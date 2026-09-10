@@ -13,6 +13,12 @@ import { formatNumber } from "@/common/lib/format/format-number";
 import { IncomeExpensesChart } from "../income-expenses-chart";
 import { DistributionChart } from "../distribution-chart";
 import CashFlowSankey from "../cash-flow-sankey";
+import {
+  SANKEY_CASH_NODE,
+  SANKEY_HUB_NODE,
+} from "../../lib/sankey-data-transformer";
+import { statementFrom } from "../../lib/__tests__/sankey-fixtures";
+import type { AccountMetaMap } from "@/features/reports/cash-flow/lib/model";
 
 vi.unmock("@/common/hooks/use-translations");
 vi.unmock("react-i18next");
@@ -62,20 +68,27 @@ const liabilities = node("Liabilities", {}, [
   node("Liabilities:Card", { EUR: -75 }),
   node("Liabilities:Loan", { EUR: -25 }),
 ]);
-const sankeyProps = {
-  incomeHierarchyData: node("Income", {}, [
-    node("Income:Salary", { EUR: -100, VACHR: -999 }),
-  ]),
-  expensesHierarchyData: node("Expenses", {}, [
-    node("Expenses:Food", { EUR: 40 }),
-  ]),
-  assetsHierarchyData: node("Assets", {}, [
-    node("Assets:Bank:CD", { EUR: 10 }),
-  ]),
-  primaryCurrency: "EUR",
-  depth: 3 as const,
-  accountMeta: new Map([["Assets:Bank:CD", { "cash-flow-role": "investing" }]]),
-};
+const sankeyIntervals = [
+  {
+    date: "2026-01-31",
+    accountChanges: {
+      "Income:Salary": { EUR: "-100", VACHR: "-999" },
+      "Expenses:Food": { EUR: "40" },
+      "Assets:Bank:CD": { EUR: "10" },
+    },
+  },
+];
+const investingCD: AccountMetaMap = new Map([
+  ["Assets:Bank:CD", { "cash-flow-role": "investing" }],
+]);
+function sankeyProps(accountMeta: AccountMetaMap = investingCD) {
+  return {
+    statement: statementFrom(sankeyIntervals, "EUR", accountMeta),
+    primaryCurrency: "EUR",
+    depth: 3 as const,
+    accountMeta,
+  };
+}
 
 async function mount(children: ReactNode, language = "en") {
   const localization = createLocalization();
@@ -156,10 +169,20 @@ type FlowsOption = {
   series: [{ links: Array<{ source: string; target: string; value: number }> }];
 };
 function assertFlows(element: HTMLElement, unit: string) {
+  const { links } = option<FlowsOption>().series[0];
+  // The hub and cash nodes carry stable ids; the table prints their labels.
+  const label = (id: string) =>
+    id === SANKEY_HUB_NODE
+      ? "Cash Flow"
+      : id === SANKEY_CASH_NODE
+        ? links.some((link) => link.target === SANKEY_CASH_NODE)
+          ? "To cash & equivalents"
+          : "From cash & equivalents"
+        : id;
   expect(rows(element).map(texts)).toEqual(
-    option<FlowsOption>().series[0].links.map((link) => [
-      link.source,
-      link.target,
+    links.map((link) => [
+      label(link.source),
+      label(link.target),
       shown(link.value, unit),
     ]),
   );
@@ -230,7 +253,7 @@ describe("Overview chart data alternatives", () => {
   );
 
   it("exposes exact Sankey links including declared investing and computed savings, without omitted-unit totals", async () => {
-    await mount(<CashFlowSankey {...sankeyProps} />);
+    await mount(<CashFlowSankey {...sankeyProps()} />);
     const element = await table("Cash Flow", "Flows");
     assertFlows(element, "EUR");
     expect(
@@ -238,11 +261,13 @@ describe("Overview chart data alternatives", () => {
         .getAllByRole("columnheader")
         .map((cell) => cell.textContent),
     ).toEqual(["From", "To", "Amount"]);
-    expect(element).toHaveTextContent("Assets:Bank");
-    expect(element).toHaveTextContent("Savings");
-    expect(
-      screen.getByText(/Balances in VACHR are not included/),
-    ).toBeInTheDocument();
+    expect(rows(element).map((row) => texts(row).slice(0, 2))).toEqual([
+      ["Income:Salary", "Cash Flow"],
+      ["Cash Flow", "Expenses:Food"],
+      ["Cash Flow", "Assets:Bank:CD"],
+      ["Cash Flow", "To cash & equivalents"],
+    ]);
+    expect(screen.getByText(/VACHR have no price to EUR/)).toBeInTheDocument();
     expect(element).not.toHaveTextContent("999");
   });
 
@@ -328,22 +353,19 @@ describe("Overview chart data alternatives", () => {
   });
 
   it("withholds both canvas and flows while authoritative account roles are pending, then follows changed roles", async () => {
-    const view = await mount(
-      <CashFlowSankey {...sankeyProps} accountMetaPending />,
-    );
+    const view = await mount(<CashFlowSankey {...sankeyProps()} pending />);
     expect(screen.getByRole("status")).toHaveTextContent(
       "Loading account roles",
     );
     expect(screen.queryByTestId("chart")).not.toBeInTheDocument();
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
-    view.rerender(<CashFlowSankey {...sankeyProps} />);
+    view.rerender(<CashFlowSankey {...sankeyProps()} />);
     assertFlows(await table("Cash Flow", "Flows"), "EUR");
     view.rerender(
       <CashFlowSankey
-        {...sankeyProps}
-        accountMeta={
-          new Map([["Assets:Bank:CD", { "cash-flow-role": "cash" }]])
-        }
+        {...sankeyProps(
+          new Map([["Assets:Bank:CD", { "cash-flow-role": "cash" }]]),
+        )}
       />,
     );
     const element = screen.getByRole("table", { name: "Cash Flow Flows" });
@@ -390,7 +412,7 @@ describe("Overview chart data alternatives", () => {
         distribution: (
           <DistributionChart title="Assets Distribution" data={null} />
         ),
-        flows: <CashFlowSankey />,
+        flows: <CashFlowSankey primaryCurrency="EUR" />,
       };
       await mount(children[kind]);
       expect(screen.queryByRole("table")).not.toBeInTheDocument();

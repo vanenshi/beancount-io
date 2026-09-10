@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LineChart } from "@/features/reports/balance-sheet/line-chart";
 import CashFlowSankey from "@/features/reports/overview/components/cash-flow-sankey";
 import { IncomeExpensesChart } from "@/features/reports/overview/components/income-expenses-chart";
+import { buildCashFlowStatement } from "@/features/reports/cash-flow/lib/model";
 import { parseQueryChart } from "@/features/bql/lib/chart-utils";
 import LedgerCommoditiesPage from "@/features/ledger-data/commodities";
 import type { QueryResultTable } from "@/graphql/definitions";
@@ -122,28 +123,21 @@ describe("cash flow sankey", () => {
   it("bounds its tooltip", () => {
     render(
       <CashFlowSankey
-        incomeHierarchyData={{
-          account: "Income",
-          balance: null,
-          children: [
+        statement={buildCashFlowStatement({
+          intervals: [
             {
-              account: "Income:NetRevenue",
-              balance: { EUR: -26328539000 },
-              children: [],
+              date: "2026-01-01",
+              accountChanges: {
+                "Income:NetRevenue": { EUR: "-26328539000" },
+                "Expenses:Operations": { EUR: "13971790000" },
+                "Assets:Bank:Checking": { EUR: "12356749000" },
+              },
             },
           ],
-        }}
-        assetsHierarchyData={{
-          account: "Assets",
-          balance: null,
-          children: [
-            {
-              account: "Assets:Current",
-              balance: { EUR: 13971790000 },
-              children: [],
-            },
-          ],
-        }}
+          closingCashAccounts: [],
+          primaryCurrency: "EUR",
+        })}
+        primaryCurrency="EUR"
       />,
     );
 
