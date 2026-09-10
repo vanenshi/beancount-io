@@ -1,4 +1,5 @@
 import Stripe from "stripe";
+import { config } from "@/config/config";
 import { getUserTier, getUserTierLimits } from "../get-user-tier";
 import { BILLING_CLIENT_ID, SubscriptionTier } from "../../service/stripe";
 import { subscriptionPeriodEnd } from "../../service/subscription-plan";
@@ -36,6 +37,21 @@ function deps(subscriptions: ClientSubscription[]) {
     postgresDb: {},
   } as any;
 }
+
+describe("development premium override", () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it("returns ENTERPRISE for a listed user without touching Stripe", async () => {
+    jest.replaceProperty(
+      config.api,
+      "developmentPremiumUserIds",
+      new Set(["usr_synthetic"]),
+    );
+    const params = deps([sub([premium])]);
+    expect(await getUserTier(params)).toBe(SubscriptionTier.ENTERPRISE);
+    expect(params.stripe.listSubscriptions).not.toHaveBeenCalled();
+  });
+});
 
 describe("subscription-bound tier", () => {
   it.each([

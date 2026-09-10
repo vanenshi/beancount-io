@@ -1,4 +1,5 @@
 import Stripe from "stripe";
+import { config } from "@/config/config";
 import { logger } from "@/shared/logger";
 import { SubscriptionTier, TierLimits, getTierLimits } from "../service/stripe";
 import {
@@ -22,6 +23,11 @@ export async function getUserTier({
   stripe,
   userId,
 }: GetUserTierParams): Promise<SubscriptionTier> {
+  // Development-only complimentary tier. This is the single owner of the
+  // override; nothing else may consult `developmentPremiumUserIds`.
+  if (config.api.developmentPremiumUserIds.has(userId)) {
+    return SubscriptionTier.ENTERPRISE;
+  }
   try {
     // listSubscriptions verifies the user's exact configured customer binding.
     // Not canceled: a past-due subscription keeps its tier while Stripe
