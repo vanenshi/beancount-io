@@ -52,6 +52,27 @@ const skOverview: Record<string, TranslationEntry> = {
     description:
       "Note under an overview chart when the ledger holds balances in more than one unit. {unit} is the unit the chart is drawn in; {others} is a comma-separated list of the units it leaves out.",
   },
+  "page.overview.cashFlowToCash": {
+    message: "Do peňažných prostriedkov",
+    description:
+      "Sankey node label for the period's net increase in cash and cash equivalents",
+  },
+  "page.overview.cashFlowFromCash": {
+    message: "Z peňažných prostriedkov",
+    description:
+      "Sankey node label for the period's net decrease in cash and cash equivalents",
+  },
+  "page.overview.cashFlowUnshownUnits": {
+    message:
+      "Zobrazené v {currency}. Pre {units} neexistuje cena v {currency}, preto nie sú v grafe.",
+    description:
+      "Caption under the cash flow chart listing units that could not be converted to the presentation currency",
+  },
+  "page.overview.cashFlowNoFlows": {
+    message: "V tomto období nie sú žiadne toky v {currency}.",
+    description:
+      "Empty state shown when the cash flow chart has no movement in the presentation currency",
+  },
   "page.overview.starButton.star": {
     message: "Hviezda",
     description: "Button label to star a ledger",

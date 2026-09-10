@@ -206,11 +206,12 @@ describe("overview valuation wiring", () => {
     expect(lastProps("income-expenses")).toMatchObject({
       income: overview.incomeIntervalData,
     });
-    // The cash-flow Sankey keeps the balance sheet at cost with its flows.
-    expect(lastProps("cash-flow")).toMatchObject({
-      assetsHierarchyData: overview.assetsHierarchyData,
-      liabilitiesHierarchyData: overview.liabilitiesHierarchyData,
-    });
+    // The cash-flow Sankey projects the period's cash-flow statement, so no
+    // balance-sheet hierarchy (at cost or market) reaches it.
+    expect(lastProps("cash-flow")).not.toHaveProperty("assetsHierarchyData");
+    expect(lastProps("cash-flow")).not.toHaveProperty(
+      "liabilitiesHierarchyData",
+    );
   });
 
   it("asks for the market read with the overview's own scope", () => {

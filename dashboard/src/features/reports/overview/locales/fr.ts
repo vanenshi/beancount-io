@@ -55,6 +55,27 @@ const frOverview: Record<string, TranslationEntry> = {
     description:
       "Note under an overview chart when the ledger holds balances in more than one unit. {unit} is the unit the chart is drawn in; {others} is a comma-separated list of the units it leaves out.",
   },
+  "page.overview.cashFlowToCash": {
+    message: "Vers la trésorerie",
+    description:
+      "Sankey node label for the period's net increase in cash and cash equivalents",
+  },
+  "page.overview.cashFlowFromCash": {
+    message: "Depuis la trésorerie",
+    description:
+      "Sankey node label for the period's net decrease in cash and cash equivalents",
+  },
+  "page.overview.cashFlowUnshownUnits": {
+    message:
+      "Affiché en {currency}. {units} n'ont pas de cours en {currency} et n'apparaissent donc pas dans le graphique.",
+    description:
+      "Caption under the cash flow chart listing units that could not be converted to the presentation currency",
+  },
+  "page.overview.cashFlowNoFlows": {
+    message: "Aucun flux en {currency} sur cette période.",
+    description:
+      "Empty state shown when the cash flow chart has no movement in the presentation currency",
+  },
   "page.overview.starButton.star": {
     message: "Étoile",
     description: "Button label to star a ledger",

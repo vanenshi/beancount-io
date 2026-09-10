@@ -119,8 +119,8 @@ All charts use **ECharts 6+**. Chart options are constructed in component files,
 ## Data Transformation Pipeline (Overview Example)
 
 ```
-GraphQL hierarchy data
-  → account-categorizer.ts (classify accounts)
+getLedgerIntervalTotals (5 roots, conversion = primary currency)
+  → cash-flow/lib/model.ts (buildCashFlowStatement: period rows + netChange)
   → sankey-data-transformer.ts (build nodes/links)
   → sankey-colors.ts (assign colors)
   → ECharts Sankey component
@@ -128,9 +128,9 @@ GraphQL hierarchy data
 
 ### Overview chart units
 
-The overview charts add their own parts together — a Sankey into node totals,
-the centre and Savings; a pie into the denominator behind every percentage — so
-each can only be truthful in **one** unit. A ledger balance is a map like
+The overview charts add their own parts together — a pie into the denominator
+behind every percentage, the Sankey into node totals — so each can only be
+truthful in **one** unit. A ledger balance is a map like
 `{ USD: 386.22, VACHR: 25 }`, and those numbers are not commensurable: no price
 was supplied, so adding them yields neither a dollar total nor a conversion.
 
@@ -138,8 +138,8 @@ was supplied, so adding them yields neither a dollar total nor a conversion.
 `UnitAmounts` (`unit → amount`), `chooseDisplayUnit` picks the unit the most
 accounts use (ties by magnitude, then alphabetically, so the choice is stable
 across renders), and the chart renders that unit alone and names the omitted
-ones through `page.overview.chartUnitScope`. Both `sankey-data-transformer.ts`
-and `buildDistributionData` go through it — never re-derive a unit with
+ones through `page.overview.chartUnitScope`. `buildDistributionData` goes
+through it (the Sankey has its own one-unit rule, below) — never re-derive a unit with
 `balance["USD"] ?? Object.values(balance)[0]`, which silently relabels MUSD or
 EUR as USD and adds vacation hours to dollars.
 
@@ -150,10 +150,26 @@ nothing, while summing only children drops a parent's real money. And every
 descendant resolves its **own** cash-flow role — a `Cash` or `Checking` leaf
 must not reach the investing bucket because its parent did.
 
+### Overview Sankey
+
+The overview Sankey is a **projection of the cash-flow statement**, not of the
+balance-sheet hierarchies — cumulative balances are not period flows
+(`docs/adrs/ADR004-dashboard-sankey-cash-flow-projection.md`). Two rules follow
+from that and must not be relaxed:
+
+- **One unit.** A link value is one currency's amount, never a sum across
+  units. Units with movement but no price to the presentation currency are
+  listed in a caption under the chart — never converted, never dropped
+  silently.
+- **The cash node balances it.** The only balancing node is the net change in
+  cash & equivalents (`statement.netChange`), drawn on the side its sign
+  requires, so total inflow equals total outflow exactly. Negative flows are
+  drawn on the opposite side, never discarded.
+
 The Sankey categorizer resolves accounts through the shared
-`cash-flow/lib/role-resolver.ts` (a declared `cash-flow-role` wins for
-non-`Income`/`Equity` roots; `Income` stays the source side and `Equity`
-stays excluded). Account `open`-directive metadata is the `meta` field of
+`cash-flow/lib/role-resolver.ts` (a declared `cash-flow-role` wins for every
+root but `Income`, which stays the source side; `Equity` is financing, the same
+as in the statement). Account `open`-directive metadata is the `meta` field of
 `getLedgerAccountDirectives`: the cash-flow page reads it from its own query,
 while the overview fetches a `{ account meta }` projection separately
 (`GetLedgerAccountMeta` through `overview/hooks/use-account-meta.ts`) so a
@@ -161,6 +177,12 @@ failure degrades the Sankey to heuristics instead of failing the page. While
 that query is pending the hook reports it and the Sankey shows a pending state
 rather than the heuristic layout — declared roles are authoritative and must
 never be pre-empted by provisional output.
+
+The flows themselves come from a second client-side query
+(`GetLedgerCashFlowSankey` through `overview/hooks/use-sankey-statement.ts`),
+kept out of the route loader because the loader has no `primaryCurrency` to
+pass as the conversion target. Both hooks degrade the Sankey card alone; the
+page's other cards keep reading `GetLedgerOverview`.
 
 ## Route Loaders
 
