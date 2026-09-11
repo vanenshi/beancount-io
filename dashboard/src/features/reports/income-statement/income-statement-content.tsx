@@ -17,16 +17,18 @@ import { useChartsVisibility } from "../components/use-charts-visibility";
 import type { ChartInterval, ConversionOption } from "@/common/types/chart";
 import { ResponsiveTabTriggerList } from "@/common/components/responsive-tab-trigger-list";
 import { IntervalSelect } from "@/common/components/interval-select";
-import { ConversionSelect } from "@/common/components/conversion-select";
 import { useTranslations } from "@/common/hooks/use-translations";
 import { sortUsdFirst } from "@/common/lib/utils/sort";
 import { LedgerPageSEO } from "@/common/components/seo/ledger-page-seo";
+import { isCurrencyConversion } from "@/common/lib/ledger-search-params/conversion";
 import { HierarchyVisualizationCard } from "../balance-sheet/hierarchy-visualization-card";
 import { HierarchyListCard } from "../balance-sheet/hierarchy-list-card";
 import { filterAccountHierarchy } from "../balance-sheet/utils";
 import { ChartModeSelect, type ChartMode } from "./chart-mode-select";
 import type { LedgerSearchParams } from "@/common/providers/ledger-search-params-provider/context";
 import { StatementExportMenu } from "../export/statement-export-menu";
+import { collectHierarchyRecords, collectUnits } from "../export/units";
+import { UnconvertedUnitsNotice } from "../components/unconverted-units-notice";
 import {
   buildProfitAndLossDocument,
   sumBalanceRecords,
@@ -50,7 +52,6 @@ interface IncomeStatementContentProps {
   showClosedAccounts: boolean;
   closedAccountNames: Set<string>;
   collapsePatterns: string[];
-  onConversionChange: (value: ConversionOption) => void;
   onTimeIntervalChange: (value: ChartInterval) => void;
   filters: LedgerSearchParams;
   fiscalYearEnd: FiscalYearEnd;
@@ -72,7 +73,6 @@ export function IncomeStatementContent({
   showClosedAccounts,
   closedAccountNames,
   collapsePatterns,
-  onConversionChange,
   onTimeIntervalChange,
   filters,
   fiscalYearEnd,
@@ -153,12 +153,24 @@ export function IncomeStatementContent({
       hierarchyFilterOptions,
     );
   }, [hierarchyFilterOptions, incomeStatementData.expensesHierarchyData]);
+  const unconvertedUnits = isCurrencyConversion(conversion)
+    ? collectUnits(
+        [
+          ...collectHierarchyRecords(incomeHierarchy),
+          ...collectHierarchyRecords(expensesHierarchy),
+        ],
+        conversion,
+      )
+    : [];
+  const exportPrimaryCurrency = isCurrencyConversion(conversion)
+    ? conversion
+    : primaryCurrency;
   const exportDocument = buildProfitAndLossDocument({
     title: t("common.incomeStatement"),
     reportingEntity: reportingEntityName,
     reportingEntitySource,
     ledgerName: ledgerDisplayName,
-    primaryCurrency,
+    primaryCurrency: exportPrimaryCurrency,
     conversion,
     interval: timeInterval,
     filters,
@@ -198,6 +210,9 @@ export function IncomeStatementContent({
           </div>
         </ClientOnly>
       </div>
+
+      <UnconvertedUnitsNotice currency={conversion} units={unconvertedUnits} />
+
       {/* Collapsible Chart Section */}
       <CollapsibleChartsSection
         id={chartsSectionId}
@@ -226,11 +241,6 @@ export function IncomeStatementContent({
                 <IntervalSelect
                   value={timeInterval}
                   onValueChange={onTimeIntervalChange}
-                />
-                <ConversionSelect
-                  value={conversion}
-                  onValueChange={onConversionChange}
-                  currency={primaryCurrency}
                 />
               </div>
             </ClientOnly>

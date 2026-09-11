@@ -16,11 +16,14 @@ import { useTranslations } from "@/common/hooks/use-translations";
 import { useFormatNumber } from "@/common/hooks/use-format-number";
 import { getChartColors } from "@/common/lib/chart/color";
 import { formatDateAxis, formatYAxisNumber } from "@/common/lib/chart/chart";
+import { isCurrencyConversion } from "@/common/lib/ledger-search-params/conversion";
+import type { ConversionOption } from "@/common/types/chart";
 import type { DataSeries } from "../lib/overview-utils";
 import {
   getBalanceAmounts,
   getComparableAmount,
   prioritizeCurrency,
+  splitPresentationAmounts,
 } from "../lib/overview-utils";
 import { FormattedAmounts } from "./formatted-amounts";
 
@@ -51,9 +54,11 @@ function isSinglePointSeries(data: ReadonlyArray<number | null>): boolean {
 export function NetWorthCard({
   data,
   primaryCurrency,
+  conversion,
 }: {
   data: DataSeries;
   primaryCurrency: string;
+  conversion: ConversionOption;
 }) {
   const { t, i18n } = useTranslations();
   const language = i18n.language;
@@ -62,21 +67,31 @@ export function NetWorthCard({
   const visibleData = useMemo(() => data.slice(-12), [data]);
   const latest = visibleData.at(-1);
   const previous = visibleData.at(-2);
+  const presentationCurrency = isCurrencyConversion(conversion)
+    ? conversion
+    : primaryCurrency;
   const latestAmounts = prioritizeCurrency(
     getBalanceAmounts(latest?.balance),
-    primaryCurrency,
+    presentationCurrency,
   );
-  const latestComparable = getComparableAmount(latestAmounts, primaryCurrency);
+  const latestComparable = getComparableAmount(
+    latestAmounts,
+    presentationCurrency,
+  );
   const previousComparable = previous
     ? getComparableAmount(
         getBalanceAmounts(previous.balance),
-        latestComparable?.currency ?? primaryCurrency,
+        latestComparable?.currency ?? presentationCurrency,
       )
     : null;
   const change =
     latestComparable && previousComparable
       ? latestComparable.value - previousComparable.value
       : null;
+  const { headline, residual } = splitPresentationAmounts(
+    latestAmounts,
+    presentationCurrency,
+  );
 
   const chartOption = useMemo<EChartsOption>(() => {
     const currencies = Array.from(
@@ -86,8 +101,8 @@ export function NetWorthCard({
         ),
       ),
     );
-    const displayedCurrencies = currencies.includes(primaryCurrency)
-      ? [primaryCurrency]
+    const displayedCurrencies = currencies.includes(presentationCurrency)
+      ? [presentationCurrency]
       : currencies;
 
     return {
@@ -151,7 +166,7 @@ export function NetWorthCard({
         };
       }),
     };
-  }, [formatNumber, language, primaryCurrency, visibleData]);
+  }, [formatNumber, language, presentationCurrency, visibleData]);
 
   return (
     <Card className="min-w-0 gap-0 overflow-hidden py-0">
@@ -186,10 +201,31 @@ export function NetWorthCard({
 
       <CardContent className="px-4 py-5 sm:px-6">
         <div className="flex flex-wrap items-end justify-between gap-3">
-          <FormattedAmounts
-            amounts={latestAmounts}
-            className="text-2xl font-semibold tracking-tight sm:text-3xl"
-          />
+          {isCurrencyConversion(conversion) ? (
+            <div>
+              <FormattedAmounts
+                amounts={headline ? [headline] : []}
+                className="text-2xl font-semibold tracking-tight sm:text-3xl"
+              />
+              {residual.length > 0 && (
+                <div className="mt-1 text-xs text-muted-foreground">
+                  {t("page.overview.notConvertedUnits", {
+                    units: residual
+                      .map(
+                        (amount) =>
+                          `${formatNumber(amount.value)} ${amount.currency}`,
+                      )
+                      .join(", "),
+                  })}
+                </div>
+              )}
+            </div>
+          ) : (
+            <FormattedAmounts
+              amounts={latestAmounts}
+              className="text-2xl font-semibold tracking-tight sm:text-3xl"
+            />
+          )}
           {change !== null && latestComparable && (
             <div
               className={
@@ -236,7 +272,7 @@ export function NetWorthCard({
                 <FormattedAmounts
                   amounts={prioritizeCurrency(
                     getBalanceAmounts(point.balance),
-                    primaryCurrency,
+                    presentationCurrency,
                   )}
                   className="text-right font-medium"
                 />

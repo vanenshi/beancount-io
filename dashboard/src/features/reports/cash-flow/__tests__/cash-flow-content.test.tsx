@@ -36,7 +36,8 @@ vi.mock("@/common/hooks/use-format-number", () => ({
 
 vi.mock("@/common/hooks/use-translations", () => ({
   useTranslations: () => ({
-    t: (key: string) => key,
+    t: (key: string, params?: Record<string, string | number>) =>
+      params ? `${key} ${JSON.stringify(params)}` : key,
     i18n: { language: "en", dir: () => "ltr" },
   }),
 }));
@@ -56,11 +57,8 @@ vi.mock("../export/statement-export-menu", () => ({
 vi.mock("@/common/components/seo/ledger-page-seo", () => ({
   LedgerPageSEO: () => null,
 }));
-vi.mock("@/common/components/conversion-select", () => ({
-  ConversionSelect: () => <div data-testid="conversion-select" />,
-}));
 vi.mock("@/common/components/interval-select", () => ({
-  IntervalSelect: () => null,
+  IntervalSelect: () => <div data-testid="interval-select" />,
 }));
 vi.mock("@/common/components/responsive-tab-trigger-list", () => ({
   ResponsiveTabTriggerList: () => null,
@@ -111,10 +109,15 @@ const closingCashAccounts: CashAccountSnapshot[] = [
   },
 ];
 
-function renderContent() {
+function renderContent(
+  overrides: {
+    statement?: CashFlowStatement;
+    conversion?: string;
+  } = {},
+) {
   return render(
     <CashFlowContent
-      statement={statement}
+      statement={overrides.statement ?? statement}
       closingCashAccounts={closingCashAccounts}
       cashAccountRows={[]}
       primaryCurrency="USD"
@@ -124,11 +127,10 @@ function renderContent() {
       ledgerOwner="demo"
       ledgerNameParam="books"
       showClosedAccounts={false}
-      conversion="at_cost"
-      onConversionChange={() => {}}
+      conversion={overrides.conversion ?? "at_cost"}
       timeInterval="monthly"
       onTimeIntervalChange={() => {}}
-      filters={{ time: "", account: "", filter: "" }}
+      filters={{ time: "", account: "", filter: "", conversion: "" }}
       fiscalYearEnd={{ month: 12, day: 31 }}
       collapsePatterns={[]}
     />,
@@ -158,18 +160,17 @@ describe("CashFlowContent declared/inferred indicators", () => {
 });
 
 describe("CashFlowContent chart toolbar", () => {
-  it("lets the toolbar stack so the conversion group is not clipped when narrow", () => {
+  it("lets the toolbar stack so the control group is not clipped when narrow", () => {
     renderContent();
 
-    const conversionGroup =
-      screen.getByTestId("conversion-select").parentElement;
-    const toolbarRow = conversionGroup?.parentElement;
+    const controlGroup = screen.getByTestId("interval-select").parentElement;
+    const toolbarRow = controlGroup?.parentElement;
 
     // The toolbar lives inside the collapse wrapper's `overflow-hidden`, so a
     // non-wrapping row pushes this group out of view behind a long View label.
     expect(toolbarRow?.className).toMatch(/\bflex-wrap\b/);
     // The control group itself must stay unshrunk — wrapping is what gives room.
-    expect(conversionGroup?.className).toMatch(/\bshrink-0\b/);
+    expect(controlGroup?.className).toMatch(/\bshrink-0\b/);
   });
 });
 
@@ -230,5 +231,37 @@ describe("CashFlowContent statement tables", () => {
     expect(closingAt).toBeGreaterThan(checkingAt);
     expect(openingAt).toBeGreaterThan(closingAt);
     expect(netChangeAt).toBeGreaterThan(openingAt);
+  });
+});
+
+describe("CashFlowContent unconverted units disclosure", () => {
+  const statementWithTry: CashFlowStatement = {
+    ...statement,
+    rows: [
+      ...statement.rows,
+      {
+        accountPath: "Income:Freelance",
+        label: "Freelance",
+        activity: "operating",
+        roleSource: "heuristic",
+        amounts: { TRY: "-20000.00" },
+      },
+    ],
+  };
+
+  it("discloses units with no price to the presentation currency", () => {
+    renderContent({ statement: statementWithTry, conversion: "USD" });
+
+    expect(
+      screen.getByText("reports.unconvertedUnits", { exact: false }),
+    ).toHaveTextContent("TRY");
+  });
+
+  it("stays silent when not converting to a single currency", () => {
+    renderContent({ statement: statementWithTry, conversion: "at_cost" });
+
+    expect(
+      screen.queryByText("reports.unconvertedUnits", { exact: false }),
+    ).not.toBeInTheDocument();
   });
 });

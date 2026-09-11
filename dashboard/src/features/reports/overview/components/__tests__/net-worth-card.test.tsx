@@ -6,13 +6,18 @@ import { NetWorthCard } from "../net-worth-card";
 import type { DataSeries } from "../../lib/overview-utils";
 
 // ECharts renders to canvas, which jsdom cannot assert on: capture the option
-// object instead.
+// object instead, and also serialize it into the DOM for the tests that read
+// the rendered series names.
 const capturedOptions: EChartsOption[] = [];
 
 vi.mock("@/common/components/react-echarts", () => ({
   ReactECharts: ({ option }: { option: EChartsOption }) => {
     capturedOptions.push(option);
-    return <div data-testid="echarts-mock" />;
+    return (
+      <span data-testid="echarts-mock">
+        <span data-testid="echarts-option">{JSON.stringify(option)}</span>
+      </span>
+    );
   },
 }));
 
@@ -24,7 +29,8 @@ let language = "en";
 
 vi.mock("@/common/hooks/use-translations", () => ({
   useTranslations: () => ({
-    t: (key: string) => key,
+    t: (key: string, params?: Record<string, string | number>) =>
+      params ? `${key} ${JSON.stringify(params)}` : key,
     i18n: { language },
   }),
 }));
@@ -46,6 +52,13 @@ function axisLabelFormatter(option: EChartsOption): (value: string) => string {
     axisLabel: { formatter: (value: string) => string };
   };
   return xAxis.axisLabel.formatter;
+}
+
+function seriesNamesOf(): string[] {
+  const option = JSON.parse(
+    screen.getByTestId("echarts-option").textContent ?? "{}",
+  ) as { series: Array<{ name: string }> };
+  return option.series.map((series) => series.name);
 }
 
 beforeEach(() => {
@@ -162,5 +175,39 @@ describe("NetWorthCard localization", () => {
     );
 
     expect(screen.getByText("not-a-date")).toBeInTheDocument();
+  });
+});
+
+describe("NetWorthCard presentation currency", () => {
+  const data = [
+    { date: "2026-06-30", balance: { USD: "1000" } },
+    { date: "2026-07-31", balance: { USD: "1200", TRX: "19.953" } },
+  ];
+
+  it("shows one headline and a muted residual line under a currency conversion", () => {
+    render(<NetWorthCard data={data} primaryCurrency="USD" conversion="USD" />);
+
+    expect(screen.getByText("1200 USD")).toBeInTheDocument();
+    expect(
+      screen.getByText("page.overview.notConvertedUnits", { exact: false }),
+    ).toHaveTextContent("19.953 TRX");
+  });
+
+  it("keeps the multi-line list when not converting to a single currency", () => {
+    render(
+      <NetWorthCard data={data} primaryCurrency="USD" conversion="at_cost" />,
+    );
+
+    expect(screen.getByText("1200 USD")).toBeInTheDocument();
+    expect(screen.getByText("19.953 TRX")).toBeInTheDocument();
+    expect(
+      screen.queryByText("page.overview.notConvertedUnits", { exact: false }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("plots the presentation-currency series, not the ledger's primary currency", () => {
+    render(<NetWorthCard data={data} primaryCurrency="USD" conversion="TRX" />);
+
+    expect(seriesNamesOf()).toEqual(["TRX"]);
   });
 });

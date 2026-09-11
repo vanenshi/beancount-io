@@ -6,7 +6,6 @@ import { RelatedLinks } from "@/common/components/related-links";
 import { LedgerPageSEO } from "@/common/components/seo/ledger-page-seo";
 import { Tabs, TabsContent } from "@/common/components/ui/tabs";
 import { ResponsiveTabTriggerList } from "@/common/components/responsive-tab-trigger-list";
-import { ConversionSelect } from "@/common/components/conversion-select";
 import { IntervalSelect } from "@/common/components/interval-select";
 import {
   ChartsToggleButton,
@@ -17,8 +16,11 @@ import { useTranslations } from "@/common/hooks/use-translations";
 import { sortUsdFirst } from "@/common/lib/utils/sort";
 import type { ChartInterval, ConversionOption } from "@/common/types/chart";
 import type { LedgerSearchParams } from "@/common/providers/ledger-search-params-provider/context";
+import { isCurrencyConversion } from "@/common/lib/ledger-search-params/conversion";
 import { formatStatementAmount } from "../export/amount";
 import { StatementExportMenu } from "../export/statement-export-menu";
+import { collectUnits } from "../export/units";
+import { UnconvertedUnitsNotice } from "../components/unconverted-units-notice";
 import {
   buildCashFlowDocument,
   type ReportingEntitySource,
@@ -54,7 +56,6 @@ interface CashFlowContentProps {
   ledgerNameParam: string;
   showClosedAccounts: boolean;
   conversion: ConversionOption;
-  onConversionChange: (value: ConversionOption) => void;
   timeInterval: ChartInterval;
   onTimeIntervalChange: (value: ChartInterval) => void;
   filters: LedgerSearchParams;
@@ -96,7 +97,6 @@ export function CashFlowContent({
   ledgerNameParam,
   showClosedAccounts,
   conversion,
-  onConversionChange,
   timeInterval,
   onTimeIntervalChange,
   filters,
@@ -117,12 +117,22 @@ export function CashFlowContent({
   const { chartsVisible, toggleChartsVisible, chartsSectionId } =
     useChartsVisibility("cashFlow");
 
+  const unconvertedUnits = isCurrencyConversion(conversion)
+    ? collectUnits(
+        [...statement.rows.map((row) => row.amounts), statement.netChange],
+        conversion,
+      )
+    : [];
+
+  const exportPrimaryCurrency = isCurrencyConversion(conversion)
+    ? conversion
+    : primaryCurrency;
   const exportDocument = buildCashFlowDocument({
     title: t("common.cashFlow"),
     reportingEntity: reportingEntityName,
     reportingEntitySource,
     ledgerName: ledgerDisplayName,
-    primaryCurrency,
+    primaryCurrency: exportPrimaryCurrency,
     conversion,
     interval: timeInterval,
     filters,
@@ -202,6 +212,8 @@ export function CashFlowContent({
         </ClientOnly>
       </div>
 
+      <UnconvertedUnitsNotice currency={conversion} units={unconvertedUnits} />
+
       {/* Collapsible Chart Section */}
       <CollapsibleChartsSection
         id={chartsSectionId}
@@ -224,11 +236,6 @@ export function CashFlowContent({
                 <IntervalSelect
                   value={timeInterval}
                   onValueChange={onTimeIntervalChange}
-                />
-                <ConversionSelect
-                  value={conversion}
-                  onValueChange={onConversionChange}
-                  currency={primaryCurrency}
                 />
               </div>
             </ClientOnly>

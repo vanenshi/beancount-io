@@ -51,24 +51,6 @@ vi.mock("@/common/components/responsive-tab-trigger-list", () => ({
   ),
 }));
 
-vi.mock("@/common/components/conversion-select", () => ({
-  ConversionSelect: ({
-    value,
-    onValueChange,
-  }: {
-    value: string;
-    onValueChange: (value: string) => void;
-  }) => (
-    <button
-      type="button"
-      data-testid="conversion-select"
-      onClick={() => onValueChange("units")}
-    >
-      {`conversion:${value}`}
-    </button>
-  ),
-}));
-
 function hierarchyNode(account: string) {
   return {
     __typename: "SerializableTreeNode" as const,
@@ -90,7 +72,7 @@ const trialBalanceData = {
   equityHierarchyData: hierarchyNode("Equity"),
 };
 
-function renderContent(onConversionChange = vi.fn()) {
+function renderContent() {
   render(
     <TrialBalanceContent
       trialBalanceData={
@@ -103,7 +85,6 @@ function renderContent(onConversionChange = vi.fn()) {
       ledgerOwner="demo"
       ledgerNameParam="books"
       conversion="at_cost"
-      onConversionChange={onConversionChange}
       invertIncomeLiabilitiesEquity={false}
       showZeroBalance
       showZeroTransactions
@@ -112,7 +93,6 @@ function renderContent(onConversionChange = vi.fn()) {
       collapsePatterns={[]}
     />,
   );
-  return { onConversionChange };
 }
 
 describe("TrialBalanceContent", () => {
@@ -135,23 +115,5 @@ describe("TrialBalanceContent", () => {
     await user.click(screen.getByRole("button", { name: "pick-income" }));
 
     expect(screen.getByTestId("active-chart")).toHaveTextContent("Income");
-  });
-
-  it("offers the conversion selector regardless of viewport width", async () => {
-    const user = userEvent.setup();
-    const { onConversionChange } = renderContent();
-
-    // Exactly one conversion control, and it is not gated behind a
-    // desktop-only wrapper (it used to be inside `hidden lg:flex`).
-    const conversionSelects = screen.getAllByTestId("conversion-select");
-    expect(conversionSelects).toHaveLength(1);
-    expect(conversionSelects[0].parentElement?.className).not.toMatch(
-      /\bhidden\b/,
-    );
-
-    // The single shared conversion state drives it — no mobile-only duplicate.
-    expect(conversionSelects[0]).toHaveTextContent("conversion:at_cost");
-    await user.click(conversionSelects[0]);
-    expect(onConversionChange).toHaveBeenCalledWith("units");
   });
 });
