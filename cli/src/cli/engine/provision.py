@@ -13,8 +13,9 @@ future engine lands beside the current one instead of replacing it underneath a
 running command.
 
 Release artifacts ship `engine-requirements.lock` (see `make engine-release-lock`);
-when that lock is present beside the installed package or in the sdist, installs
-use `--require-hashes`. Checkouts without the lock fall back to the version pins
+when that lock ships inside the installed package or sits in the checkout, installs
+use `--require-hashes`, and a shipped lock that cannot be used stops the install
+rather than dropping the hashes. Checkouts without the lock fall back to the version pins
 in `manifest.json` while the helper sources always come from this beancount-io installation.
 
 Optional Beangulp / Beanprice features (ADR012, ADR014 m20) stay out of the
@@ -24,11 +25,14 @@ extra into the managed engine venv and records it so repairs re-apply it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -48,42 +52,67 @@ def ensure_engine() -> Path:
         return override
 
     root = paths.engine_root()
-    if paths.is_provisioned(root):
-        return paths.venv_python(root)
-
-    provision(root)
+    if not paths.is_provisioned(root):
+        with provisioning_lock(root):
+            # Another command may have finished provisioning while we waited.
+            if not paths.is_provisioned(root):
+                provision(root)
     return paths.venv_python(root)
 
 
-def repair_engine() -> Path:
-    """Rebuild the managed engine after a failed or incomplete install."""
-    override = paths.python_override()
-    if override is not None:
-        return override
-    root = paths.engine_root()
-    remembered = enabled_features(root)
-    if root.exists():
-        discarded = root.with_name(f"{root.name}.repair-discard.{os.getpid()}")
-        os.replace(root, discarded)
-        shutil.rmtree(discarded, ignore_errors=True)
-    provision(root)
-    for name in sorted(remembered):
-        _install_feature(root, name)
-        _record_feature(root, name)
-    return paths.venv_python(root)
+@contextmanager
+def provisioning_lock(root: Path) -> Iterator[None]:
+    """Hold the exclusive lock for changing the engine at `root`.
+
+    Commands started together on a fresh install would otherwise each build
+    an engine and each move the other's freshly published one aside — out
+    from under a command already running it. The lock file sits beside the
+    root and is never removed, so every waiter locks the same inode.
+    """
+    root.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(root.with_name(f"{root.name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+b") as stream:
+        if sys.platform == "win32":
+            import msvcrt
+
+            if not os.fstat(stream.fileno()).st_size:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if sys.platform == "win32":
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def provision(root: Path) -> None:
-    """Build the engine environment at `root`, atomically."""
+    """Build the engine environment at `root`, atomically.
+
+    Callers hold `provisioning_lock(root)`.
+
+    Whatever is already at `root` stays there until its replacement is
+    complete, so a failed rebuild (offline, no uv, a bad package) keeps the
+    engine commands were using. Optional features recorded in it are
+    reinstalled into the replacement before it is published.
+    """
     uv = _find_uv()
+    remembered = enabled_features(root)
     version = paths.engine_version()
     manifest = paths.manifest()
 
-    # Per-process, so two commands provisioning at the same time build in
-    # separate directories and the loser's rename is simply redundant.
+    # Per-process, so an interrupted build is attributable to its pid.
     partial = root.with_name(f"{root.name}.partial.{os.getpid()}")
-    shutil.rmtree(partial, ignore_errors=True)
     partial.parent.mkdir(parents=True, exist_ok=True)
+    _sweep_abandoned(root)
 
     output.note(f"Installing the Beancount engine {version} (one time) in {root}...")
     try:
@@ -121,6 +150,9 @@ def provision(root: Path) -> None:
                 [uv, "pip", "install", "--python", python, *_requirements()],
                 failure="Could not install the engine's packages",
             )
+        for name in sorted(remembered):
+            _install_feature(partial, name)
+            _record_feature(partial, name)
         _publish(partial, root)
     except BaseException:
         shutil.rmtree(partial, ignore_errors=True)
@@ -174,17 +206,18 @@ def enable_feature(name: str) -> tuple[bool, set[str]]:
         raise UsageError(f"Unknown engine feature '{name}'. Choose one of: {choices}.")
 
     root = paths.engine_root()
-    if not paths.is_provisioned(root):
-        provision(root)
+    with provisioning_lock(root):
+        if not paths.is_provisioned(root):
+            provision(root)
 
-    already = enabled_features(root)
-    if name in already and _feature_present(root, name):
-        output.note(f"Engine feature '{name}' is already enabled.")
-        return False, already
+        already = enabled_features(root)
+        if name in already and _feature_present(root, name):
+            output.note(f"Engine feature '{name}' is already enabled.")
+            return False, already
 
-    output.note(f"Enabling engine feature '{name}' in {root}...")
-    _install_feature(root, name)
-    recorded = _record_feature(root, name)
+        output.note(f"Enabling engine feature '{name}' in {root}...")
+        _install_feature(root, name)
+        recorded = _record_feature(root, name)
     output.note(f"Engine feature '{name}' ready.")
     return True, recorded
 
@@ -305,7 +338,13 @@ def _lockfile() -> Path | None:
 
 
 def _find_packaged_file(name: str) -> Path | None:
-    """Locate a release lock next to the installed package or checkout."""
+    """Locate a release lock shipped with this installation or checkout.
+
+    None means this installation ships no such lock (a checkout before
+    `make release-lock`), which is the only case allowed to fall back to the
+    manifest's version pins. A lock that ships but cannot be handed to uv is
+    an error: falling back would quietly drop hash verification.
+    """
     if not name:
         return None
     # Checkout: cli/<name> (generated by make engine-release-lock).
@@ -314,37 +353,84 @@ def _find_packaged_file(name: str) -> Path | None:
         candidate = checkout.parent / name
         if candidate.is_file():
             return candidate
-    # Installed wheel/sdist: adjacent to the distribution root.
-    package_root = Path(__file__).resolve().parents[2]  # .../site-packages or .../src
-    for candidate in (package_root.parent / name, package_root / name):
-        if candidate.is_file():
-            return candidate
+    # Installed wheel: the build hook ships the locks inside the `cli` package.
+    installed = Path(__file__).resolve().parents[1] / name
+    if installed.is_file():
+        return installed
     try:
         traversable = resources.files("cli").joinpath(name)
-        if traversable.is_file():
-            # Wheels store package data inside a zip; uv needs a real filesystem
-            # path, so materialize once beside the managed engines.
-            cache = paths.engine_root().parent / name
-            cache.parent.mkdir(parents=True, exist_ok=True)
-            data = traversable.read_bytes()
-            if not cache.is_file() or cache.read_bytes() != data:
-                cache.write_bytes(data)
-            return cache
+        shipped = traversable.is_file()
     except (FileNotFoundError, TypeError, AttributeError, OSError):
-        pass
-    return None
+        return None
+    if not shipped:
+        return None
+    if isinstance(traversable, Path):
+        return traversable
+    # A zipped install: uv needs a real file. Named by content, so a copy from
+    # another bea version is never mistaken for this one, and written through
+    # a temporary name so a reader never sees a partial file.
+    data = traversable.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    cache = paths.engine_root().parent / f"{Path(name).stem}-{digest}{Path(name).suffix}"
+    try:
+        if cache.is_file() and cache.read_bytes() == data:
+            return cache
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        staged = cache.with_name(f"{cache.name}.{os.getpid()}.tmp")
+        staged.write_bytes(data)
+        os.replace(staged, cache)
+    except OSError as exc:
+        raise BeaError(
+            f"Could not prepare the hash-pinned {name} for the engine install at {cache}: {exc.strerror or exc}.",
+            details=["Make that directory writable, or set BEA_ENGINE_DIR to a writable location."],
+        ) from exc
+    return cache
+
+
+def _sweep_abandoned(root: Path) -> None:
+    """Remove scratch directories left beside `root` by builds that died.
+
+    A build killed by SIGTERM or SIGHUP (a closed terminal) never reaches its
+    cleanup, leaving a `.partial.<pid>` engine of tens of megabytes behind.
+    Called under the provisioning lock; a directory whose process is still
+    alive is left alone, since an older bea without the lock may own it.
+    """
+    for prefix in (f"{root.name}.partial.", f"{root.name}.discarded.", f"{root.name}.repair-discard."):
+        for path in root.parent.glob(f"{prefix}*"):
+            suffix = path.name[len(prefix) :]
+            if not suffix.isdigit():
+                continue
+            pid = int(suffix)
+            if pid == os.getpid() or not _process_alive(pid):
+                shutil.rmtree(path, ignore_errors=True)
+
+
+def _process_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        # `os.kill` on Windows terminates rather than probes; assume alive.
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _publish(partial: Path, root: Path) -> None:
     """Move a finished environment into place under the name commands look for."""
-    if root.exists():
-        # Something unusable is already there — `ensure_engine` only calls us
-        # when `is_provisioned` said no. Move it out of the way first, because
-        # renaming onto a non-empty directory fails.
-        discarded = root.with_name(f"{root.name}.discarded.{os.getpid()}")
-        os.replace(root, discarded)
-        shutil.rmtree(discarded, ignore_errors=True)
-    os.replace(partial, root)
+    try:
+        if root.exists():
+            # Something unusable is already there — under the provisioning
+            # lock we only build when `is_provisioned` said no. Move it out of
+            # the way first, because renaming onto a non-empty directory fails.
+            discarded = root.with_name(f"{root.name}.discarded.{os.getpid()}")
+            os.replace(root, discarded)
+            shutil.rmtree(discarded, ignore_errors=True)
+        os.replace(partial, root)
+    except OSError as exc:
+        raise BeaError(f"Could not move the finished engine into place at {root}: {exc.strerror or exc}.") from exc
 
 
 def _requirements() -> list[str]:

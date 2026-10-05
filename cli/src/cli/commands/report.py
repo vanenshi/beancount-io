@@ -31,7 +31,11 @@ class ReportInterval(StrEnum):
 
 ConversionOpt = Annotated[
     str | None,
-    typer.Option("--conversion", "-x", help="Currency; defaults to the single operating currency, otherwise units"),
+    typer.Option(
+        "--conversion",
+        "-x",
+        help="Currency or units/at_cost/at_value; defaults to the single operating currency, otherwise units",
+    ),
 ]
 TimeOpt = Annotated[
     str | None, typer.Option("--time", "-t", help='Time filter: year, month, 2026, 2026-08, or "2026-01 - 2026-06"')
@@ -103,15 +107,6 @@ def _amounts(
     return "  ".join(render(currency, number) for currency, number in sorted(balance.items())) or "—"
 
 
-def _negated(balance: Mapping[str, Any]) -> dict[str, Decimal | None]:
-    """The same balance in the opposite sign convention, for translating a credit."""
-    result: dict[str, Decimal | None] = {}
-    for currency, number in balance.items():
-        value = _as_decimal(number)
-        result[currency] = None if value is None else -value
-    return result
-
-
 def _print_tree(
     node: dict[str, Any],
     depth: int = 0,
@@ -145,7 +140,7 @@ def _heading(title: str, metadata: dict[str, Any], *, profit_line: bool = False)
     if metadata.get("account_filter_empty"):
         output.note(f"No accounts match {metadata['account_filter']}.")
     if metadata["missing_prices"]:
-        typer.echo("Partial valuation: some prices are missing; combined totals are unavailable.")
+        typer.echo("Partial valuation: some prices are missing; a total that cannot be valued reads Unavailable.")
         for line in metadata["missing_price_summary"]:
             output.note(line)
 
@@ -324,7 +319,7 @@ def balance_sheet(
         typer.echo(f"  {'Total equity (credit):':<46}  {equity_total}")
     # The credit lines above carry the opposite sign to the income statement's
     # Net Profit, which is the same quantity. Say so, and say what it equals.
-    profit = _amounts(_negated(data["current_earnings"]), conversion, precision)
+    profit = _amounts(data["net_profit"], conversion, precision)
     typer.echo(f"\nCredit lines above are negative for a gain; the same period's Net Profit is {profit}.")
     typer.echo(f"Net Worth: {_amounts(data['net_worth'], conversion, precision)}")
     typer.echo(f"\n{str(data['interval']).title()} net worth")
@@ -375,9 +370,7 @@ def balance(
     _heading("Trial Balance", data)
     precision = _precision(data)
     trees = [data[name] for name in ("assets", "liabilities", "equity", "income", "expenses")]
-    if not any(trees):
-        output.note(f"No accounts match {' '.join(accounts or [])}.")
-        return
+    # `_heading` already said "No accounts match …" from `account_filter_empty`.
     for tree in trees:
         if tree is not None:
             typer.echo("")

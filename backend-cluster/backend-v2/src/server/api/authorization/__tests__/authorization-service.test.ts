@@ -50,7 +50,6 @@ const BILLING_ACTIONS = [
 ] as const;
 
 const SESSION_SOCIAL_ACTIONS = [
-  AUTHORIZATION_ACTIONS.USER_SOCIAL_FEED_READ,
   AUTHORIZATION_ACTIONS.USER_SOCIAL_FOLLOW_CREATE,
   AUTHORIZATION_ACTIONS.USER_SOCIAL_FOLLOW_DELETE,
 ] as const;
@@ -421,6 +420,33 @@ describe("AuthorizationService", () => {
     });
   });
 
+  it("allows delegated feed reads only for the exact-self user", async () => {
+    const principal = identity("oauth", "usr_alice", ["ledger.read"]);
+    const action = AUTHORIZATION_ACTIONS.USER_SOCIAL_FEED_READ;
+    expect(authorizationActionAcceptsDelegatedCredential(action)).toBe(true);
+    await expect(
+      selfService().authorize({
+        principal,
+        action,
+        resource: userResource("usr_alice"),
+      }),
+    ).resolves.toMatchObject({ allowed: true });
+    await expect(
+      selfService().authorize({
+        principal,
+        action,
+        resource: userResource("usr_bob"),
+      }),
+    ).resolves.toMatchObject({ allowed: false, reason: "relationship_denied" });
+    await expect(
+      selfService().authorize({
+        principal: anonymousPrincipal(),
+        action,
+        resource: userResource("usr_alice"),
+      }),
+    ).resolves.toMatchObject({ allowed: false });
+  });
+
   it.each(SESSION_SOCIAL_ACTIONS)(
     "does not classify session-only social action %s as delegated parity work",
     (action) => {
@@ -588,6 +614,32 @@ describe("AuthorizationService", () => {
       });
     }
   });
+
+  it.each(LEDGER_CONTENT_READ_ACTIONS)(
+    "conceals relationship denials but preserves credential denials for %s",
+    async (action) => {
+      const relationships = { check: jest.fn(async () => false) };
+      const service = new AuthorizationService(relationships);
+      const principal = identity("oauth", "usr_alice", ["ledger.read"]);
+      const resource = ledgerResource("alice/private");
+      await expect(
+        service.authorizeOrThrow({ principal, action, resource }),
+      ).rejects.toMatchObject({
+        category: ErrorCategory.NOT_FOUND,
+        message: "Ledger not found",
+      });
+      relationships.check.mockClear();
+      for (const restricted of [
+        { ...principal, scopes: new Set<string>() },
+        { ...principal, ledgerScope: "alice/other" },
+      ]) {
+        await expect(
+          service.authorizeOrThrow({ principal: restricted, action, resource }),
+        ).rejects.toMatchObject({ category: ErrorCategory.FORBIDDEN });
+      }
+      expect(relationships.check).not.toHaveBeenCalled();
+    },
+  );
 
   it("checks a ledger pin before any control-plane relationship lookup", async () => {
     const relationships = { check: jest.fn(async () => true) };

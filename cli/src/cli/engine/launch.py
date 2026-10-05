@@ -54,7 +54,8 @@ import select
 import signal
 import subprocess
 import sys
-from collections.abc import Iterator, Sequence
+import threading
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,13 +64,48 @@ from typing import Any, Literal
 from cli import context, output
 from cli.auth.credentials import load_credentials
 from cli.engine import paths, provision
-from cli.errors import BY_CATEGORY, AuthError, BeaError, UsageError
+from cli.errors import BY_CATEGORY, AuthError, BeaError, ConflictError, UsageError
 
 
-def run_engine_argv(argv: Sequence[str]) -> int:
-    """Run the engine helper with `argv`, streams inherited. Returns its exit code."""
+def run_engine_argv(argv: Sequence[str], *, interactive: bool = False) -> int:
+    """Run the engine helper with `argv`, streams inherited. Returns its exit code.
+
+    `interactive` marks a child that owns the terminal for a whole session,
+    such as the query shell: Ctrl-C there belongs to the child, which cancels
+    the line and keeps going, so this process must not die of it too.
+    """
     command, env = helper_command()
-    return _spawn([*command, *argv], env)
+    if not interactive:
+        return _spawn([*command, *argv], env)
+    with _terminal_child_owns_interrupts():
+        return _spawn([*command, *argv], env)
+
+
+@contextmanager
+def _terminal_child_owns_interrupts() -> Iterator[None]:
+    """Let a foreground child answer Ctrl-C while this process waits it out.
+
+    The terminal delivers SIGINT to the whole foreground process group, so the
+    frontend heard every Ctrl-C the shell's user meant for the shell. The
+    `KeyboardInterrupt` then made `subprocess.run` kill the shell a quarter
+    second later — before its atexit history write — and `bea` exited 130
+    while the shell had already printed `(interrupted)` and a fresh prompt.
+
+    A do-nothing Python handler rather than `SIG_IGN`: an ignored disposition
+    survives `exec`, and Python started with SIGINT ignored never raises
+    `KeyboardInterrupt`, so the child would stop hearing Ctrl-C altogether. A
+    handler is reset to the default on `exec`. A child that does die of SIGINT
+    still reports it, and `_died_on_signal` maps that to 130.
+    """
+    try:
+        previous = signal.signal(signal.SIGINT, lambda _number, _frame: None)
+    except (OSError, ValueError):  # Not the main thread: nothing to change.
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 def run_native(name: str, args: Sequence[str], *, env: dict[str, str] | None = None) -> int:
@@ -268,12 +304,17 @@ def _candidate_bin_dirs() -> list[Path]:
     return directories
 
 
-def helper_json(args: Sequence[str], *, stdin: str | None = None) -> dict[str, Any]:
+def helper_json(args: Sequence[str], *, stdin: str | None = None, writes: bool = False) -> dict[str, Any]:
     """Run a helper command and return its result, raising what it reports instead.
 
     The frontend renders: this hands back `data` from the envelope and turns a
     failure into the matching `cli.errors` exception, so a command reads like
     the in-process call it replaced.
+
+    `writes` says the command may change a file. An engine that dies without an
+    envelope then leaves an unknown outcome — the write may already have
+    happened — so it is reported as `conflict`/4 rather than a plain failure,
+    which invites a retry that would append the directive a second time.
 
     `stdin` carries a request the argument list cannot hold — a batch of
     transactions for `bea-engine add --request -`. Nothing is read back from
@@ -283,7 +324,7 @@ def helper_json(args: Sequence[str], *, stdin: str | None = None) -> dict[str, A
     command, env = helper_command()
     completed = _run_helper([*command, *args], env, stdin)
 
-    envelope = _parse(completed, args)
+    envelope = _parse(completed, args, writes=writes)
     if not envelope.get("ok"):
         failure = envelope.get("error") or {}
         category = str(failure.get("category", "validation"))
@@ -321,41 +362,49 @@ _CLEANUP_GRACE_SECONDS = 5.0
 
 def _run_helper(command: list[str], env: dict[str, str] | None, stdin: str | None) -> subprocess.CompletedProcess[str]:
     """`subprocess.run`, except the child is told when the frontend is being stopped."""
-    with subprocess.Popen(
-        command,
-        env=env,
-        stdin=subprocess.PIPE if stdin is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    ) as child:
-        with _forwarding_teardown(child):
+    with _forwarding_teardown() as attach:
+        with subprocess.Popen(
+            command,
+            env=env,
+            stdin=subprocess.PIPE if stdin is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            # Group delivery plus forwarding could otherwise interrupt cleanup twice.
+            # Worker threads cannot forward signals, so their helpers stay in the group.
+            start_new_session=sys.platform != "win32" and threading.current_thread() is threading.main_thread(),
+        ) as child:
+            attach(child)
             out, err = child.communicate(stdin)
     return subprocess.CompletedProcess(command, child.returncode, out, err)
 
 
 @contextmanager
-def _forwarding_teardown(child: subprocess.Popen[str]) -> Iterator[None]:
+def _forwarding_teardown() -> Iterator[Callable[[subprocess.Popen[str]], None]]:
     """Pass a termination signal on to `child`, and let it unwind before we go.
 
     The engine stages every write into a `.bea-*.tmp` candidate beside the
     ledger and drops it in a `finally`. That cleanup only runs if the child is
-    told to stop. A terminal delivers Ctrl-C to the whole foreground process
-    group, so interactive use was always fine — but a supervisor, a container
-    stopping its main pid, `timeout` or `Popen.terminate()` signals the
-    frontend alone, and the orphaned child left a full-size copy of the ledger
-    beside the user's books on every attempt.
+    told to stop. Main-thread calls give the helper a separate session, making
+    this the only signal-delivery path: a terminal's group-wide Ctrl-C cannot
+    interrupt cleanup again after forwarding. Worker-thread calls keep their
+    helpers in the terminal's group because Python cannot install handlers
+    there. Signals aimed at the frontend alone, such as a supervisor's
+    termination request, also reach main-thread helpers through this path.
 
-    Handlers are installed only for the child's lifetime and restored after, so
-    nothing else in the process changes its interrupt behaviour. Once the child
-    is done we re-raise the signal with its default disposition, which keeps the
-    status the shell reports exactly what it was.
+    Install before spawning and defer signals until the child handle is ready,
+    so an interrupt during Popen cannot orphan an isolated helper. Handlers are
+    restored after the child exits. Once the child is done we re-raise the signal
+    with its default disposition, keeping the status the shell reports.
     """
-    if not _FORWARDED_SIGNALS:
-        yield
-        return
+    child: subprocess.Popen[str] | None = None
+    pending: int | None = None
 
     def forward(number: int, _frame: Any) -> None:
+        nonlocal pending
+        if child is None:
+            pending = number
+            return
         child.send_signal(number)
         try:
             child.wait(timeout=_CLEANUP_GRACE_SECONDS)
@@ -363,6 +412,13 @@ def _forwarding_teardown(child: subprocess.Popen[str]) -> Iterator[None]:
             child.kill()
         signal.signal(number, signal.SIG_DFL)
         os.kill(os.getpid(), number)
+
+    def attach(started: subprocess.Popen[str]) -> None:
+        nonlocal child, pending
+        child = started
+        if pending is not None:
+            number, pending = pending, None
+            forward(number, None)
 
     installed: list[tuple[int, Any]] = []
     try:
@@ -374,16 +430,20 @@ def _forwarding_teardown(child: subprocess.Popen[str]) -> Iterator[None]:
                 # `signal.signal` only works on the main thread. Forwarding is
                 # an improvement where it is available, never a requirement.
                 continue
-        yield
+        yield attach
     finally:
         for number, previous in installed:
             try:
                 signal.signal(number, previous)
             except (OSError, ValueError):
                 pass
+        if pending is not None:
+            # A failed spawn must not swallow a termination signal either.
+            signal.signal(pending, signal.SIG_DFL)
+            os.kill(os.getpid(), pending)
 
 
-def _parse(completed: subprocess.CompletedProcess[str], args: Sequence[str]) -> dict[str, Any]:
+def _parse(completed: subprocess.CompletedProcess[str], args: Sequence[str], *, writes: bool = False) -> dict[str, Any]:
     """Read the one JSON object the protocol promises on stdout."""
     try:
         envelope = json.loads(completed.stdout)
@@ -392,6 +452,15 @@ def _parse(completed: subprocess.CompletedProcess[str], args: Sequence[str]) -> 
         # not the program we think it is. Its own output is the only evidence,
         # so it becomes the details rather than being swallowed.
         printed = [line for line in (completed.stderr or completed.stdout).splitlines() if line.strip()][-20:]
+        if writes:
+            # A writer that produced no envelope may or may not have written.
+            # Exit 4 says exactly that, and stops a caller from retrying a
+            # command whose first attempt may already have changed the file.
+            raise ConflictError(
+                f"The Beancount engine did not answer 'bea-engine {' '.join(args)}' "
+                f"(exit {completed.returncode}); the outcome is unknown. Inspect the file before retrying.",
+                details=printed,
+            ) from None
         if completed.returncode < 0:
             # Killed by a signal: the child printed nothing to carry the
             # explanation, so name the signal and what usually causes it.
@@ -428,7 +497,12 @@ def helper_command() -> tuple[list[str], dict[str, str] | None]:
 
 
 def _module_command(python: Path) -> list[str]:
-    return [str(python), "-m", "bea_engine"]
+    # `-P`: `-m` would otherwise put the working directory first on the
+    # module path, so a `regex.py` in whatever folder bea ran from was
+    # imported ahead of the standard library, and a plugin resolved from cwd
+    # only in the helper, never in bean-check (w1/098). The managed engine
+    # requires Python 3.12, and `-P` exists since 3.11.
+    return [str(python), "-P", "-m", "bea_engine"]
 
 
 def _helper_env(source_root: Path | None = None) -> dict[str, str] | None:

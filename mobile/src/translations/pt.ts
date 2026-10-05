@@ -58,6 +58,7 @@ export const pt: Translations = {
   openInBrowser: "Abrir no navegador",
   shareLink: "Partilhar ligação",
   copyLink: "Copiar ligação",
+  drawerCurrentLedger: "Livro atual",
   drawerNew: "Novo",
   drawerLedgerActions: "Ações para {{name}}",
   drawerPrivateLinkHint:
@@ -417,7 +418,7 @@ export const pt: Translations = {
   receiptRevealHint:
     "Nada foi salvo ainda — confira os detalhes na próxima tela.",
   total: "Total",
-  receiptQuotaExhausted: "Cota de IA esgotada. Faça upgrade do seu plano.",
+  receiptQuotaExhausted: "Cota de IA esgotada.",
   receiptParseFailed: "Não foi possível ler o recibo. Tente novamente.",
   receiptUploadFailed: "Falha no envio. Tente novamente.",
   receiptCameraPermission:
@@ -544,7 +545,7 @@ export const pt: Translations = {
     "Consultei o seu livro, mas fiquei sem passos antes de responder. Uma pergunta mais específica costuma resolver.",
   agentQuotaTitle: "Limite mensal de IA atingido",
   agentQuotaBody:
-    "Esgotou a utilização de IA deste mês. É reposta no próximo mês, ou pode fazer upgrade.",
+    "Esgotou a utilização de IA deste mês. É reposta no próximo mês.",
   agentApprovalTitle: "Aprove na web",
   agentApprovalBody:
     "Esta alteração precisa da sua revisão antes de tocar no seu livro, e a aplicação ainda não consegue mostrar o diff completo. Abra este livro em beancount.io para aprovar.",
@@ -574,7 +575,7 @@ export const pt: Translations = {
   createLedgerTemplateSampleHint:
     "Transações de exemplo para explorar a aplicação.",
   createLedgerTierLimit:
-    "Atingiu o limite de livros do seu plano. Atualize ou archive um livro para criar outro.",
+    "Foi atingido o limite de livros. Não é possível criar outro.",
   createLedgerGenericError: "Não foi possível criar o livro. Tente novamente.",
   createLedgerDrawerRow: "Novo livro",
   createLedgerEmptyTitle: "Ainda não há livros",
@@ -603,4 +604,7 @@ export const pt: Translations = {
   breakdownRowShare: "{{amount}}, {{percent}}% do total",
   budgetChartSummary:
     "Orçado versus realizado em {{span}}. Realizado {{actual}} de {{budget}} orçado em {{count}} períodos, {{over}} acima da meta.",
+  feedSourceLedger: "Livro",
+  feedSourceBlog: "Blog",
+  feedSourceRelease: "Versão",
 };

@@ -32,17 +32,23 @@ export const collaboratorListQuery = z
     limit: z.coerce.number().default(10),
   })
   .strict();
+const collaboratorName = z.string().min(1);
 export const collaboratorPermissionQuery = z
-  .object({ collaborator: z.string() })
+  .object({ collaborator: collaboratorName })
   .strict();
 export const collaboratorUpdateInput = z
-  .object({ collaborator: z.string(), permission: permissionSchema.nullish() })
+  .object({
+    collaborator: collaboratorName,
+    permission: permissionSchema.nullish(),
+  })
   .strict();
 export const collaboratorDeleteInput = z
-  .object({ collaborator: z.string() })
+  .object({ collaborator: collaboratorName })
   .strict();
 export const collaboratorLeaveInput = z.object({}).strict();
-const collaboratorPath = ledgerPathSchema.extend({ collaborator: z.string() });
+const collaboratorPath = ledgerPathSchema.extend({
+  collaborator: collaboratorName,
+});
 
 export const COLLABORATOR_ROUTES = [
   v1Route({

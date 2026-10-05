@@ -260,6 +260,136 @@ describe("ActivityTransformer", () => {
       });
     });
 
+    describe("contentless and ref activities", () => {
+      const activityOf = (
+        op_type: string,
+        content: string,
+        ref_name?: string,
+      ): Activity => ({
+        id: 11,
+        op_type: op_type as Activity["op_type"],
+        ref_name,
+        repo: {
+          id: 1,
+          name: "example",
+          full_name: "testuser/example",
+          owner: { login: "testuser" },
+        },
+        act_user: { login: "testuser" },
+        created: "2024-01-15T10:00:00Z",
+        content,
+      });
+      const emptyPush = JSON.stringify({
+        Commits: [],
+        HeadCommit: { Sha1: "abc123", Message: "Add opening balances" },
+        CompareURL: "",
+        Len: 0,
+      });
+
+      it.each(["commit_repo", "mirror_sync_push"])(
+        "skips a %s push that introduced no commits",
+        (op) => {
+          expect(
+            transformActivityToFeedItem(activityOf(op, emptyPush)),
+          ).toBeNull();
+        },
+      );
+
+      it("skips a commit_repo activity with no content", () => {
+        expect(
+          transformActivityToFeedItem(activityOf("commit_repo", "")),
+        ).toBeNull();
+      });
+
+      it("keeps a push that introduced commits", () => {
+        const push = JSON.stringify({
+          Commits: [{ Sha1: "abc123", Message: "Add opening balances" }],
+          HeadCommit: { Sha1: "abc123" },
+          CompareURL: "",
+          Len: 1,
+        });
+        const item = transformActivityToFeedItem(
+          activityOf("commit_repo", push),
+        );
+        expect(item?.title).toBe("Committed to example");
+        expect(item?.summary).toBe("Add opening balances");
+      });
+
+      it("titles a branch creation recorded as push_tag as a branch", () => {
+        const item = transformActivityToFeedItem(
+          activityOf("push_tag", "", "refs/heads/feature"),
+        );
+        expect(item?.title).toBe("Created branch feature in example");
+      });
+
+      it("titles tags and deleted refs by their short names", () => {
+        expect(
+          transformActivityToFeedItem(
+            activityOf("push_tag", "", "refs/tags/v1"),
+          )?.title,
+        ).toBe("Pushed tag v1 to example");
+        expect(
+          transformActivityToFeedItem(
+            activityOf("delete_branch", "", "refs/heads/old"),
+          )?.title,
+        ).toBe("Deleted branch old from example");
+      });
+
+      it("gives an unknown op type a neutral title, not a commit title", () => {
+        const item = transformActivityToFeedItem(
+          activityOf("some_future_op", ""),
+        );
+        expect(item?.title).toBe("Activity in example");
+      });
+    });
+
+    describe("authorAvatar", () => {
+      const withAvatar = (avatar_url: string | undefined): Activity => ({
+        id: 9,
+        op_type: "commit_repo",
+        repo: {
+          id: 1,
+          name: "my-ledger",
+          full_name: "testuser/my-ledger",
+          owner: { login: "testuser" },
+        },
+        act_user: { login: "testuser", avatar_url },
+        created: "2024-01-15T10:00:00Z",
+        content: "Fixed accounting errors",
+      });
+
+      it.each([
+        "https://git.example.org/avatars/abc123",
+        "https://secure.gravatar.com/avatar/abc?d=identicon",
+      ])("keeps a publicly reachable avatar URL (%s)", (url) => {
+        expect(transformActivityToFeedItem(withAvatar(url))?.authorAvatar).toBe(
+          url,
+        );
+      });
+
+      it.each([
+        "http://localhost:3000/avatars/abc123",
+        "http://LOCALHOST/avatars/abc123",
+        "http://gitea:3000/avatars/abc123",
+        "http://127.0.0.1:3000/avatars/abc123",
+        "http://[::1]:3000/avatars/abc123",
+        "http://10.0.0.5/avatars/abc123",
+        "http://172.20.1.2/avatars/abc123",
+        "http://192.168.1.10/avatars/abc123",
+        "http://169.254.169.254/avatars/abc123",
+        "http://gitea.internal/avatars/abc123",
+        "http://app.localhost/avatars/abc123",
+        "/avatars/abc123",
+        "javascript:alert(1)",
+        "",
+        undefined,
+      ])("omits a non-public avatar URL (%s)", (url) => {
+        const item = transformActivityToFeedItem(withAvatar(url));
+        expect(item).not.toBeNull();
+        expect(item?.authorAvatar).toBeUndefined();
+      });
+    });
+
     it("links push commits to their exact dashboard version", () => {
       const activity: Activity = {
         id: 7,

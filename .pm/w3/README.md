@@ -64,6 +64,27 @@
 
 - [x] **m45** — Keep generated import identities exact across amounts and currencies (6 tasks) ← continuous CLI QA, 2026-09-21
 
+- [x] **m46** — [Harden REST v1 ledger path params (validate + encode + fail-closed)](./done/m46/README.md) (8 tasks) ← continuous CLI QA, 2026-09-26
+
+- [x] **m47** — Make `bea format --in-place` a locked, atomic write (6 tasks) ← continuous CLI QA, 2026-09-26; consolidates notes 434 + 435
+
+- [x] **m48** — Refuse output destinations that would destroy files the command was not given (6 tasks) ← continuous CLI QA, 2026-09-26; consolidates notes 431 + 436
+
+- [x] **m49** — Write the money the user asked for (8 tasks) ← continuous CLI QA, 2026-09-25/26; consolidates notes 414 + 416 + 421 + 424 + 430
+
+- [x] **m50** — Make the `ask` consent surface honest and its session survivable (9 tasks) ← continuous CLI QA, 2026-09-26; consolidates notes 451 + 452 + 449 (which absorbed 453) + 454
+
+- [x] **m51** — Answer from bounded, unambiguous query results (9 tasks) ← continuous CLI QA, 2026-09-26; consolidates notes 447 + 455 + 448 + the CLI half of 446
+
+- [ ] **m52** — [Make Ask-AI proxy limits and failures truthful](./blocked/m52/README.md) (7 tasks) ← promoted 446 — **blocked:** provider/operator capacity contract, product decision, and near-limit verification; t001–t002 shipped
+
+## Dropped
+
+- ~~**446**~~ — Ask-AI quota/cap mismatch — superseded 2026-10-02 by [m52](./blocked/m52/README.md); the complete evidence is retained in its source note, public proxy fixes shipped, and shared-provider accounting has an explicit external unblock condition.
+
+- ~~**439**~~ — `--offline` with no cached revision reports the cause as `None` — dropped 2026-09-26: not a separate defect. Same six lines of `cli/src/bea_engine/managed_load.py` (~399–405) as [433](./done/433.md), which now carries both symptoms and the full record; one fix covers both.
+- ~~**453**~~ — One server-side failure ends the whole `bea ask` session — dropped 2026-09-26: not a separate defect. Same five lines of `cli/src/cli/ask/repl.py` (225–233) as [449](./done/449.md), which now carries both triggers and the full record; both notes already said they belonged in one pass.
+
 ## Blocked
 
 Blocked milestones and inbox notes live under [`blocked/`](./blocked/) with their reason and **Unblock:** condition; they keep their IDs and return to the open tree when work can resume.

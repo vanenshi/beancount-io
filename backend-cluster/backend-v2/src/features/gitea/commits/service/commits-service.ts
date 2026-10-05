@@ -13,6 +13,7 @@ import {
   type IAuthorizationService,
 } from "@/server/api/authorization";
 import {
+  BadUserInputError,
   DomainError,
   InternalServerError,
   NotFoundError,
@@ -28,7 +29,8 @@ export function isMissingCommitLookupError(error: unknown): boolean {
   if (error.status === 404 || error.status === 422) return true;
   if (error.status !== 500) return false;
   const apiError = (error as Response & { error?: { message?: string } }).error;
-  const message = `${apiError?.message ?? ""} ${error.statusText ?? ""}`.toLowerCase();
+  const message =
+    `${apiError?.message ?? ""} ${error.statusText ?? ""}`.toLowerCase();
   return (
     message.includes("not found") ||
     message.includes("does not exist") ||
@@ -150,6 +152,17 @@ export class CommitsService implements ICommitsService {
     page = 1,
     limit = 30,
   }: ListCommitsInput): Promise<CommitListItem[]> {
+    // Gitea answers an out-of-range page or limit with its own defaults, so
+    // `limit=-1` and `page=0` returned a full first page as if they had been
+    // honoured. Checked here because GraphQL's Int arguments arrive unchecked.
+    for (const [name, value] of [
+      ["page", page],
+      ["limit", limit],
+    ] as const) {
+      if (!Number.isInteger(value) || value < 1) {
+        throw new BadUserInputError(`${name} must be a positive integer`, name);
+      }
+    }
     await this.authorization.authorizeOrThrow({
       principal: identity ?? anonymousPrincipal(),
       action: AUTHORIZATION_ACTIONS.LEDGER_REPOSITORY_READ,
@@ -200,14 +213,23 @@ export class CommitsService implements ICommitsService {
         shortSha: commit.sha?.substring(0, 7),
       }));
     } catch (error) {
+      if (error instanceof DomainError) throw error;
+      // The generated client throws the `Response` itself, so stringifying it
+      // told the caller "[object Response]". A revision Gitea does not know is
+      // the caller's branch name, not a server fault.
+      if (isMissingCommitLookupError(error)) {
+        throw new NotFoundError("Branch", branch);
+      }
       logger.error("Error fetching commits from Gitea", {
         owner,
         repo,
         branch,
         error: error instanceof Error ? error.message : String(error),
+        status: error instanceof Response ? error.status : undefined,
       });
-      throw new Error(
-        `Failed to fetch commits from Gitea: ${error instanceof Error ? error.message : String(error)}`,
+      throw new InternalServerError(
+        "Failed to fetch commits from Gitea",
+        error instanceof Error ? error : undefined,
       );
     }
   }

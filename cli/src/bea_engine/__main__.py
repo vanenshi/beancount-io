@@ -7,6 +7,15 @@ checkout works without installing the engine distribution at all.
 
 from __future__ import annotations
 
+import signal
+
+from bea_engine import stopping
 from bea_engine.main import app
 
-app()
+# Unwind staged files and locks before reporting the shell's signal status.
+_previous_handlers = stopping.install()
+try:
+    app()
+finally:
+    for number, handler in _previous_handlers.items():
+        signal.signal(number, handler)

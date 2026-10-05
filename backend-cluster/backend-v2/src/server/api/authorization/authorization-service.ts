@@ -54,15 +54,25 @@ type CredentialRequirement = {
   readonly capability?: OperationClass;
   readonly denyMessageByMethod?: Partial<Record<AuthMethod, string>>;
   readonly enforceLedgerScope?: boolean;
+  readonly requireAccountWideCredential?: boolean;
 };
 
 type AuditClass = "read" | "write" | "admin";
+
+/** Shared with the key service's own not-found, so both say the same thing. */
+export const API_KEY_NOT_FOUND_HINT =
+  "Pass a key id (`akey_…`) that belongs to this account, not the key itself. `manageApiKeys` with operation `list` shows your keys and their ids.";
 
 interface DenialConcealment {
   readonly reasons: readonly AuthorizationDenyReason[];
   readonly resourceTypes?: readonly AuthorizationResourceType[];
   readonly category: ErrorCategory;
   readonly message: string;
+  /**
+   * The next step, for a concealment whose category fallback would point at
+   * the wrong kind of resource — NOT_FOUND's talks about ledgers and files.
+   */
+  readonly hint?: string;
 }
 
 interface ActionRequirement {
@@ -178,6 +188,7 @@ const ledgerContentReadRequirement = (): ActionRequirement => ({
   relationships: [relationship("ledger", LEDGER_RELATIONSHIPS.READ_CONTENTS)],
   credential: LEDGER_CONTENT_READ_CREDENTIAL,
   auditClass: "read",
+  concealDenialAs: LEDGER_NOT_FOUND_CONCEALMENT,
 });
 
 /** The one executable policy catalog for protected application domains. */
@@ -259,6 +270,7 @@ const ACTION_REQUIREMENTS: Readonly<
       reasons: ["relationship_denied", "unknown_resource"],
       category: ErrorCategory.NOT_FOUND,
       message: "API key not found",
+      hint: API_KEY_NOT_FOUND_HINT,
     },
   },
   [AUTHORIZATION_ACTIONS.USER_BILLING_STATUS_READ]: {
@@ -298,7 +310,11 @@ const ACTION_REQUIREMENTS: Readonly<
   },
   [AUTHORIZATION_ACTIONS.USER_SOCIAL_FEED_READ]: {
     relationships: userRelationship(USER_RELATIONSHIPS.READ_SOCIAL),
-    credential: { methods: SESSION_ONLY },
+    credential: {
+      methods: INTERACTIVE_OR_OAUTH,
+      capability: "read",
+      requireAccountWideCredential: true,
+    },
     auditClass: "read",
   },
   [AUTHORIZATION_ACTIONS.USER_SOCIAL_FOLLOW_CREATE]: {
@@ -774,6 +790,12 @@ const credentialDenial = (
     return `This operation requires the "ledger.${requirement.capability}" scope`;
   }
   if (
+    requirement.requireAccountWideCredential &&
+    identity.ledgerScope !== undefined
+  ) {
+    return "Reading the account feed requires an account-wide credential";
+  }
+  if (
     requirement.enforceLedgerScope &&
     (resource === undefined ||
       (resource.type !== "ledger" && resource.type !== "bank_connection") ||
@@ -819,6 +841,7 @@ export class AuthorizationDeniedError extends DomainError {
         ...(decision.failedResourceType && {
           resourceType: decision.failedResourceType,
         }),
+        ...(concealed?.hint !== undefined && { hint: concealed.hint }),
       },
     );
   }

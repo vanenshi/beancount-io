@@ -14,9 +14,10 @@ from typing import Annotated
 
 import typer
 
-from cli import context
+from cli import context, output
 from cli.engine import launch
 from cli.errors import UsageError, refuse_json
+from cli.native_command import ForwardingCommand
 from cli.native_help import native_help
 
 _EXTRA = {"allow_extra_args": True, "ignore_unknown_options": True}
@@ -55,12 +56,40 @@ def _ingest_script(supplied: Path | None) -> Path:
     )
 
 
+#: Beangulp `extract`'s boolean short flags (`--reverse`, `--failfast`,
+#: `--quiet`). Click lets them cluster in front of `-o`/`-e`, so `-qo X` names
+#: a destination exactly as `-o X` does (w1/141).
+_EXTRACT_FLAGS = "rxq"
+
+
 def _forward(operation: str, ctx: typer.Context, config: Path | None) -> None:
     refuse_json("ingest", hint="Run without --json for native output; use bea import for a JSON preview.")
+    if operation == "extract":
+        # `archive -o DIR` moves source documents into a directory tree — not a
+        # ledger write — so it stays outside the guard on purpose, and
+        # `identify` writes nothing at all.
+        output.guard_forwarded_output(list(ctx.args), _extract_ledgers(ctx), flags=_EXTRACT_FLAGS)
     script = _ingest_script(config)
     _refuse_config_only_script(script)
     code = launch.run_optional_script("beangulp", script, [operation, *ctx.args])
     raise typer.Exit(code)
+
+
+def _extract_ledgers(ctx: typer.Context) -> list[Path]:
+    """The ledgers an `extract` must never write over: `bea --file`, and Beangulp's `-e`.
+
+    Both are read by the run, so both are destinations that would destroy the
+    books being extracted against.
+    """
+    ledgers: list[Path] = []
+    try:
+        ledgers.append(context.current().entry_file())
+    except UsageError:
+        pass
+    existing = output.forwarded_option(list(ctx.args), "-e", "--existing", flags=_EXTRACT_FLAGS)
+    if existing is not None:
+        ledgers.append(Path(existing).expanduser())
+    return ledgers
 
 
 def _refuse_config_only_script(script: Path) -> None:
@@ -86,19 +115,19 @@ def _refuse_config_only_script(script: Path) -> None:
         )
 
 
-@ingest_app.command("identify", epilog=native_help("ingest identify"), context_settings=_EXTRA)
+@ingest_app.command("identify", cls=ForwardingCommand, epilog=native_help("ingest identify"), context_settings=_EXTRA)
 def identify(ctx: typer.Context, config: _CONFIG = None) -> None:
     """Identify which importer matches each document (Beangulp identify)."""
     _forward("identify", ctx, config)
 
 
-@ingest_app.command("extract", epilog=native_help("ingest extract"), context_settings=_EXTRA)
+@ingest_app.command("extract", cls=ForwardingCommand, epilog=native_help("ingest extract"), context_settings=_EXTRA)
 def extract(ctx: typer.Context, config: _CONFIG = None) -> None:
     """Extract raw entries from documents (Beangulp extract; not bea import --apply)."""
     _forward("extract", ctx, config)
 
 
-@ingest_app.command("archive", epilog=native_help("ingest archive"), context_settings=_EXTRA)
+@ingest_app.command("archive", cls=ForwardingCommand, epilog=native_help("ingest archive"), context_settings=_EXTRA)
 def archive(ctx: typer.Context, config: _CONFIG = None) -> None:
     """File documents into the archive hierarchy (Beangulp archive)."""
     _forward("archive", ctx, config)

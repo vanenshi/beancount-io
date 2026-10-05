@@ -12,7 +12,7 @@ import hashlib
 import re
 import unicodedata
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from bea_engine.amounts import require_decimal_notation
+from bea_engine.ledger.text import is_commodity, require_commodity
 from bea_engine.protocol import UsageError
 
 _MAPPING_FIELDS = frozenset(
@@ -34,7 +35,11 @@ _EU_GROUPING = re.compile(r"\d{1,3}(?:\.\d{3})+")
 # (`-0,5`, `-0,50`, `-0,1234`), so it can only be a decimal comma.
 _COMMA_DECIMAL_TAIL = re.compile(r"\A[^,]*,(?:\d{1,2}|\d{4,})\Z")
 # The comma groupings point-decimal exports use: 1,234,567 and Indian 12,34,567.
-_COMMA_GROUPING = re.compile(r"\d{1,3}(?:,\d{3})+|\d{1,2}(?:,\d{2})*,\d{3}")
+# A first group is never zero-led: `0,125` is not grouping in any convention.
+_COMMA_GROUPING = re.compile(r"[1-9]\d{0,2}(?:,\d{3})+|[1-9]\d?(?:,\d{2})*,\d{3}")
+# One comma and exactly three digits after it: a thousands group only when the
+# whole part is a valid first group, so `0,125` and `1613,030` are decimals.
+_SINGLE_COMMA_THREE = re.compile(r"\d+,\d{3}")
 _ACCEPTED_AMOUNTS = (
     "Accepted: plain decimals (1000.50), $/€ symbols, thousands separators, "
     "(parentheses) or trailing-minus negatives; comma decimals like 1.000,00 "
@@ -44,6 +49,41 @@ _ACCEPTED_AMOUNTS = (
 
 def _is_currency_symbol(text: str) -> bool:
     return len(text) == 1 and unicodedata.category(text) == "Sc"
+
+
+# Symbols that name exactly one commodity. `$` (dollars of a dozen countries)
+# and `¥` (JPY and CNY) are deliberately absent: they say nothing a row can be
+# refused over, and every existing `$` column must keep importing unchanged.
+_UNAMBIGUOUS_SYMBOLS = {
+    "€": "EUR",
+    "£": "GBP",
+    "₹": "INR",
+    "₽": "RUB",
+    "₩": "KRW",
+    "₪": "ILS",
+    "₺": "TRY",
+    "₫": "VND",
+    "₴": "UAH",
+    "฿": "THB",
+    "₱": "PHP",
+    "₦": "NGN",
+}
+
+
+def _cell_symbol_currency(value: str) -> tuple[str, str] | None:
+    """The commodity an amount cell's own symbol names, with the symbol.
+
+    A cell is written by the bank, and `4,50 €` says euros no matter what the
+    mapping or the ledger says. The symbol is still stripped before parsing —
+    the number is the number — but it is no longer thrown away unread: a symbol
+    that contradicts the currency the row would be posted in is a refusal, not a
+    relabelling of the money.
+    """
+    for character in value:
+        currency = _UNAMBIGUOUS_SYMBOLS.get(character)
+        if currency is not None:
+            return character, currency
+    return None
 
 
 def _negated(number: Decimal) -> Decimal:
@@ -61,16 +101,16 @@ def _negated(number: Decimal) -> Decimal:
     return number.copy_negate()
 
 
-def _split_amount_sign(value: str) -> tuple[str, str, bool]:
+def _split_amount_sign(value: str) -> tuple[str, str, int]:
     """Split the sign, currency symbols, and parentheses off an amount cell.
 
-    Returns the leading +/- sign (kept for Decimal), the bare core, and whether
-    parentheses/trailing-minus negation applies.
+    Returns the leading +/- sign (kept for Decimal), the bare core, and how
+    many parentheses/trailing-minus negations the cell carries.
     """
     text = value.strip()
-    negate = False
+    negations = 0
     if len(text) >= 2 and text.startswith("(") and text.endswith(")"):
-        negate = True
+        negations += 1
         text = text[1:-1]
     text = text.strip()
     sign = ""
@@ -88,11 +128,11 @@ def _split_amount_sign(value: str) -> tuple[str, str, bool]:
             text = text[:-1]
         elif text.endswith("-") and not trailing_minus_seen:
             trailing_minus_seen = True
-            negate = not negate
+            negations += 1
             text = text[:-1]
         else:
             break
-    return sign, text.strip(), negate
+    return sign, text.strip(), negations
 
 
 def _separator_vote(core: str) -> str | None:
@@ -101,6 +141,10 @@ def _separator_vote(core: str) -> str | None:
         return "eu" if core.rfind(",") > core.rfind(".") else "us"
     if _COMMA_DECIMAL_TAIL.match(core):
         return "eu-weak"
+    if _SINGLE_COMMA_THREE.fullmatch(core) and not _COMMA_GROUPING.fullmatch(core):
+        # `0,125` or `1613,030`: three decimals that no grouping can explain,
+        # so the cell proves comma decimals as firmly as `1.613,030` does.
+        return "eu"
     return None
 
 
@@ -117,7 +161,7 @@ def _resolve_decimal_comma(cells: list[tuple[int, str]]) -> bool:
     for row_number, value in cells:
         if not value.strip():
             continue
-        _sign, core, _negate = _split_amount_sign(value)
+        _sign, core, _negations = _split_amount_sign(value)
         vote = _separator_vote(core)
         if vote == "us" and first_us is None:
             first_us = (row_number, value.strip())
@@ -179,7 +223,14 @@ def _comma_decimal_to_point(where: str, column: str, value: str, text: str) -> s
 
 def _parse_amount_cell(where: str, column: str, value: str, *, decimal_comma: bool) -> Decimal:
     """Parse one bank amount cell under the column's resolved convention."""
-    sign, core, negate = _split_amount_sign(value)
+    sign, core, negations = _split_amount_sign(value)
+    if negations > 1 or (negations and (sign == "-" or core.startswith("-"))):
+        # `(-5.00)`, `-5.00-` or `(5.00-)` marks one amount negative twice.
+        # Cancelling the two would book a payment as money in: refuse it.
+        raise UsageError(
+            f"{where}: amount {value!r} in column {column!r} is marked negative twice (more than one of a "
+            "minus sign, parentheses, and a trailing minus); keep one negative marker."
+        )
     if _NON_FINITE_AMOUNT.fullmatch(core):
         raise UsageError(f"{where}: amount {value!r} in column {column!r} is not a finite number.")
     text = _THOUSAND_SEPARATOR_FILLER.sub("", core)
@@ -201,7 +252,7 @@ def _parse_amount_cell(where: str, column: str, value: str, *, decimal_comma: bo
         raise UsageError(f"{where}, column {column!r}: {exc}") from None
     except InvalidOperation:
         raise _unparseable_amount(where, column, value) from None
-    return _negated(number) if negate else number
+    return _negated(number) if negations else number
 
 
 @dataclass(frozen=True)
@@ -215,6 +266,10 @@ class CsvMapping:
         return self.columns.get(name)
 
 
+# The spellings of "match every row" a rules file may use on purpose.
+_EXPLICIT_CATCH_ALL = frozenset({".*", "^.*", ".*$", "^.*$"})
+
+
 @dataclass(frozen=True)
 class CsvRule:
     """One categorization rule: the first matching pattern wins."""
@@ -224,7 +279,7 @@ class CsvRule:
     expression: re.Pattern[str] = field(compare=False)
 
     @staticmethod
-    def compile(index: int, raw: Any) -> CsvRule:
+    def compile(index: int, raw: Any, roots: Collection[str] | None = None) -> CsvRule:
         match = raw.get("match") if isinstance(raw, dict) else None
         account = raw.get("account") if isinstance(raw, dict) else None
         if not isinstance(match, str) or not isinstance(account, str):
@@ -232,16 +287,26 @@ class CsvRule:
         if not match.strip():
             raise UsageError(f"Rule {index + 1} has an empty match; write a regex, or .* for a catch-all.")
         try:
-            expression = re.compile(match, re.IGNORECASE)
+            # Compiled NFC, like the cell text it searches: `café` typed
+            # composed must match a bank's decomposed `café`, and vice versa.
+            expression = re.compile(unicodedata.normalize("NFC", match), re.IGNORECASE)
         except re.error as exc:
             raise UsageError(f"Rule {index + 1} has an invalid regex {match!r}: {exc}.") from exc
+        # A pattern that matches empty text (`a|b|`, `(x)?`, `y*`) matches every
+        # row, so a typo would silently categorize all of them. Only the
+        # documented spelling of a catch-all may do that.
+        if expression.search("") is not None and match.strip() not in _EXPLICIT_CATCH_ALL:
+            raise UsageError(
+                f"Rule {index + 1} pattern {match!r} matches empty text, so it would categorize every row; "
+                "drop the empty alternative (such as a trailing |), or write .* for an explicit catch-all."
+            )
         # A rule naming an unopenable account used to surface as every matching
         # row being "not open" — a name no `open` directive can ever create.
         # Refuse it here, where the rule number says which line to fix.
         from bea_engine.ledger.text import parse_account
 
         try:
-            account = parse_account(account)
+            account = parse_account(account, roots)
         except UsageError as exc:
             raise UsageError(f"Rule {index + 1}: {exc}") from None
         return CsvRule(pattern=match, account=account, expression=expression)
@@ -292,12 +357,15 @@ def parse_mapping(spec: str) -> CsvMapping:
     return CsvMapping(columns=columns, sign=sign)
 
 
-def load_rules(path: Path) -> list[CsvRule]:
-    """Load `--rules` TOML into ordered, compiled rules (exit 2 on misuse)."""
+def load_rules(path: Path, roots: Collection[str] | None = None) -> list[CsvRule]:
+    """Load `--rules` TOML into ordered, compiled rules (exit 2 on misuse).
+
+    With the ledger's ``roots``, a rule account under any other root is refused.
+    """
     import tomllib
 
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        raw = tomllib.loads(path.read_text(encoding="utf-8-sig"))
     except OSError as exc:
         raise UsageError(f"Cannot read rules file {path}: {exc}.") from exc
     except ValueError as exc:
@@ -306,7 +374,7 @@ def load_rules(path: Path) -> list[CsvRule]:
     if not isinstance(entries, list) or not entries:
         raise UsageError(f"Rules file {path} must hold a [[rule]] list with match and account each.")
     try:
-        return [CsvRule.compile(index, entry) for index, entry in enumerate(entries)]
+        return [CsvRule.compile(index, entry, roots) for index, entry in enumerate(entries)]
     except UsageError as exc:
         raise UsageError(f"Rules file {path}: {exc}") from exc
 
@@ -418,6 +486,33 @@ def _read_codec(encoding: str) -> str:
     return "utf-8-sig" if encoding == "utf-8" else encoding
 
 
+_UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
+
+
+def _refuse_utf16(source: Path) -> None:
+    """Refuse UTF-16 text (Excel's "Unicode Text") and binaries before any codec reads them.
+
+    cp1252 and latin-1 decode nearly any bytes, so a UTF-16 export used to be
+    diagnosed as cp1252 and then read as a header of `ÿþD a t e`. No supported
+    encoding reads a file with a UTF-16 byte-order mark or NUL bytes; say what
+    can. NULs all on one byte parity are BOM-less UTF-16; scattered ones are a
+    binary file such as a spreadsheet.
+    """
+    with open(source, "rb") as stream:
+        head = stream.read(4096)
+    if b"\x00" not in head and not head.startswith(_UTF16_BOMS):
+        return
+    even, odd = head[0::2].count(0), head[1::2].count(0)
+    if head.startswith(_UTF16_BOMS) or (min(even, odd) == 0 and 4 * max(even, odd) >= len(head) // 2):
+        raise UsageError(
+            f"{source.name} is UTF-16 text, which import cannot read; re-save it as UTF-8 (Excel: CSV UTF-8) and retry."
+        )
+    raise UsageError(
+        f"{source.name} contains NUL bytes, so it is not a CSV text file (a spreadsheet or other binary?); "
+        "export it as CSV UTF-8 and retry."
+    )
+
+
 def probe_decoding(source: Path) -> str:
     """First of utf-8, cp1252, latin-1 that decodes this file.
 
@@ -489,12 +584,16 @@ def detect_delimiter(source: Path, encoding: str = "utf-8") -> str:
     """Pick comma, semicolon, tab, or pipe from the first non-empty lines.
 
     Bank exports often use ``;`` (EU), tabs, or ``|`` (brokers). Prefer the
-    separator with a consistent multi-field column count across the sampled
-    body rows, so a header tied on field count resolves by the body; the
-    header itself stays out of the uniformity check (a merged header cell is
-    not a vote), and when no candidate is consistent the most fields on the
-    header line wins as before.
+    separator on which the header and every sampled body row agree on one
+    multi-field count, so a header tied on field count resolves by the body
+    and a body tie resolves by the header: a comma file whose quoted cells
+    hold semicolons, or a tab file whose dates hold commas, splits its header
+    on the real separator only. A separator the body agrees on but the header
+    does not (a merged header cell) comes next, provided the header splits on
+    it at all; when nothing is consistent the most fields on the header line
+    wins.
     """
+    _refuse_utf16(source)
     try:
         with open(source, encoding=_read_codec(encoding), newline="") as stream:
             sample = []
@@ -507,19 +606,30 @@ def detect_delimiter(source: Path, encoding: str = "utf-8") -> str:
         raise _decode_usage_error(source, exc, encoding) from None
     if not sample:
         return ","
-    best = ","
-    best_count = 0
-    body = sample[1:]
+    header, body = sample[0], sample[1:]
+    agreed: tuple[int, str] | None = None
+    body_only: tuple[int, str] | None = None
     for delim in _CANDIDATE_DELIMITERS:
         counts = {_field_count(line, delim) for line in body}
-        if len(counts) == 1:
-            (count,) = counts
-            if count is not None and count > 1 and count > best_count:
-                best, best_count = delim, count
-    if best_count > 1:
-        return best
+        if len(counts) != 1:
+            continue
+        (count,) = counts
+        header_count = _field_count(header, delim)
+        if count is None or count < 2 or header_count is None or header_count < 2:
+            continue
+        if header_count == count:
+            if agreed is None or count > agreed[0]:
+                agreed = (count, delim)
+        elif body_only is None or count > body_only[0]:
+            body_only = (count, delim)
+    if agreed is not None:
+        return agreed[1]
+    if body_only is not None:
+        return body_only[1]
+    best = ","
+    best_count = 0
     for delim in _CANDIDATE_DELIMITERS:
-        count = _field_count(sample[0], delim)
+        count = _field_count(header, delim)
         if count is not None and count > best_count:
             best, best_count = delim, count
     return best
@@ -582,13 +692,23 @@ def open_records(
     folding every later row into one field. When ``delimiter`` is omitted the
     sampled rows choose among comma, semicolon, tab, and pipe.
     """
+    _refuse_utf16(source)
     delim = detect_delimiter(source, encoding=encoding) if delimiter is None else delimiter
     with open(source, encoding=_read_codec(encoding), newline="") as stream:
         reader = csv.reader(stream, delimiter=delim, strict=True)
+        # A malformed record is reported where it starts: `line_num` has by
+        # then run to the end of the file when an unclosed quote swallowed it.
+        header_start = 1
         try:
             first = next(reader, None)
+            # Blank lines before the header (some bank exports start with
+            # one) are not the header; `detect_delimiter` skips them too, and
+            # `line_num` keeps counting them, so file lines stay right.
+            while first is not None and not any(cell.strip() for cell in first):
+                header_start = reader.line_num + 1
+                first = next(reader, None)
         except csv.Error as exc:
-            raise _malformed(source, reader.line_num, exc) from None
+            raise _malformed(source, header_start, exc) from None
         except UnicodeDecodeError as exc:
             raise _decode_usage_error(source, exc, encoding) from None
         headers = [cell.strip() for cell in first or []]
@@ -606,7 +726,7 @@ def open_records(
                     yield start, {name: record[i] if i < len(record) else "" for i, name in enumerate(headers)}
                     start = reader.line_num + 1
             except csv.Error as exc:
-                raise _malformed(source, reader.line_num, exc) from None
+                raise _malformed(source, start, exc) from None
             except UnicodeDecodeError as exc:
                 raise _decode_usage_error(source, exc, encoding) from None
 
@@ -678,6 +798,13 @@ def read_header(source: Path, *, delimiter: str | None = None, encoding: str = "
         return None
 
 
+def _lookalike_header(column: str, headers: list[str]) -> str | None:
+    """The one header that differs from a mapped column name only by case."""
+    folded = column.casefold()
+    matches = [header for header in headers if header != column and header.casefold() == folded]
+    return matches[0] if len(matches) == 1 else None
+
+
 class CsvImporter:
     """A column-mapping importer with the Beangulp shape (`name = "csv"`)."""
 
@@ -692,10 +819,14 @@ class CsvImporter:
         rules: list[CsvRule] | None = None,
         default_account: str = "Expenses:Uncategorized",
         currency: str | None = None,
+        known_currencies: frozenset[str] | None = None,
         delimiter: str | None = None,
         encoding: str = "utf-8",
+        account_roots: Collection[str] | None = None,
     ) -> None:
         self._account = account
+        # The ledger's root names; a category under any other root is a label.
+        self._account_roots = account_roots
         self._mapping = mapping
         self._delimiter = delimiter
         self._encoding = encoding
@@ -703,10 +834,20 @@ class CsvImporter:
         self._rules = rules or []
         self._default_account = default_account
         self._currency = currency
+        # Commodities a constant `currency=CODE` may name; None skips the check.
+        self._known_currencies = known_currencies
+        # Set by _check_columns when the currency mapping names a commodity
+        # rather than a column the file has.
+        self._constant_currency: str | None = None
         self._decimal_comma = False
         self.skipped_blank_rows = 0
         # Category values that were not account names, for the caller to report once.
         self.rejected_categories: Counter[str] = Counter()
+
+    @property
+    def constant_currency(self) -> str | None:
+        """The commodity `currency=CODE` fixed for every row, once extraction ran."""
+        return self._constant_currency
 
     def identify(self, filepath: str) -> bool:
         return True
@@ -726,11 +867,33 @@ class CsvImporter:
         """Every column this run reads must exist exactly once, or a row could silently take the wrong cell."""
         counts = Counter(headers)
         wanted = dict(self._mapping.columns)
+        # `currency=EUR` on a file with no `EUR` column is a constant, not a
+        # typo: a foreign-currency export that names its commodity nowhere used
+        # to be importable only by editing the bank's own file.
+        constant = wanted.get("currency")
+        if (
+            constant is not None
+            and counts[constant] == 0
+            and is_commodity(constant)
+            and _lookalike_header(constant, headers) is None
+        ):
+            # A constant relabels every row's money, so it must be a
+            # commodity the ledger already knows, not any capitalized word.
+            if self._known_currencies is not None and constant not in self._known_currencies:
+                raise UsageError(
+                    f"currency={constant} names no column of {source.name} and no commodity this ledger "
+                    f"knows. Map the file's currency column, or declare it first: "
+                    f"bea add commodity --date YYYY-MM-DD --currency {constant}."
+                )
+            self._constant_currency = constant
+            del wanted["currency"]
         if category_header is not None:
             wanted.setdefault("category", category_header)
         for role, column in wanted.items():
             if counts[column] == 0:
-                raise UsageError(f"The mapping names column {column!r} for {role}, which {source.name} lacks.")
+                lookalike = _lookalike_header(column, headers)
+                hint = f" Did you mean {lookalike!r}? Column names are case-sensitive." if lookalike else ""
+                raise UsageError(f"The mapping names column {column!r} for {role}, which {source.name} lacks.{hint}")
             if counts[column] > 1:
                 raise UsageError(
                     f"Column {column!r} appears {counts[column]} times in the header of {source.name}, so {role} "
@@ -739,6 +902,90 @@ class CsvImporter:
 
     def _parse_decimal(self, where: str, column: str, value: str) -> Decimal:
         return _parse_amount_cell(where, column, value, decimal_comma=self._decimal_comma)
+
+    def _pair_number(self, row: dict[str, str], where: str) -> Decimal:
+        """The signed amount of a row mapped as a debit/credit pair.
+
+        A debit is money leaving the source account and a credit money arriving,
+        whichever sign the bank printed on the cell: many exports print the
+        outflow column negative already, and negating that a second time booked
+        every outflow as income. So the direction comes from the column and only
+        the magnitude from the cell.
+
+        A cell that parses to zero is an empty cell for the "exactly one" rule —
+        banks routinely zero-fill the unused side — and a row whose two cells are
+        both zero is a zero amount, exactly as the single-amount path treats
+        `0.00`.
+        """
+        columns = self._mapping.columns
+        parsed: list[tuple[str, Decimal]] = []
+        for side in ("debit", "credit"):
+            text = self._cell(row, where, side)
+            if text.strip():
+                parsed.append((side, self._parse_decimal(where, columns[side], text)))
+        nonzero = [(side, number) for side, number in parsed if number]
+        if not parsed or len(nonzero) > 1:
+            raise UsageError(f"{where}: fill exactly one of {columns['debit']!r} or {columns['credit']!r}.")
+        if not nonzero:
+            return parsed[0][1].copy_abs()
+        side, number = nonzero[0]
+        magnitude = number.copy_abs()
+        return magnitude if side == "credit" else _negated(magnitude)
+
+    def _check_cell_symbols(self, row: dict[str, str], where: str, currency: str, amount_columns: list[str]) -> None:
+        """Refuse a row whose own currency symbol is not the currency it would post.
+
+        The symbols are stripped to parse the number; reading them back is what
+        keeps a `4,50 €` cell from being written as `-4.50 USD` under a USD
+        ledger, with exit 0 and a green `bea check` over the wrong commodity.
+        """
+        for column in amount_columns:
+            found = _cell_symbol_currency(row.get(column, ""))
+            if found is None:
+                continue
+            symbol, symbol_currency = found
+            if symbol_currency != currency:
+                unknown = self._known_currencies is not None and symbol_currency not in self._known_currencies
+                declare = (
+                    f" (after bea add commodity --date YYYY-MM-DD --currency {symbol_currency})" if unknown else ""
+                )
+                raise UsageError(
+                    f"{where}: column {column!r} carries {symbol!r} ({symbol_currency}), but the row would post "
+                    f"{currency}. Name the commodity with --csv currency={symbol_currency}{declare}, or open the "
+                    f"source account for {symbol_currency}. Nothing was written."
+                )
+
+    def _check_pair_signs(self, numbered: list[tuple[int, int, dict[str, str]]]) -> None:
+        """Refuse a debit or credit column whose rows disagree about the sign.
+
+        One sign throughout means the column's own sign carries no information
+        and the magnitude rule in `_pair_number` is safe. A column holding both
+        `-5` and `7` does not: one of the two spellings means the opposite
+        direction, and no row can say which. Naming the column and the two rows
+        lets the caller map it as `amount=` — where the sign *is* the direction —
+        or split it, instead of having half the export booked backwards.
+        """
+        columns = self._mapping.columns
+        for side in ("debit", "credit"):
+            column = columns.get(side)
+            if column is None:
+                continue
+            first: dict[bool, int] = {}
+            for row_number, line, row in numbered:
+                text = row.get(column, "")
+                if not text.strip():
+                    continue
+                number = self._parse_decimal(_at(row_number, line), column, text)
+                if number:
+                    first.setdefault(number < 0, row_number)
+                if len(first) == 2:
+                    negative, positive = first[True], first[False]
+                    raise UsageError(
+                        f"Column {column!r} mixes signs: row {negative} is negative and row {positive} "
+                        f"is positive, so no row says which direction the sign means. A {side} column posts "
+                        f"by magnitude and must use one sign; map the column with amount= if its sign "
+                        f"carries the direction."
+                    )
 
     def _is_blank_row(self, row: dict[str, str], headers: set[str]) -> bool:
         """Whether every mapped cell in the row is empty or whitespace."""
@@ -758,7 +1005,7 @@ class CsvImporter:
             self._check_columns(source, headers, category_header)
             materialized = list(records)
             amount_columns = [columns[field] for field in ("amount", "debit", "credit") if field in columns]
-            blank_headers = set(columns.values())
+            blank_headers = {column for column in columns.values() if column != self._constant_currency}
             if category_header is not None:
                 blank_headers.add(category_header)
             # Number the data rows once, up front, and hand both numbers down.
@@ -781,6 +1028,8 @@ class CsvImporter:
             self._decimal_comma = _resolve_decimal_comma(
                 [(number, row.get(header, "")) for number, _line, row in numbered for header in amount_columns]
             )
+            if "amount" not in columns:
+                self._check_pair_signs(numbered)
             for row_number, line, row in numbered:
                 where = _at(row_number, line)
                 date_column = columns["date"]
@@ -795,18 +1044,25 @@ class CsvImporter:
                     amount_column = columns["amount"]
                     number = self._parse_decimal(where, amount_column, self._cell(row, where, "amount"))
                 else:
-                    debit = self._cell(row, where, "debit")
-                    credit = self._cell(row, where, "credit")
-                    if bool(debit) == bool(credit):
-                        raise UsageError(f"{where}: fill exactly one of {columns['debit']!r} or {columns['credit']!r}.")
-                    side = "credit" if credit else "debit"
-                    number = self._parse_decimal(where, columns[side], credit or debit)
-                    number = number if credit else _negated(number)
+                    number = self._pair_number(row, where)
                 if self._mapping.sign == "ledger":
                     number = _negated(number)
-                currency = self._cell(row, where, "currency") or self._currency
+                currency = self._constant_currency or self._cell(row, where, "currency") or self._currency
                 if not currency:
-                    raise UsageError(f"{where}: no currency column and the ledger has no single operating currency.")
+                    raise UsageError(
+                        f"{where}: no currency column and the ledger has no single operating currency. "
+                        "Name the commodity with --csv currency=CODE, or open the source account for one currency."
+                    )
+                try:
+                    # The cell is printed bare into both postings, so anything
+                    # but one commodity token — a line break above all — would
+                    # write accounting syntax the bank row never meant.
+                    require_commodity(currency)
+                except ValueError as exc:
+                    raise UsageError(
+                        f"{where}, column {columns.get('currency')!r}: {exc} Nothing was written."
+                    ) from None
+                self._check_cell_symbols(row, where, currency, amount_columns)
                 # An unmapped or blank payee is absent, not empty: a bare `""`
                 # payee would be printed into every entry the mapping writes.
                 payee = self._cell(row, where, "payee") or None
@@ -840,18 +1096,21 @@ class CsvImporter:
         from beancount.core.account import is_valid
 
         category_text = row.get(category_header, "").strip() if category_header is not None else ""
+        # Bank exports mix Unicode normalization forms; rules compare NFC
+        # text, as `list --search` does, so equal-looking text matches.
+        texts = [unicodedata.normalize("NFC", text) for text in (payee or "", narration, category_text)]
         for rule in self._rules:
-            if (
-                rule.expression.search(payee or "")
-                or rule.expression.search(narration)
-                or rule.expression.search(category_text)
-            ):
+            if any(rule.expression.search(text) for text in texts):
                 return rule.account, "*", rule.pattern
         if category_header is not None:
             if category_header not in row:
                 raise UsageError(f"{where}: the CSV lacks category column {category_header!r}.")
             category = row[category_header].strip()
-            if category and is_valid(category):
+            if (
+                category
+                and is_valid(category)
+                and (self._account_roots is None or category.split(":", 1)[0] in self._account_roots)
+            ):
                 return category, "*", category
             if category:
                 # A card export's own label ("Groceries", "Food & Drink") is

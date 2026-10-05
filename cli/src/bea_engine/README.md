@@ -23,7 +23,9 @@ path and resolves every `include` against it. The helper reads and writes only
 the paths it is given, inherits the caller's working directory, and never
 prompts: there is no interactive mode and no terminal detection.
 
-**stdout** carries exactly one JSON object per invocation and nothing else:
+**stdout** carries exactly one JSON object per invocation and nothing else.
+While a command body runs, descriptor 1 points at stderr, so a ledger plugin
+or importer that prints cannot corrupt it:
 
 ```json
 {"engine": "0.1.0", "command": "check", "ok": true, "data": {"valid": true, "errors": []}}
@@ -74,16 +76,23 @@ doing money arithmetic, and a float would silently round.
 | `list --file PATH --type TYPE`      | `{"items": [...], "truncated": false, "errors": []}`       |
 | `add --file PATH --type TYPE --request JSON` | `{"written": 1, "directive": {...}, "warnings": [], "target": "..."}` |
 | `append --file PATH --text TEXT`    | raw directive text: dry-run token or `{"written", "target"}` |
-| `shell --file PATH`                 | nothing — the one streaming command (see below)            |
+| `syntax PATH...`                    | `{"files": {path: [errors]}}`, per-file syntax errors       |
+| `format PATH... [--in-place]`       | `{"changed": [path, ...]}` — locked, atomic in-place writes |
+| `format --render PATH`             | `{"text": "..."}` — same formatting for a file or `-` for stdin |
+| `shell --file PATH`                 | interactive query streams (see below)                     |
+| `source-shell SOURCE`               | native Beanquery streams, with input-file protection      |
+| `source-query SOURCE BQL`           | one native query's rendering; exit 2 on a usage error     |
 | `report --file PATH --kind KIND`    | one financial report (trees, series, valuation metadata)   |
 | `balance --file PATH [ACCOUNT...]`  | filtered balances or the trial balance                     |
 | `init --file PATH --currency CCY --date DATE` | starter ledger creation                          |
 | `import --file PATH --source PATH`  | CSV/Beangulp extract, dedup preview, optional append       |
 | `version`                           | `{"version": "0.1.0"}`                                     |
 
-`shell` is the exception to everything above: an interactive terminal session
+`shell` and `source-shell` are exceptions to the envelope contract: a terminal session
 cannot be summarised in an envelope, so it streams and answers with its exit
-status.
+status. `source-query` streams the same way, because native `--source` output
+is upstream's rendering rather than bea's envelope; a missing stored query or a
+dropped statement tail still exits 2.
 
 ### `list`
 

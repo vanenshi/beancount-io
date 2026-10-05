@@ -9,8 +9,10 @@ from pathlib import Path
 
 import typer
 
+from cli import output
 from cli.engine import launch
 from cli.errors import BeaError, ConflictError, LedgerError, refuse_json
+from cli.native_command import ForwardingCommand
 from cli.native_help import native_help
 
 doctor_app = typer.Typer(
@@ -133,6 +135,27 @@ def _syntax_errors_of(filename: str) -> list[str]:
     return [str(error) for error in data.get("files", {}).get(filename, [])]
 
 
+def _closure_syntax_errors_of(filename: str) -> list[str]:
+    """Syntax errors anywhere in the ledger's include closure, root first.
+
+    `print-options` and `roundtrip` load the whole ledger, so an unparseable
+    include fails them just as surely as an unparseable root: the loader logs
+    the error and carries on with whatever it recovered. `lex` and `parse`
+    read only the named file upstream, and keep using `_syntax_errors_of`.
+    Fails open exactly like that helper does.
+    """
+    root = Path(filename)
+    if not root.is_file():
+        return []
+    members = [str(member) for member in output.ledger_closure(root)]
+    try:
+        data = launch.helper_json(["syntax", *members])
+    except BeaError:
+        return []
+    files = data.get("files", {})
+    return [str(error) for member in members for error in files.get(member, [])]
+
+
 def _refuse_json() -> None:
     """Doctor has no JSON output; every operation says so the same way."""
     refuse_json(
@@ -186,7 +209,7 @@ def _forward_print_options(ctx: typer.Context) -> None:
     args = list(ctx.args)
     positionals = _positionals(args)
     if positionals:
-        errors = _syntax_errors_of(positionals[0])
+        errors = _closure_syntax_errors_of(positionals[0])
         if errors:
             raise LedgerError(f"doctor print-options cannot load {positionals[0]}: {errors[0]}")
     code = launch.run_native("bean-doctor", ["print-options", *args])
@@ -198,9 +221,11 @@ def _roundtrip_artifacts(ledger: str) -> list[Path]:
 
     Derived exactly as `beancount.scripts.doctor.roundtrip` does —
     `os.path.splitext` then `<base>.roundtrip1<ext>` — because the refusal
-    below is only worth as much as its agreement with upstream.
+    below is only worth as much as its agreement with upstream. Upstream's
+    `ledger_path` is `click.Path(resolve_path=True)`, so a symlinked ledger is
+    resolved first and the scratch files land beside its target (w1/156).
     """
-    base, extension = os.path.splitext(ledger)
+    base, extension = os.path.splitext(os.path.realpath(ledger))
     return [Path(f"{base}.roundtrip{index}{extension}") for index in (1, 2)]
 
 
@@ -239,7 +264,7 @@ def _forward_roundtrip(ctx: typer.Context) -> None:
     positionals = _positionals(args)
     if positionals:
         _refuse_roundtrip_collisions(positionals[0])
-    errors = _syntax_errors_of(positionals[0]) if positionals else []
+    errors = _closure_syntax_errors_of(positionals[0]) if positionals else []
     completed = launch.capture_native("bean-doctor", ["roundtrip", *args])
     if errors:
         _replay_without_congratulations(completed)
@@ -355,6 +380,7 @@ def _register(op: str) -> None:
 
     @doctor_app.command(
         op,
+        cls=ForwardingCommand,
         help=help_text,
         epilog=native_help(f"doctor {op}"),
         context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
@@ -370,6 +396,7 @@ for _op in _OPS:
 
 @doctor_app.command(
     "dump-lexer",
+    cls=ForwardingCommand,
     epilog=native_help("doctor dump-lexer"),
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
 )

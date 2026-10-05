@@ -19,7 +19,6 @@ import { useCallback } from "react";
 import { createLedgerId } from "@/common/lib/utils/encode";
 import { useTranslations } from "@/common/hooks/use-translations";
 import { useLedger } from "@/common/hooks/use-ledger";
-import { LedgerPageSEO } from "@/common/components/seo/ledger-page-seo";
 import { QueryView } from "@/common/components/query-view";
 
 export default function LedgerErrorsPage() {
@@ -47,7 +46,6 @@ export default function LedgerErrorsPage() {
 
   return (
     <div className="space-y-4">
-      <LedgerPageSEO seoKey="ledgerErrors" noIndex />
       <PageHeader
         title={t("page.errors.errors")}
         description={t("common.pageDescription.errors", {
@@ -144,7 +142,7 @@ export default function LedgerErrorsPage() {
                           // pointer-only and unreachable by keyboard.
                           <button
                             type="button"
-                            className="truncate underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded"
+                            className="cursor-pointer truncate underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded"
                             onClick={() =>
                               handleGoToFile(
                                 err.filename || "",

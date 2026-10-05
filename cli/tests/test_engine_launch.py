@@ -57,7 +57,8 @@ def fake_venv(root: Path) -> Path:
     """The parts of a provisioned environment that `paths.is_provisioned` looks for."""
     (root / "bin").mkdir(parents=True, exist_ok=True)
     (root / "bin" / "python").write_text("")
-    (root / "lib" / "python3.12" / "site-packages" / "beanquery").mkdir(parents=True, exist_ok=True)
+    for package in ("beancount", "beanquery"):
+        (root / "lib" / "python3.12" / "site-packages" / package).mkdir(parents=True, exist_ok=True)
     return root
 
 
@@ -94,6 +95,21 @@ class TestHelperJson:
 
         assert "did not answer" in str(raised.value)
         assert "exit 9" in str(raised.value)
+
+    def test_a_writer_that_answers_nothing_reports_an_unknown_outcome(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A write whose envelope never arrived may already have happened (w3/414).
+
+        Reporting it as a plain failure invited the retry that appended the
+        directive a second time; exit 4 is the documented "outcome unknown".
+        """
+        monkeypatch.setattr(launch, "helper_command", lambda: ([sys.executable, "-c", "import sys; sys.exit(9)"], None))
+
+        with pytest.raises(BeaError) as raised:
+            launch.helper_json(["add", "--file", "main.bean"], writes=True)
+
+        assert raised.value.exit_code == 4
+        assert raised.value.category == "conflict"
+        assert "outcome is unknown" in str(raised.value)
 
 
 class TestRunEngineArgv:
@@ -136,7 +152,7 @@ class TestResolution:
 
         command, _env = launch.helper_command()
 
-        assert command == [sys.executable, "-m", "bea_engine"]
+        assert command == [sys.executable, "-P", "-m", "bea_engine"]
 
     def test_a_provisioned_engine_beats_the_checkout(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         root = fake_venv(tmp_path / "engine")
@@ -144,7 +160,7 @@ class TestResolution:
 
         command, env = launch.helper_command()
 
-        assert command == [str(root / "bin" / "python"), "-m", "bea_engine"]
+        assert command == [str(root / "bin" / "python"), "-P", "-m", "bea_engine"]
         # Live checkout source still wins for the helper module itself.
         assert env is not None
         assert str(SOURCE_ROOT) in env["PYTHONPATH"]
@@ -155,7 +171,7 @@ class TestResolution:
 
         command, env = launch.helper_command()
 
-        assert command == [sys.executable, "-m", "bea_engine"]
+        assert command == [sys.executable, "-P", "-m", "bea_engine"]
         assert env is not None
         assert str(SOURCE_ROOT) in env["PYTHONPATH"]
 
@@ -213,6 +229,25 @@ class TestPaths:
         assert paths.is_provisioned(root) is False
         assert paths.is_provisioned(fake_venv(root)) is True
 
+    def test_an_engine_missing_beancount_is_damaged_not_provisioned(self, tmp_path: Path) -> None:
+        """w1/122: every command printed an import traceback while status said yes."""
+        root = fake_venv(tmp_path / "engine")
+        (root / "lib" / "python3.12" / "site-packages" / "beancount").rmdir()
+
+        assert paths.is_provisioned(root) is False
+
+    def test_a_damaged_engine_is_rebuilt_by_the_next_command(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        root = fake_venv(tmp_path / "engine")
+        (root / "lib" / "python3.12" / "site-packages" / "beancount").rmdir()
+        monkeypatch.setenv(paths.DIR_ENV, str(root))
+        rebuilt: list[Path] = []
+        monkeypatch.setattr(provision, "provision", lambda target: rebuilt.append(fake_venv(target)))
+
+        assert provision.ensure_engine() == root / "bin" / "python"
+        assert rebuilt == [root]
+
     def test_executables_are_resolved_beside_the_interpreter(self, tmp_path: Path) -> None:
         """`bean-check` comes from the engine, never from whatever `PATH` offers."""
         assert paths.bin_dir_for(tmp_path / "engine" / "bin" / "python") == tmp_path / "engine" / "bin"
@@ -265,6 +300,27 @@ class TestProvision:
 
         assert not root.exists()
         assert not list(tmp_path.glob("*.partial*"))
+
+    def test_a_failed_rebuild_keeps_the_working_engine_and_its_features(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """w1/119: an offline rebuild deleted the engine before building its replacement."""
+        root = fake_venv(tmp_path / "engine")
+        features = root / provision.FEATURES_FILE
+        features.write_text(json.dumps({"enabled": ["beanprice"]}))
+
+        def offline(command: list[str], *, failure: str) -> None:
+            raise BeaError(failure)
+
+        monkeypatch.setattr(provision, "_find_uv", lambda: "uv")
+        monkeypatch.setattr(provision, "_run", offline)
+
+        with pytest.raises(BeaError):
+            provision.provision(root)
+
+        assert paths.is_provisioned(root)
+        assert json.loads(features.read_text()) == {"enabled": ["beanprice"]}
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["engine"]
 
     def test_an_unusable_existing_environment_is_replaced(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -338,6 +394,73 @@ class TestProvision:
         monkeypatch.setenv(provision.UV_ENV, str(override))
 
         assert provision._find_uv() == str(override)
+
+
+class _ZippedLock:
+    """A package resource that is not a real file, as in a zipped install."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def joinpath(self, name: str) -> _ZippedLock:
+        return self
+
+    def is_file(self) -> bool:
+        return True
+
+    def read_bytes(self) -> bytes:
+        return self.data
+
+
+class TestReleaseLocks:
+    """w1/121: an installed artifact's lock must reach uv, or the install must stop."""
+
+    LOCK = "engine-requirements.lock"
+    SHIPPED = b"beancount==3.2.3 --hash=sha256:abc\n"
+
+    @pytest.fixture(autouse=True)
+    def installed(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+        monkeypatch.setattr(paths, "checkout_source_root", lambda: None)
+        root = tmp_path / "engines" / "0.3.1"
+        monkeypatch.setenv(paths.DIR_ENV, str(root))
+        stale = root.parent / self.LOCK
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"# a different bea version's lock\n")
+        stale.chmod(0o444)
+        return root
+
+    def test_a_lock_inside_the_installed_package_is_used_in_place(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        package = tmp_path / "site-packages" / "cli"
+        package.mkdir(parents=True)
+        (package / self.LOCK).write_bytes(self.SHIPPED)
+        monkeypatch.setattr(provision.resources, "files", lambda _name: package)
+
+        assert provision._lockfile() == package / self.LOCK
+
+    def test_a_zipped_lock_is_materialized_beside_a_stale_read_only_copy(
+        self, monkeypatch: pytest.MonkeyPatch, installed: Path
+    ) -> None:
+        monkeypatch.setattr(provision.resources, "files", lambda _name: _ZippedLock(self.SHIPPED))
+
+        lock = provision._lockfile()
+
+        assert lock is not None
+        assert lock.read_bytes() == self.SHIPPED
+        assert lock.parent == installed.parent
+
+    @pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0, reason="needs POSIX permissions")
+    def test_a_lock_that_cannot_be_materialized_refuses_the_unhashed_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, installed: Path
+    ) -> None:
+        monkeypatch.setattr(provision.resources, "files", lambda _name: _ZippedLock(self.SHIPPED))
+        installed.parent.chmod(0o555)
+        try:
+            with pytest.raises(BeaError, match="hash-pinned"):
+                provision._lockfile()
+        finally:
+            installed.parent.chmod(0o755)
 
 
 class TestFrontendIsolation:
@@ -494,6 +617,7 @@ def test_managed_engine_layout_and_native_executable(
     python.touch()
     site = root / ("Lib/site-packages" if platform == "win32" else "lib/python3.12/site-packages")
     (site / "beanquery").mkdir(parents=True)
+    (site / "beancount").mkdir()
     command = python.parent / ("bean-check.exe" if platform == "win32" else "bean-check")
     command.touch()
     monkeypatch.setenv("BEA_ENGINE_DIR", str(root))
@@ -533,7 +657,8 @@ class TestMissingNativeExecutable:
         python = paths.venv_python(root)
         python.parent.mkdir(parents=True)
         python.touch()
-        (root / "lib" / "python3.12" / "site-packages" / "beanquery").mkdir(parents=True)
+        for package in ("beancount", "beanquery"):
+            (root / "lib" / "python3.12" / "site-packages" / package).mkdir(parents=True)
         monkeypatch.setenv("BEA_ENGINE_DIR", str(root))
         monkeypatch.delenv(paths.PYTHON_ENV, raising=False)
         # An installed copy, not a checkout: otherwise the developer's own
@@ -635,6 +760,24 @@ class TestNativeMisuse:
         assert "begin must be on or before end" in result.stderr
         assert "Traceback" not in result.stderr
         assert not target.exists()
+
+    @pytest.mark.parametrize(
+        ("args", "reason"),
+        [
+            (["--date-end", "2001-06-01"], "begin must be on or before end"),
+            (["--date-begin", "2999-12-01"], "begin must be on or before end"),
+            (["--date-begin", "2024-01-01", "--date-end", "2024-01-01"], "needs at least 31"),
+            (["--date-begin", "2020-01-01", "--date-end", "2020-01-16"], "needs at least 31"),
+        ],
+        ids=["end-only", "begin-only", "same-day", "short-span"],
+    )
+    def test_example_unusable_ranges_are_usage_errors(self, tmp_path: Path, args: list[str], reason: str) -> None:
+        """A missing side takes upstream's default before comparing (w1/086)."""
+        result = _bea_native(tmp_path, "example", *args)
+        assert result.returncode == 2, result.stderr
+        assert reason in result.stderr
+        assert "Traceback" not in result.stderr
+        assert result.stdout == ""
 
     def test_example_valid_range_still_works(self, tmp_path: Path) -> None:
         target = tmp_path / "ex.bean"

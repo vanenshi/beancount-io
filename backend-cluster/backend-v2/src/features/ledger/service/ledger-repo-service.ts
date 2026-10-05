@@ -13,6 +13,7 @@ import {
 } from "@/features/ledger/utils/authorize-ledger";
 import { AUTHORIZATION_ACTIONS } from "@/server/api/authorization/authorization-contract";
 import { assertSafeRepoPath } from "@/features/ledger/utils/safe-repo-path";
+import { BadUserInputError, ConflictError } from "@/shared/errors";
 
 type CommitUser = {
   login: string | null;
@@ -209,6 +210,18 @@ export class LedgerRepoService
       "read ledger files",
     );
 
+    // A directory comes back with no content, which decodes to "" — so it
+    // read as an empty file on every surface. Refuse it instead: nothing a
+    // caller does with the "content" of a directory is what it meant.
+    const directory = files.find((file) => file.type === "dir");
+    if (directory) {
+      throw new BadUserInputError(
+        `${directory.path} is a directory, not a file`,
+        "path",
+        "List a directory instead of reading it: `listLedgerFiles` with `dir_path`, or `GET …/files?dir=`.",
+      );
+    }
+
     return files.map((file) => ({
       path: file.path,
       content: decodeFileContent(file),
@@ -239,12 +252,39 @@ export class LedgerRepoService
         );
       }
     });
-    if (dryRun) return;
     const { ledgerOwner, ledgerName } = parseLedgerId(ledgerId);
     const favaApiClient = await this.favaClientFactory.getPublicApiClient(
       ledgerId,
       identity.userId,
     );
+    if (dryRun) {
+      // The commit refuses a `create` over a file that is already there, so
+      // the preview has to as well — otherwise it approves a write that will
+      // then fail, or tempts the caller to believe it overwrote something.
+      const created = new Set<string>();
+      const freed = new Set<string>();
+      for (const operation of operations) {
+        if (operation.operation === "delete") freed.add(operation.path);
+        // A file this same batch deletes first is free to create again.
+        else if (operation.operation === "create" && !freed.has(operation.path))
+          created.add(operation.path);
+      }
+      if (created.size > 0) {
+        const existing = await unwrapFavaResponse(
+          favaApiClient.ledgers.getLedgerFilesContent(ledgerOwner, ledgerName, {
+            files: [...created],
+          }),
+          "check new file paths",
+        );
+        const taken = existing.find((file) => created.has(file.path));
+        if (taken) {
+          throw new ConflictError("File", `${taken.path} already exists`, {
+            hint: "`create` is for a new file. Overwrite this one deliberately with `replace` (REST: `PUT` with its `sha`), or choose another path.",
+          });
+        }
+      }
+      return;
+    }
 
     await unwrapFavaResponse(
       favaApiClient.ledgers.changeLedgerFiles(ledgerOwner, ledgerName, {

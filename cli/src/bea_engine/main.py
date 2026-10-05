@@ -5,9 +5,8 @@ arguments, and answers with one JSON envelope (see `protocol`). Nothing here
 knows about the frontend's terminal rendering, credentials or AI clients — the
 frontend reads the envelope and decides how to show it.
 
-`shell` is the one exception, and it says so in its own help: an interactive
-terminal session cannot be summarised in an envelope, so it streams. Every
-other command answers exactly one JSON object.
+`shell`, `source-shell`, `source-query` and `scoped` stream terminal output instead of an
+envelope. Every other command answers exactly one JSON object.
 
 Init and import accounting operations live here as `init` / `import` (t021).
 Balances and Fava reports live as `report` / `balance` (t020).
@@ -17,6 +16,7 @@ Ask's raw-text writes live as `append` (t022).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -63,6 +63,47 @@ def syntax(
         answer.data = {"files": {str(path): text.syntax_errors(path) for path in files}}
 
 
+@app.command("format")
+def format_files(
+    files: Annotated[list[Path], typer.Argument(help="Ledger files to align.")],
+    in_place: Annotated[
+        bool, typer.Option("--in-place", "-i", help="Rewrite each file instead of only reporting it.")
+    ] = False,
+    render: Annotated[
+        bool, typer.Option("--render", help="Return formatted text for one file or - for stdin.")
+    ] = False,
+    prefix_width: Annotated[int | None, typer.Option("--prefix-width", "-w", help="Force fixed prefix width.")] = None,
+    num_width: Annotated[int | None, typer.Option("--num-width", "-W", help="Force fixed numbers width.")] = None,
+    currency_column: Annotated[
+        int | None, typer.Option("--currency-column", "-c", help="Align currencies to this column.")
+    ] = None,
+) -> None:
+    """Align postings the way `bean-format` does, in memory.
+
+    Answers `{"changed": [path, ...]}`: the files alignment would rewrite, or
+    with `--in-place` the ones it did rewrite. Rewriting takes the same ledger
+    lock every other writer takes and replaces each file atomically from a
+    staged candidate, so an interrupted run leaves every target either
+    byte-identical or completely formatted. A failure that had already rewritten
+    earlier files carries them as `result.formatted`.
+    """
+    with protocol.answering("format") as answer:
+        from bea_engine.ledger import formatting
+
+        if render:
+            if in_place or len(files) != 1:
+                raise protocol.UsageError("--render needs exactly one file and cannot be combined with --in-place.")
+            answer.data = {"text": formatting.render_file(files[0], (prefix_width, num_width, currency_column))}
+            return
+        answer.data = formatting.format_files(
+            files,
+            in_place=in_place,
+            prefix_width=prefix_width,
+            num_width=num_width,
+            currency_column=currency_column,
+        )
+
+
 @app.command()
 def query(
     query_string: Annotated[str, typer.Argument(help="The BQL statement, dot command or stored query to run.")],
@@ -71,13 +112,19 @@ def query(
         str, typer.Option("--format", help="Result shape: json for columns and rows, or text, csv, beancount.")
     ] = "json",
     output: Annotated[
-        Path | None, typer.Option("--output", "-o", help="Write a rendered result here instead of into the envelope.")
+        Path | None,
+        typer.Option(
+            "--output", "-o", help="Write a rendered result here instead of into the envelope.", readable=False
+        ),
     ] = None,
     numberify: Annotated[
         bool, typer.Option("--numberify", "-m", help="Split amounts into per-currency columns.")
     ] = False,
     allow_errors: Annotated[
         bool, typer.Option("--allow-errors", help="Answer even when the ledger has load errors.")
+    ] = False,
+    spreadsheet_safe: Annotated[
+        bool, typer.Option("--spreadsheet-safe", help="Prefix formula-looking CSV text cells with '.")
     ] = False,
 ) -> None:
     """Run one query and answer with its result.
@@ -106,6 +153,7 @@ def query(
                 format=format,
                 numberify=numberify,
                 allow_errors=allow_errors,
+                spreadsheet_safe=spreadsheet_safe,
             )
 
 
@@ -451,13 +499,16 @@ def import_entries(
 def shell(
     file: Annotated[Path, typer.Option("--file", "-f", help="Root ledger file to query.")],
     format: Annotated[str, typer.Option("--format", help="Query output format.")] = "text",
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Query output file.")] = None,
+    output: Annotated[Path | None, typer.Option("--output", "-o", help="Query output file.", readable=False)] = None,
     numberify: Annotated[
         bool, typer.Option("--numberify", "-m", help="Split amounts into per-currency columns.")
     ] = False,
     no_errors: Annotated[bool, typer.Option("--no-errors", "-q", help="Do not report load errors on startup.")] = False,
     allow_errors: Annotated[
         bool, typer.Option("--allow-errors", help="Open the shell even when the ledger does not load cleanly.")
+    ] = False,
+    spreadsheet_safe: Annotated[
+        bool, typer.Option("--spreadsheet-safe", help="Prefix formula-looking CSV text cells with '.")
     ] = False,
 ) -> None:
     """Open the interactive query shell on this terminal.
@@ -470,7 +521,9 @@ def shell(
     import sys
 
     from bea_engine import query as bql
+    from bea_engine import stopping
 
+    stopping.interactive()
     try:
         ledger = _ledger(file)
         # Inside the handler as well: a strict read refuses the session itself,
@@ -482,6 +535,7 @@ def shell(
             numberify=numberify,
             show_errors=not no_errors,
             allow_errors=allow_errors,
+            spreadsheet_safe=spreadsheet_safe,
         )
     except protocol.EngineError as exc:
         # No envelope to put it in, so it reads like any other program's
@@ -490,6 +544,50 @@ def shell(
         print(f"error: {exc}", file=sys.stderr)
         for detail in exc.details or ():
             print(f"  {detail}", file=sys.stderr)
+        raise SystemExit(exc.exit_code) from None
+
+
+@app.command("source-shell")
+def source_shell(
+    source: Annotated[str, typer.Argument(help="Native Beanquery source URI or ledger path.")],
+    format: Annotated[str, typer.Option("--format", help="Query output format.")] = "text",
+    output: Annotated[Path | None, typer.Option("--output", "-o", help="Query output file.", readable=False)] = None,
+    numberify: Annotated[bool, typer.Option("--numberify", "-m")] = False,
+    no_errors: Annotated[bool, typer.Option("--no-errors", "-q")] = False,
+) -> None:
+    """Stream a native query shell with protection for its input files."""
+    from bea_engine import query as bql
+    from bea_engine import stopping
+
+    stopping.interactive()
+    try:
+        bql.native_interactive(source, format=format, output=output, numberify=numberify, show_errors=not no_errors)
+    except protocol.EngineError as exc:
+        protocol.note(str(exc))
+        raise SystemExit(exc.exit_code) from None
+
+
+@app.command("source-query")
+def source_query(
+    source: Annotated[str, typer.Argument(help="Native Beanquery source URI or ledger path.")],
+    query_string: Annotated[str, typer.Argument(help="The BQL statement, dot command or stored query to run.")],
+    format: Annotated[str, typer.Option("--format", help="Query output format.")] = "text",
+    output: Annotated[Path | None, typer.Option("--output", "-o", help="Query output file.", readable=False)] = None,
+    numberify: Annotated[bool, typer.Option("--numberify", "-m")] = False,
+    no_errors: Annotated[bool, typer.Option("--no-errors", "-q")] = False,
+) -> None:
+    """Run one native query, streaming upstream's rendering, with a failing status for usage errors."""
+    from bea_engine import query as bql
+
+    try:
+        bql.native_one_shot(
+            source, query_string, format=format, output=output, numberify=numberify, show_errors=not no_errors
+        )
+    except protocol.EngineError as exc:
+        # Upstream's own spelling of a failure, now with a failing status.
+        protocol.note(f"error: {exc}")
+        for detail in exc.details or ():
+            protocol.note(f"  {detail}")
         raise SystemExit(exc.exit_code) from None
 
 
@@ -554,7 +652,7 @@ def price_refresh(
     """
     with protocol.answering("price-refresh") as answer:
         from bea_engine import managed_load
-        from bea_engine.managed_price_cache import zero_next_refresh
+        from bea_engine.managed_price_cache import cache_write_problem, feed_dir, zero_next_refresh
         from bea_engine.query import format_error
 
         root = _ledger(file)
@@ -567,7 +665,12 @@ def price_refresh(
         if managed_load._env_flag(managed_load.OFFLINE_ENV):
             raise protocol.UsageError("price refresh requires network access; remove --offline.")
         for url in before:
-            zero_next_refresh(url)
+            try:
+                zero_next_refresh(url)
+            except OSError as error:
+                raise protocol.LedgerError(
+                    f"Cannot refresh {url}: {cache_write_problem(error, feed_dir(url) / 'head.json')}."
+                ) from error
         # Collect every source outcome even in strict mode. The frontend fails
         # explicit refreshes with the full result instead of losing later sources.
         loaded = managed_load.load_with_sources(root, strict=False)
@@ -597,21 +700,27 @@ def price_export(
         bool,
         typer.Option("--allow-errors", help="Export unavailable sources with their marker alone."),
     ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Overwrite files already at the export's destinations."),
+    ] = False,
 ) -> None:
     """Snapshot the ledger with local price files and relative includes.
 
-    Answers `{"output": ..., "files": [...], "sources": [...], "errors": [...]}`.
+    Answers `{"output": ..., "files": [...], "overwritten": [...], "sources": [...], "errors": [...]}`.
     An unavailable source refuses the export naming it unless `--allow-errors`
-    carries the marker alone.
+    carries the marker alone; a destination that already holds a file refuses it
+    unless `--force`.
     """
     with protocol.answering("price-export") as answer:
         from bea_engine import managed_load
         from bea_engine.query import format_error
 
-        exported = managed_load.export_portable(_ledger(file), output, allow_errors=allow_errors)
+        exported = managed_load.export_portable(_ledger(file), output, allow_errors=allow_errors, force=force)
         answer.data = {
             "output": str(exported.output),
             "files": list(exported.files),
+            "overwritten": list(exported.overwritten),
             "sources": [managed_load.source_json(source) for source in exported.sources],
             "errors": [format_error(error) for error in exported.errors],
         }
@@ -620,14 +729,15 @@ def price_export(
 def _ledger(file: Path) -> Path:
     """The ledger as an absolute path, or a usage failure naming what is wrong.
 
-    Resolved because Beancount's loader asserts on a relative entry path and
-    resolves every `include` against it.
+    Absolute because Beancount's loader asserts on a relative entry path and
+    resolves every `include` against it — lexically, like the loader's own
+    `abspath`, so a symlinked root keeps its includes beside the link (w1/056).
     """
     if not file.exists():
         raise protocol.UsageError(f"No ledger file at '{file}'.")
     if not file.is_file():
         raise protocol.UsageError(f"Ledger path '{file}' is not a regular file.")
-    return file.resolve()
+    return Path(os.path.abspath(file))
 
 
 def _date(option: str, value: str | None) -> Any:
@@ -665,6 +775,23 @@ def _text(value: str) -> str:
     return sys.stdin.read() if value == "-" else value
 
 
+def _written_document_path(entry: Any) -> str | None:
+    """The path string a document directive's source line spells, or None when unreadable."""
+    import re
+
+    source, lineno = entry.meta.get("filename"), entry.meta.get("lineno")
+    if not isinstance(source, str) or not isinstance(lineno, int) or lineno < 1:
+        return None
+    try:
+        lines = Path(source).read_text(encoding="utf-8-sig").split("\n")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if lineno > len(lines):
+        return None
+    match = re.search(r'\bdocument\s+\S+\s+"((?:[^"\\]|\\.)*)"', lines[lineno - 1])
+    return match.group(1).replace('\\"', '"').replace("\\\\", "\\") if match else None
+
+
 def _validate(file: Path) -> dict[str, Any]:
     from beancount.core.data import Document
 
@@ -679,22 +806,26 @@ def _validate(file: Path) -> dict[str, Any]:
             details=[format_error(error, ledger_file=file) for error in errors],
         )
 
-    root = file.resolve().parent
+    from bea_engine.ledger.text import outside_ledger_tree
+
+    root = file.parent.resolve()
     portable: list[str] = []
     for entry in entries:
         if not isinstance(entry, Document):
             continue
         path = Path(entry.filename)
-        if not path.is_absolute():
+        # Beancount makes every document path absolute on load, so a relative
+        # `../x.pdf` arrives here resolved too; the containment rule is the
+        # one `add document` applies, and the message quotes the source text.
+        if not path.is_absolute() or not outside_ledger_tree(path, root):
             continue
-        try:
-            path.resolve().relative_to(root)
-        except ValueError:
-            portable.append(
-                f"{entry.meta.get('filename', file)}:{entry.meta.get('lineno', '?')}: "
-                f"Document path {entry.filename!r} is absolute and outside the ledger "
-                f"directory {root}. Prefer a path relative to the ledger file so copies stay portable."
-            )
+        written = _written_document_path(entry) or entry.filename
+        portable.append(
+            f"{entry.meta.get('filename', file)}:{entry.meta.get('lineno', '?')}: "
+            f"Document path {written!r} resolves to {str(path.resolve())!r}, outside the ledger "
+            f"directory {root}. Move the file under the ledger directory and use a relative path "
+            "so copies stay portable."
+        )
     if portable:
         raise protocol.LedgerError(
             f"{file}: {len(portable)} portable-document warning(s).",

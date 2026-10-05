@@ -1,6 +1,7 @@
 import { resolveMcpLedger } from "../mcp-context";
 import {
   envelopeFromThrown,
+  maskingFor,
   splitToolFailure,
   JSON_RPC_FORBIDDEN,
   JSON_RPC_INVALID_PARAMS,
@@ -10,6 +11,8 @@ import {
   McpRequestFailure,
   renderErrorText,
 } from "../mcp-errors";
+import { favaApiErrorToDomainError } from "@/foundation/fava/error-to-domain";
+import { FavaApiError } from "@/foundation/fava/api-client";
 import {
   BadUserInputError,
   ConfigurationError,
@@ -47,7 +50,9 @@ describe("envelopeFromThrown", () => {
       ),
     );
     expect(envelope.code).toBe("CONFIGURATION_ERROR");
-    expect(envelope.hint).toBe("Set TEMP_ASSETS_AWS_S3_BUCKET (see .env.example)");
+    expect(envelope.hint).toBe(
+      "Set TEMP_ASSETS_AWS_S3_BUCKET (see .env.example)",
+    );
   });
 
   it("names the next call for the refusals the audit actually hit", () => {
@@ -96,6 +101,27 @@ describe("envelopeFromThrown", () => {
         new BadUserInputError("ledgerScope must be owner/name"),
       ).hint,
     ).toMatch(/tools\/list publishes each tool's input schema|`tools\/list`/);
+  });
+
+  /**
+   * w5/042. The CONFLICT fallback is about re-reading an entry's hash, which
+   * sent an agent that had picked a taken ledger name off to edit entries.
+   */
+  it("tells a ledger-name conflict to pick another name, not to re-read an entry", () => {
+    const envelope = envelopeFromThrown(
+      favaApiErrorToDomainError(
+        new FavaApiError("duplicate", 400, {
+          success: false,
+          error: "Ledger name conflict",
+          code: "ledger_name_already_exists",
+        }),
+        "create ledger",
+      ),
+    );
+    expect(envelope.code).toBe("CONFLICT");
+    expect(envelope.hint).toMatch(/different ledger name/);
+    expect(envelope.hint).toContain("listLedgers");
+    expect(envelope.hint).not.toContain("getEntryContext");
   });
 
   it("carries retryAfter for a rate-limit refusal", () => {
@@ -181,6 +207,86 @@ describe("splitToolFailure", () => {
       result: { success: false, message: "PR is no longer open" },
     });
     expect(envelope.code).toBe("CONFLICT");
+  });
+});
+
+/**
+ * ADR 0007 D7 (w5/028). An unexpected error's message was written for whoever
+ * reads logs, so production replaces it; anything shaped for the caller — a
+ * DomainError, a Zod refusal, a tool guard's own not-found — keeps its words.
+ */
+describe("production masking of unexpected errors", () => {
+  const production = maskingFor({ env: "production" });
+
+  it("masks only in production", () => {
+    expect(maskingFor({ env: "production" }).maskUnexpected).toBe(true);
+    expect(maskingFor({ env: "development" }).maskUnexpected).toBe(false);
+    expect(maskingFor({}).maskUnexpected).toBe(false);
+    expect(
+      envelopeFromThrown(new RangeError("Invalid time value")).message,
+    ).toBe("Invalid time value");
+  });
+
+  it("replaces an unexpected throw's message and keeps its category and hint", () => {
+    const envelope = envelopeFromThrown(
+      new RangeError("Invalid time value"),
+      production,
+    );
+    expect(envelope).toEqual({
+      code: "INTERNAL_SERVER_ERROR",
+      message: "Internal server error",
+      hint: expect.stringMatching(/Retry once/),
+    });
+  });
+
+  it("replaces an uncoded tool failure's message the same way", () => {
+    const { envelope, rest } = splitToolFailure(
+      { ok: false, error: 'select * from "api_keys" where digest = $1', n: 1 },
+      production,
+    );
+    expect(envelope.code).toBe("INTERNAL_SERVER_ERROR");
+    expect(envelope.message).toBe("Internal server error");
+    expect(rest).toEqual({ n: 1 });
+  });
+
+  it("leaves everything written for the caller alone", () => {
+    expect(
+      envelopeFromThrown(
+        new BadUserInputError("date is not a date"),
+        production,
+      ).message,
+    ).toBe("date is not a date");
+    expect(
+      envelopeFromThrown(
+        new ConfigurationError("Object storage is not configured"),
+        production,
+      ).message,
+    ).toBe("Object storage is not configured");
+    expect(
+      envelopeFromThrown(new Error("No such file in alice/main"), production),
+    ).toMatchObject({
+      code: "NOT_FOUND",
+      message: "No such file in alice/main",
+    });
+    expect(
+      splitToolFailure(
+        {
+          ok: false,
+          error: "upstream refused the write",
+          errorCode: "INTERNAL_SERVER_ERROR",
+        },
+        production,
+      ).envelope.message,
+    ).toBe("upstream refused the write");
+    expect(
+      splitToolFailure(
+        { ok: false, error: "main.bean: file not found" },
+        production,
+      ).envelope,
+    ).toMatchObject({
+      code: "NOT_FOUND",
+      message: "main.bean: file not found",
+    });
   });
 });
 

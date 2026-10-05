@@ -21,6 +21,33 @@ import {
 
 const moduleLogger = logger.child({ module: "ledger-collaborators-workflow" });
 
+/**
+ * Gitea reports an unknown username as "user does not exist
+ * [uid: 0, name: …]" — an internal shape no agent can act on. The
+ * collaborator name came from the caller, so this is their input error.
+ * Anything else is returned unchanged for the caller to rethrow.
+ */
+function translateUnknownUser(error: unknown, collaborator: string): unknown {
+  const message = error instanceof Error ? error.message : String(error);
+  return /user does not exist/i.test(message)
+    ? new BadUserInputError(`No such user: ${collaborator}`)
+    : error;
+}
+
+/**
+ * A blank collaborator name is refused here rather than only in the adapters'
+ * schemas, because GraphQL hands its string argument over unvalidated. Sent
+ * upstream it fails opaquely and reads as a server fault.
+ */
+function assertCollaboratorName(collaborator: string): void {
+  if (collaborator.trim() === "") {
+    throw new BadUserInputError(
+      "collaborator must be a non-empty username",
+      "collaborator",
+    );
+  }
+}
+
 export type CollaboratorData = {
   id?: number;
   login?: string;
@@ -97,6 +124,7 @@ export class LedgerCollaboratorsWorkflow implements ILedgerCollaboratorsWorkflow
     permission?: "read" | "write" | "admin";
   }): Promise<{ success: boolean; message?: string }> {
     const { identity, ledgerId, collaborator, permission } = params;
+    assertCollaboratorName(collaborator);
     await this.authorization.authorizeOrThrow({
       principal: identity,
       action: AUTHORIZATION_ACTIONS.LEDGER_COLLABORATORS_UPDATE,
@@ -151,14 +179,7 @@ export class LedgerCollaboratorsWorkflow implements ILedgerCollaboratorsWorkflow
           { permission: permission || null },
         );
     } catch (error) {
-      // Gitea reports an unknown username as "user does not exist
-      // [uid: 0, name: …]" — an internal shape no agent can act on. The
-      // collaborator name came from the caller, so this is their input error.
-      const message = error instanceof Error ? error.message : String(error);
-      if (/user does not exist/i.test(message)) {
-        throw new BadUserInputError(`No such user: ${collaborator}`);
-      }
-      throw error;
+      throw translateUnknownUser(error, collaborator);
     }
 
     if (response.data?.success) {
@@ -177,6 +198,7 @@ export class LedgerCollaboratorsWorkflow implements ILedgerCollaboratorsWorkflow
     collaborator: string;
   }): Promise<{ success: boolean; message?: string }> {
     const { identity, ledgerId, collaborator } = params;
+    assertCollaboratorName(collaborator);
     await this.authorization.authorizeOrThrow({
       principal: identity,
       action: AUTHORIZATION_ACTIONS.LEDGER_COLLABORATORS_DELETE,
@@ -189,11 +211,16 @@ export class LedgerCollaboratorsWorkflow implements ILedgerCollaboratorsWorkflow
     );
     const { ledgerOwner, ledgerName } = parseLedgerId(ledgerId);
 
-    const response = await favaApiClient.collaborators.deleteLedgerCollaborator(
-      ledgerOwner,
-      ledgerName,
-      collaborator,
-    );
+    let response;
+    try {
+      response = await favaApiClient.collaborators.deleteLedgerCollaborator(
+        ledgerOwner,
+        ledgerName,
+        collaborator,
+      );
+    } catch (error) {
+      throw translateUnknownUser(error, collaborator);
+    }
 
     if (response.data?.success) {
       return { success: true, message: "Collaborator deleted successfully" };
@@ -285,6 +312,7 @@ export class LedgerCollaboratorsWorkflow implements ILedgerCollaboratorsWorkflow
     collaborator: string;
   }): Promise<CollaboratorPermissionData> {
     const { identity, ledgerId, collaborator } = params;
+    assertCollaboratorName(collaborator);
     await this.authorization.authorizeOrThrow({
       principal: identity,
       action: AUTHORIZATION_ACTIONS.LEDGER_COLLABORATORS_PERMISSION_READ,
@@ -297,12 +325,17 @@ export class LedgerCollaboratorsWorkflow implements ILedgerCollaboratorsWorkflow
     );
     const { ledgerOwner, ledgerName } = parseLedgerId(ledgerId);
 
-    const response =
-      await favaApiClient.collaborators.getLedgerCollaboratorPermission(
-        ledgerOwner,
-        ledgerName,
-        collaborator,
-      );
+    let response;
+    try {
+      response =
+        await favaApiClient.collaborators.getLedgerCollaboratorPermission(
+          ledgerOwner,
+          ledgerName,
+          collaborator,
+        );
+    } catch (error) {
+      throw translateUnknownUser(error, collaborator);
+    }
 
     if (!response.data?.success || !response.data.data) {
       throw new InternalServerError("Failed to fetch collaborator permission");

@@ -30,7 +30,26 @@ from cli.commands.treeify import treeify
 from cli.commands.upgrade import current_channel, upgrade
 from cli.completion import install as install_completion_callback
 from cli.completion import show as show_completion_callback
+from cli.native_command import ForwardingCommand
 from cli.native_help import native_help
+
+
+def _tolerate_unencodable_output() -> None:
+    """Escape what the terminal's encoding cannot show instead of failing on it.
+
+    stdout is strict by default, so under an ASCII or cp1252 locale a write
+    that had already landed reported `'ascii' codec can't encode …` and exit 1
+    when its confirmation named a non-ASCII path — and a retry wrote the entry
+    again. Output is a report of what happened; it must never undo exit 0.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="backslashreplace")
+        except (OSError, ValueError):  # A detached or already-closed stream.
+            pass
 
 
 def _settle_stdout() -> None:
@@ -42,7 +61,13 @@ def _settle_stdout() -> None:
     ignored on flushing sys.stdout` and replaces the exit code with 120. Doing
     the flush inside the guard turns that into a `BrokenPipeError` we can still
     answer for.
+
+    With fd 1 closed (`>&-`) Python sets `sys.stdout` to None and every print
+    already went nowhere; there is nothing to settle, and failing here turned
+    a write that had landed into exit 1.
     """
+    if sys.stdout is None:
+        return
     sys.stdout.flush()
 
 
@@ -136,6 +161,7 @@ class _GuardedGroup(TyperGroup):
             output.error(exc)
 
     def invoke(self, ctx: Any) -> Any:
+        _tolerate_unencodable_output()
         try:
             result = super().invoke(ctx)
             _settle_stdout()
@@ -293,21 +319,41 @@ _CLOUD_PANEL = "Cloud commands (beancount.io — need 'bea cloud login' or BEA_T
 _SELF_PANEL = "CLI maintenance"
 
 _CHECK_CTX = {"allow_extra_args": True, "ignore_unknown_options": True}
-app.command("check", rich_help_panel=_LOCAL_PANEL, context_settings=_CHECK_CTX, epilog=native_help("check"))(check)
+app.command(
+    "check",
+    cls=ForwardingCommand,
+    rich_help_panel=_LOCAL_PANEL,
+    context_settings=_CHECK_CTX,
+    epilog=native_help("check"),
+)(check)
 app.command("balance", rich_help_panel=_LOCAL_PANEL)(balance)
 app.command("init", rich_help_panel=_LOCAL_PANEL)(init)
 app.command("import", rich_help_panel=_LOCAL_PANEL)(import_entries)
 app.add_typer(ingest_app, name="ingest", rich_help_panel=_LOCAL_PANEL)
 app.command("format", rich_help_panel=_LOCAL_PANEL)(format_beans)
 app.command("query", rich_help_panel=_LOCAL_PANEL)(query)
-app.command("price", rich_help_panel=_LOCAL_PANEL, context_settings=_CHECK_CTX, epilog=native_help("price"))(price)
+app.command(
+    "price",
+    cls=ForwardingCommand,
+    rich_help_panel=_LOCAL_PANEL,
+    context_settings=_CHECK_CTX,
+    epilog=native_help("price"),
+)(price)
 app.command("ask", rich_help_panel=_LOCAL_PANEL)(ask)
-app.command("example", rich_help_panel=_LOCAL_PANEL, context_settings=_CHECK_CTX, epilog=native_help("example"))(
-    example
-)
-app.command("treeify", rich_help_panel=_LOCAL_PANEL, context_settings=_CHECK_CTX, epilog=native_help("treeify"))(
-    treeify
-)
+app.command(
+    "example",
+    cls=ForwardingCommand,
+    rich_help_panel=_LOCAL_PANEL,
+    context_settings=_CHECK_CTX,
+    epilog=native_help("example"),
+)(example)
+app.command(
+    "treeify",
+    cls=ForwardingCommand,
+    rich_help_panel=_LOCAL_PANEL,
+    context_settings=_CHECK_CTX,
+    epilog=native_help("treeify"),
+)(treeify)
 
 app.add_typer(add_app, name="add", rich_help_panel=_LOCAL_PANEL)
 app.add_typer(list_app, name="list", rich_help_panel=_LOCAL_PANEL)

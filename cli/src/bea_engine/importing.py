@@ -11,17 +11,22 @@ import copy
 import difflib
 import hashlib
 import io
+import os
 import re
 import runpy
 import shlex
 import sys
+import tempfile
 import unicodedata
-from contextlib import redirect_stderr, redirect_stdout
-from decimal import Decimal
+from collections.abc import Iterator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from dataclasses import dataclass
+from decimal import Context, Decimal
 from pathlib import Path
 from typing import Any
 
 from bea_engine.ledger import write as ledger_write
+from bea_engine.ledger.text import ledger_roots, unknown_root_message
 from bea_engine.ledger.writer import format_entry, normalize_entry_strings
 from bea_engine.protocol import ConflictError, EngineError, LedgerError, UsageError
 from bea_engine.query import format_error
@@ -34,6 +39,37 @@ _IDENTITY_KINDS = {
 }
 
 _DEFAULT_ID_KEYS = ["bank_id", "fitid", "transaction_id", "imported_id"]
+
+
+@contextmanager
+def _capturing(logs: io.StringIO) -> Iterator[None]:
+    """Collect everything the importer prints into `importer_output`.
+
+    `redirect_stdout` swaps only the Python objects; a `subprocess.run` or an
+    `os.write(1, …)` inside the importer writes to the inherited descriptors,
+    which bypassed the capture (w1/061). Descriptors 1 and 2 point at a
+    scratch file for the duration and its bytes are appended afterwards.
+    """
+    with tempfile.TemporaryFile() as sink:
+        saved: list[tuple[int, int]] = []
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+                fd = stream.fileno()
+            except (AttributeError, OSError, ValueError):
+                continue
+            if fd in (1, 2) and all(fd != kept for kept, _ in saved):
+                saved.append((fd, os.dup(fd)))
+                os.dup2(sink.fileno(), fd)
+        try:
+            with redirect_stdout(logs), redirect_stderr(logs):
+                yield
+        finally:
+            for fd, copy_fd in saved:
+                os.dup2(copy_fd, fd)
+                os.close(copy_fd)
+            sink.seek(0)
+            logs.write(sink.read().decode("utf-8", "replace"))
 
 
 def _effective_id_keys(id_keys: list[str] | None) -> list[str]:
@@ -91,7 +127,7 @@ def answer(
     if csv_mapping is not None and config is not None:
         raise UsageError("Pass --csv or --config, not both.")
 
-    file = file.resolve()
+    file = Path(os.path.abspath(file))
     source = source.expanduser().resolve()
     if not source.is_file():
         raise UsageError(f"Export file not found: {source}")
@@ -99,9 +135,8 @@ def answer(
     source_bytes = source.read_bytes()
     snapshot = ledger_write.LedgerSnapshot.capture(file)
     target = ledger_write.destination(file, into)
-    snapshot.require_target(target)
-    original = target.read_bytes()
-    existing, errors, options = managed_load.load_file(file)
+    original = snapshot.require_target(target)
+    existing, errors, options = managed_load.load_file(file, snapshot=snapshot)
     if not allow_errors and errors:
         raise LedgerError(
             f"Ledger has {len(errors)} error(s). Pass --allow-errors to preview and apply anyway.",
@@ -110,6 +145,7 @@ def answer(
 
     logs = io.StringIO()
     notes: list[str] = []
+    roots = ledger_roots(options)
     csv_mode = csv_mapping is not None
     skipped_blank = 0
     if csv_mode:
@@ -120,8 +156,8 @@ def answer(
         mapping = parse_mapping(csv_mapping)
         # Before the preview, not after: an invalid name would otherwise block
         # every row with the wrong diagnosis instead of failing on the typo.
-        csv_account = _valid_account(csv_account, "--account")
-        default_account = _valid_account(default_account or "Expenses:Uncategorized", "--default-account")
+        csv_account = _valid_account(csv_account, "--account", roots)
+        default_account = _valid_account(default_account or "Expenses:Uncategorized", "--default-account", roots)
         resolved_date_format = date_format or "%Y-%m-%d"
         resolved_delimiter = parse_delimiter(delimiter) if delimiter is not None else None
         resolved_encoding = parse_encoding(encoding) if encoding is not None else "utf-8"
@@ -130,16 +166,18 @@ def answer(
             account=csv_account,
             mapping=mapping,
             date_format=resolved_date_format,
-            rules=load_rules(Path(rules_file)) if rules_file is not None else None,
+            rules=load_rules(Path(rules_file), roots) if rules_file is not None else None,
             default_account=default_account,
-            currency=operating[0] if len(operating) == 1 else None,
+            currency=_row_currency(existing, csv_account, operating),
+            known_currencies=_known_currencies(existing, operating),
             delimiter=resolved_delimiter,
             encoding=resolved_encoding,
+            account_roots=roots,
         )
         preview_config = csv_mapping
         try:
             account = str(importer.account(str(source)))
-            with redirect_stdout(logs), redirect_stderr(logs):
+            with _capturing(logs):
                 entries = copy.deepcopy(list(importer.extract(str(source), existing)))
         except EngineError:
             raise
@@ -149,6 +187,11 @@ def answer(
                 traceback=_traceback(exc),
             ) from exc
         skipped_blank = importer.skipped_blank_rows
+        if importer.constant_currency is not None:
+            notes.append(
+                f"currency={importer.constant_currency} names no column of {source.name}, so every row "
+                f"posts in {importer.constant_currency}."
+            )
         if importer.rejected_categories:
             examples = ", ".join(repr(name) for name in list(importer.rejected_categories)[:3])
             count = sum(importer.rejected_categories.values())
@@ -164,7 +207,7 @@ def answer(
         preview_config = str(config)
         sys.path.insert(0, str(config.parent))
         try:
-            with redirect_stdout(logs), redirect_stderr(logs):
+            with _capturing(logs):
                 importer = _importer(config, source, importer_name)
                 account = str(importer.account(str(source)))
                 entries = copy.deepcopy(list(importer.extract(str(source), existing)))
@@ -213,7 +256,12 @@ def answer(
     rows: list[dict[str, Any]] = []
     texts: list[str] = []
     conflicts = False
-    seen_inputs: dict[str, int] = {}
+    # Which side a conflicting id came from: the ledger, or an earlier row of
+    # this same export (banks do reuse ids within one file).
+    ledger_conflicts = False
+    batch_conflicts = False
+    hashed = _hash_rows(entries, account, keys, Transaction)
+    claimed = _claim_payeeless_ids(hashed, identities, account)
     batch_rows: dict[int, int] = {}
     for index, entry in enumerate(entries):
         entry = normalize_entry_strings(entry)
@@ -232,7 +280,9 @@ def answer(
                     entry.meta["import-id"] = native
                     id_source = "bank"
                 else:
-                    entry.meta["import-id"], legacy_ids = _hash_import_ids(entry, account, seen_inputs)
+                    row_ids = hashed[index]
+                    entry.meta["import-id"] = row_ids.canonical
+                    legacy_ids = [*row_ids.older, *claimed.get(index, [])]
                     id_source = "hash"
             ids = _identities(entry, account, keys)
             legacy_keys = [(account, "import-id", value) for value in legacy_ids]
@@ -243,23 +293,38 @@ def answer(
             # An older generated id is lookup-only *and* content-checked: that
             # format was lossy enough to hand two genuinely different rows one
             # digest, so a hit on it means "already imported" only when the
-            # whole source row agrees. Dropping the rest here, rather than
+            # date and source amounts agree. Dropping the rest here, rather than
             # letting them reach the conflict test, is what keeps a reused
-            # native id with changed data a conflict.
+            # native id with changed source amounts a conflict.
             hits = [
                 (key, found, same)
                 for key in ids
                 if (found := identities.get(key)) is not None
-                and ((same := _same_row(key, found, account, fingerprint)) or key not in lookup_only)
+                and (
+                    (same := _same_row(key, found, account, fingerprint, lookup_only=key in lookup_only))
+                    or key not in lookup_only
+                )
             ]
             if hits:
+                # A canonical digest proves the original source row even if
+                # a retained file/native ID disagrees with later ledger edits.
+                canonical = next(
+                    (hit for hit in hits if hit[0] not in lookup_only and _is_generated_identity(hit[0])), None
+                )
+                if canonical is not None:
+                    hits = [canonical]
                 (_, kind, matched_value), match, _ = hits[0]
                 if not all(same for _, _, same in hits):
-                    status, reason, conflicts = (
-                        "conflict",
-                        "Stable ID matches an entry with different transaction data.",
-                        True,
-                    )
+                    status, conflicts = "conflict", True
+                    if id(match) in batch_rows:
+                        batch_conflicts = True
+                        reason = (
+                            f"Stable ID repeats row {batch_rows[id(match)]} of this import with different "
+                            "transaction data."
+                        )
+                    else:
+                        ledger_conflicts = True
+                        reason = "Stable ID matches an entry with different transaction data."
                 elif kind == "file":
                     status, reason = "duplicate", "Previously imported source row matches."
                 elif kind == "digest":
@@ -277,7 +342,9 @@ def answer(
             elif _candidate_key(entry, account) in fingerprints:
                 status, reason, match = (
                     "possible_duplicate",
-                    "Date, payee and source amount match; different bank IDs or narration do not rule out a duplicate.",
+                    "Date, payee and source amount match; different bank IDs or narration do not rule out a duplicate."
+                    if _match_text(entry.payee)
+                    else "Date, narration and source amount match; different bank IDs do not rule out a duplicate.",
                     fingerprints[_candidate_key(entry, account)],
                 )
             if status == "new" or (status == "possible_duplicate" and duplicates == "include"):
@@ -293,7 +360,7 @@ def answer(
             other_entries.add(text)
         include = status == "new" or (status == "possible_duplicate" and duplicates == "include")
         if include and isinstance(entry, Transaction):
-            blocked_reason = _blocked_reason(entry, open_currencies)
+            blocked_reason = _blocked_reason(entry, open_currencies, roots)
             if blocked_reason is not None:
                 status, reason, include = "blocked", blocked_reason, False
         if include:
@@ -385,15 +452,24 @@ def answer(
                 or (row["status"] == "possible_duplicate" and duplicates == "review")
                 or row["status"] == "blocked"
             ]
-            if conflicts and not (preview["possible_duplicates"] and duplicates == "review"):
-                guidance = (
-                    "Import needs review; nothing was written. A stable ID already matches a ledger "
-                    "entry with different data — edit or remove that entry, change the bank ID, or drop the row."
+            fixes = []
+            if ledger_conflicts:
+                fixes.append(
+                    "a stable ID already matches a ledger entry with different data — edit or remove that "
+                    "entry, change the bank ID, or drop the row"
                 )
+            if batch_conflicts:
+                fixes.append(
+                    "a stable ID repeats within this export with different data — correct or drop one of "
+                    "those rows in the source file, or map a different id column"
+                )
+            conflict_fix = "; ".join(fixes)
+            if conflicts and not (preview["possible_duplicates"] and duplicates == "review"):
+                guidance = f"Import needs review; nothing was written. {conflict_fix[:1].upper()}{conflict_fix[1:]}."
             elif conflicts:
                 guidance = (
-                    "Import needs review; nothing was written. Resolve ID conflicts (stable ID with different "
-                    "ledger data) and choose --duplicates skip/include for possible duplicates."
+                    f"Import needs review; nothing was written. Resolve ID conflicts ({conflict_fix}) and choose "
+                    "--duplicates skip/include for possible duplicates."
                 )
             elif preview["possible_duplicates"] and duplicates == "review":
                 guidance = (
@@ -514,25 +590,33 @@ def _identities(entry: Any, account: str, keys: list[str]) -> list[tuple[str, st
 _GENERATED_ID = re.compile(r"(?:csv|mint|monarch|qbo):sha256:([0-9a-f]{16})")
 
 
-def _same_row(key: tuple[str, str, str], found: Any, account: str, fingerprint: tuple[Any, ...]) -> bool:
+def _is_generated_identity(key: tuple[str, str, str]) -> bool:
+    return key[1] == "digest" or (key[1] == "import-id" and _GENERATED_ID.fullmatch(key[2]) is not None)
+
+
+def _same_row(
+    key: tuple[str, str, str], found: Any, account: str, fingerprint: tuple[Any, ...], *, lookup_only: bool
+) -> bool:
     """Whether an id hit names the same source row rather than changed data.
 
-    A generated id is a digest of date, exact amount, raw description and
-    account, so its hit already proves the description; payee and narration
-    are presentation that migration and cleanup rules legitimately change, and
-    a merged transfer's one narration cannot equal both of its source rows.
-    Date and source amounts are still compared, since the older lossy digest
-    form is looked up through the same keys. Every other id — a native bank
-    id above all — must match the whole fingerprint, or it is a conflict.
+    Canonical hashes already identify the original source row; mutable ledger
+    fields cannot invalidate that proof. Older lookup-only hashes retain the
+    date/amount guard against lossy collisions. Native IDs compare exact source
+    amounts and commodities, allowing date and description cleanup. Pre-release
+    file identities retain their full-content comparison.
     """
+    generated = _is_generated_identity(key)
+    if generated and not lookup_only:
+        return True
     found_print = _fingerprint(found, account)
-    kind, value = key[1], key[2]
-    if kind == "digest" or (kind == "import-id" and _GENERATED_ID.fullmatch(value)):
+    if generated:
         return (found_print[0], found_print[3]) == (fingerprint[0], fingerprint[3])
+    if key[1] in {"bank", "import-id"}:
+        return bool(found_print[3] == fingerprint[3])
     return found_print == fingerprint
 
 
-def _valid_account(name: str, option: str) -> str:
+def _valid_account(name: str, option: str, roots: tuple[str, ...]) -> str:
     """Validate an account name the way the loader will, saying which option named it.
 
     Import used to skip this check entirely. An unopenable name — a space, a
@@ -545,18 +629,64 @@ def _valid_account(name: str, option: str) -> str:
     from bea_engine.ledger.text import parse_account
 
     try:
-        return parse_account(name)
+        return parse_account(name, roots)
     except UsageError as exc:
         raise UsageError(f"{option}: {exc}") from None
 
 
-def _blocked_reason(entry: Any, open_currencies: dict[str, set[str] | None]) -> str | None:
+def _row_currency(existing: list[Any], account: str, operating: list[str]) -> str | None:
+    """The commodity an imported row posts when no currency column names one.
+
+    The source account decides before the ledger does: an account opened for a
+    single currency *is* the commodity its statement is denominated in, and
+    reaching for the ledger's single `operating_currency` instead booked every
+    euro line of a euro account as dollars — exit 0, green `bea check`, wrong
+    money. The operating currency stays the fallback for an account opened for
+    any commodity; `None` leaves the row to the currency column or a refusal.
+    """
+    from beancount.core.data import Open
+
+    opened: set[str] | None = set()
+    for entry in existing:
+        if isinstance(entry, Open) and entry.account == account:
+            if not entry.currencies:
+                opened = None
+                break
+            opened = (opened or set()) | set(entry.currencies)
+    if opened is not None and len(opened) == 1:
+        return next(iter(opened))
+    return operating[0] if len(operating) == 1 else None
+
+
+def _known_currencies(existing: list[Any], operating: list[str]) -> frozenset[str]:
+    """Commodities the ledger names: declared, opened for, posted, priced, or operating."""
+    from beancount.core.data import Commodity, Open, Price, Transaction
+
+    known = set(operating)
+    for entry in existing:
+        if isinstance(entry, Commodity):
+            known.add(entry.currency)
+        elif isinstance(entry, Open):
+            known.update(entry.currencies or ())
+        elif isinstance(entry, Price):
+            known.update((entry.currency, entry.amount.currency))
+        elif isinstance(entry, Transaction):
+            known.update(posting.units.currency for posting in entry.postings if posting.units is not None)
+    return frozenset(currency for currency in known if isinstance(currency, str))
+
+
+def _blocked_reason(entry: Any, open_currencies: dict[str, set[str] | None], roots: tuple[str, ...]) -> str | None:
     """Why a transaction cannot be written, or None when its accounts allow it.
 
     Names each unopened account with the `bea add open` line that fixes it,
-    and each currency the account's open directive does not allow.
+    and each currency the account's open directive does not allow. An account
+    under a root the ledger does not use (from a Python importer) gets no
+    `add open` remedy: that command would refuse it too.
     """
     missing = sorted({posting.account for posting in entry.postings if posting.account not in open_currencies})
+    foreign = [name for name in missing if name.split(":", 1)[0] not in roots]
+    if foreign:
+        return unknown_root_message(foreign[0], roots)
     if missing:
         remedies = []
         for name in missing:
@@ -574,9 +704,13 @@ def _blocked_reason(entry: Any, open_currencies: dict[str, set[str] | None]) -> 
         allowed = open_currencies.get(posting.account)
         if allowed is not None and posting.units.currency not in allowed:
             choices = ", ".join(sorted(allowed))
+            instead = choices if len(allowed) == 1 else f"one of {choices}"
+            # Widening the open directive is the last remedy offered, not the
+            # first: following it relabels foreign money as the wrong commodity.
             return (
                 f"Cannot post {posting.units.currency} to '{posting.account}' "
-                f"(open for {choices} only). Add {posting.units.currency} to its open directive."
+                f"(open for {choices} only). Post {instead} instead — name the row's commodity with "
+                f"--csv currency=CODE — or add {posting.units.currency} to its open directive."
             )
     return None
 
@@ -597,10 +731,25 @@ def _exact_amount(number: Decimal, currency: str) -> str:
     result out of scientific notation, which `normalize()` otherwise produces
     for trailing zeros before the point (`100` becomes `1E+2`).
 
+    It normalizes under a context as precise as the number itself. The
+    default context keeps 28 significant digits, so `1.00…001` and
+    `1.00…002` (29+ digits, written exactly to the ledger) rounded to one
+    rendering, shared an id, and the second row was skipped as a duplicate.
+
     The currency is part of the identity. Without it, `1 ETH` and `1 BTC` on
     one date with one description shared a digest.
     """
-    return f"{number.normalize():f} {currency}"
+    return f"{_exactly_normalized(number):f} {currency}"
+
+
+def _exactly_normalized(number: Decimal) -> Decimal:
+    """`number.normalize()` without rounding to the ambient context's precision."""
+    return number.normalize(Context(prec=max(len(number.as_tuple().digits), 1)))
+
+
+def _amounts_rounded(amounts: list[tuple[Decimal, str]]) -> str:
+    """The exact-amount rendering as written before it stopped rounding to 28 digits."""
+    return "+".join(f"{number.normalize():f} {currency}" for number, currency in amounts)
 
 
 def _amounts_exact(amounts: list[tuple[Decimal, str]]) -> str:
@@ -630,7 +779,98 @@ def _digest_import_id(base: str, occurrence: int) -> str:
     return "csv:sha256:" + hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:16]
 
 
-def _hash_import_ids(entry: Any, account: str, seen: dict[str, int]) -> tuple[str, list[str]]:
+@dataclass(frozen=True)
+class _HashedRow:
+    """One hashed row's generated ids.
+
+    `canonical` is written; `older` are lookup-only spellings at the row's own
+    occurrence. A row with both a payee and a narration hashes both, so the
+    ids older releases wrote for it (from the narration alone) are `payeeless`:
+    those numbered occurrences over every row sharing the narration-only base
+    (`group`), so which stored id belongs to which row is settled for the
+    whole group by `_claim_payeeless_ids`, not by row order.
+    """
+
+    canonical: str
+    older: list[str]
+    group: str | None = None
+    payeeless: tuple[str, ...] = ()
+    payee: str = ""
+    date: Any = None
+    amounts: tuple[str, ...] = ()
+
+
+def _hash_rows(entries: list[Any], account: str, keys: list[str], transaction: type[Any]) -> dict[int, _HashedRow]:
+    """Generated ids for every row that gets one, numbered in export order.
+
+    The decision mirrors the preview loop: a transaction posting to the source
+    account with neither an importer-supplied `import-id` nor a native bank id.
+    Hashing ahead of the loop lets a group of rows claim stored ids together.
+    """
+    seen: dict[str, int] = {}
+    hashed: dict[int, _HashedRow] = {}
+    for index, raw in enumerate(entries):
+        entry = normalize_entry_strings(raw)
+        if not isinstance(entry, transaction) or not any(p.account == account for p in entry.postings):
+            continue
+        if entry.meta.get("import-id") or _native_import_id(entry.meta, keys) is not None:
+            continue
+        hashed[index] = _hash_import_ids(entry, account, seen)
+    return hashed
+
+
+def _claim_payeeless_ids(
+    hashed: dict[int, _HashedRow], identities: dict[tuple[str, str, str], Any], account: str
+) -> dict[int, list[str]]:
+    """Give each stored narration-only id to the row it was written for.
+
+    Ids written before payees were hashed number identical narrations in
+    export order, so with a reordered export occurrence K is a different row:
+    `PEETS` then `STARBUCKS`, both `CARD PURCHASE -5.00`, would have `PEETS`
+    match the id stored for `STARBUCKS`. Every stored entry any row of a group
+    reaches is therefore claimed by the group's row with that entry's payee
+    first; an entry whose payee no row has (edited later) keeps the meaning
+    the old id had — the row at its occurrence — or, if that row was claimed,
+    the next unclaimed row in export order. A row left without a claim has no
+    older id at all.
+    """
+    groups: dict[str, list[int]] = {}
+    for index, row in hashed.items():
+        if row.group is not None:
+            groups.setdefault(row.group, []).append(index)
+    claimed: dict[int, list[str]] = {}
+    for indices in groups.values():
+        stored: list[tuple[Any, str, int]] = []
+        for index in indices:
+            row = hashed[index]
+            for value in row.payeeless:
+                digest = value.rsplit(":", 1)[1]
+                found = identities.get((account, "import-id", value)) or identities.get((account, "digest", digest))
+                if found is None or any(found is entry for entry, _, _ in stored):
+                    continue
+                found_print = _fingerprint(found, account)
+                if (found_print[0], found_print[3]) == (row.date, row.amounts):
+                    stored.append((found, value, index))
+        unclaimed = list(indices)
+        leftover: list[tuple[str, int]] = []
+        for found, value, reached_by in stored:
+            payee = _match_text(found.payee)
+            owner = next((index for index in unclaimed if payee and hashed[index].payee == payee), None)
+            if owner is None:
+                leftover.append((value, reached_by))
+                continue
+            unclaimed.remove(owner)
+            claimed[owner] = [value]
+        for value, reached_by in leftover:
+            if not unclaimed:
+                break
+            owner = reached_by if reached_by in unclaimed else unclaimed[0]
+            unclaimed.remove(owner)
+            claimed[owner] = [value]
+    return claimed
+
+
+def _hash_import_ids(entry: Any, account: str, seen: dict[str, int]) -> _HashedRow:
     """The canonical import id, plus every older spelling to also match on.
 
     The canonical digest hashes the exact amount with its commodity, and hashes
@@ -645,9 +885,15 @@ def _hash_import_ids(entry: Any, account: str, seen: dict[str, int]) -> tuple[st
     exactness, or predate both, but there is no exact-amount/un-normalized
     combination in the wild to look for.
 
-    Occurrence numbering stays keyed on the canonical base, so N identical rows
-    keep their 1..N suffixes and every older spelling of row K is that format's
-    digest at occurrence K.
+    Occurrence numbering stays keyed on the narration-only base, so N
+    identical rows keep their 1..N suffixes and every older spelling of row K
+    is that format's digest at occurrence K.
+
+    A row with both a payee and a narration hashes both
+    (`date|amount|payee|narration|account`): `STARBUCKS / CARD PURCHASE` and
+    `PEETS / CARD PURCHASE` are different rows, and the occurrence suffix is
+    only for identical ones. Its narration-only spellings are returned as
+    `payeeless` for the group-wide claim instead of as plain lookups.
     """
     amounts = sorted((p.units.number, p.units.currency) for p in _source_postings(entry, account))
     raw_description = " ".join(str(entry.narration or entry.payee or "").upper().split())
@@ -656,14 +902,23 @@ def _hash_import_ids(entry: Any, account: str, seen: dict[str, int]) -> tuple[st
     description = unicodedata.normalize("NFC", raw_description)
     nfc_account = unicodedata.normalize("NFC", account)
     date = entry.date.isoformat()
+    exact = _amounts_exact(amounts)
 
-    canonical_base = _hash_base(date, _amounts_exact(amounts), description, nfc_account)
-    seen[canonical_base] = seen.get(canonical_base, 0) + 1
-    occurrence = seen[canonical_base]
+    single_base = _hash_base(date, exact, description, nfc_account)
+    seen[single_base] = seen.get(single_base, 0) + 1
+    occurrence = seen[single_base]
 
     two_decimal = _amounts_two_decimal(amounts)
-    known = {canonical_base}
+    known = {single_base}
     older: list[str] = []
+    rounded_base = _hash_base(date, _amounts_rounded(amounts), description, nfc_account)
+    if rounded_base != single_base:
+        # Amounts past 28 significant digits were hashed rounded, and those
+        # rows were numbered among every row rounding to the same base.
+        counter = f"rounded\0{rounded_base}"
+        seen[counter] = seen.get(counter, 0) + 1
+        known.add(rounded_base)
+        older.append(_digest_import_id(rounded_base, seen[counter]))
     for base in (
         _hash_base(date, two_decimal, description, nfc_account),  # before exact amounts
         _hash_base(date, two_decimal, raw_description, account),  # and before NFC
@@ -672,12 +927,37 @@ def _hash_import_ids(entry: Any, account: str, seen: dict[str, int]) -> tuple[st
             continue
         known.add(base)
         older.append(_digest_import_id(base, occurrence))
-    return _digest_import_id(canonical_base, occurrence), older
+    single = _digest_import_id(single_base, occurrence)
+
+    payee = unicodedata.normalize("NFC", " ".join(str(entry.payee or "").upper().split()))
+    if not (payee and str(entry.narration or "").strip()):
+        return _HashedRow(canonical=single, older=older)
+    paired_base = _hash_base(date, exact, f"{payee}|{description}", nfc_account)
+    # Keyed apart from the narration-only counter, so a paired base can never
+    # share an occurrence count with a narration that happens to contain `|`.
+    counter = f"paired\0{paired_base}"
+    seen[counter] = seen.get(counter, 0) + 1
+    return _HashedRow(
+        canonical=_digest_import_id(paired_base, seen[counter]),
+        older=[],
+        group=single_base,
+        payeeless=(single, *older),
+        payee=_match_text(entry.payee),
+        date=entry.date,
+        amounts=tuple(sorted(_exact_amount(number, currency) for number, currency in amounts)),
+    )
 
 
 def _candidate_key(entry: Any, account: str) -> tuple[Any, ...]:
-    date, payee, _narration, amounts = _fingerprint(entry, account)
-    return date, payee, amounts
+    """Date, who was paid, and source amounts: what flags a possible duplicate.
+
+    The payee names who was paid. A row with no payee — the documented
+    one-description CSV mapping puts the bank text in `narration` — is named
+    by its narration instead; otherwise every same-day same-amount row would
+    collapse onto date + amount and `--duplicates skip` would drop real ones.
+    """
+    date, payee, narration, amounts = _fingerprint(entry, account)
+    return date, payee or narration, amounts
 
 
 def _source_amounts(entry: Any, account: str) -> str:

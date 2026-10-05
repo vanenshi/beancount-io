@@ -1,6 +1,11 @@
 import { assertSafeRepoPath } from "@/features/ledger/utils/safe-repo-path";
 import { logger } from "@/shared/logger";
-import { BadUserInputError, DomainError } from "@/shared/errors";
+import {
+  BadUserInputError,
+  DomainError,
+  InternalServerError,
+  NotFoundError,
+} from "@/shared/errors";
 import type { IGiteaClientFactory } from "@/foundation/clients/gitea-client-factory";
 import type {
   ContentsResponse,
@@ -54,6 +59,36 @@ function describeClientFailure(error: unknown): string {
   } catch {
     return "Unknown error";
   }
+}
+
+/**
+ * The HTTP status of a refusal the generated Gitea client threw. It throws the
+ * response itself rather than an Error, so the status is the one reliable
+ * thing a catch can read off it.
+ */
+function clientFailureStatus(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const status = (error as { status?: unknown }).status;
+  return typeof status === "number" ? status : undefined;
+}
+
+/**
+ * What a failed merge or close reports.
+ *
+ * A number Gitea does not know is thrown as NOT_FOUND: there is no pull
+ * request to return a review result about. Any other refusal — already
+ * merged, conflicts, a closed pull request — stays a `success: false` result,
+ * described from the response the client threw rather than as "Unknown
+ * error", which is all its missing `Error.message` used to leave.
+ */
+function reviewFailure(
+  error: unknown,
+  prNumber: number,
+): { success: false; message: string } {
+  if (clientFailureStatus(error) === 404) {
+    throw new NotFoundError("Pull request", String(prNumber));
+  }
+  return { success: false, message: describeClientFailure(error) };
 }
 
 export interface CreatedPullRequest {
@@ -128,6 +163,15 @@ export class PullRequestService implements IPullRequestService {
         "clearCommitMessage must not be empty — it becomes the commit message for the pull request branch",
       );
     }
+    // Refused before any branch exists: with nothing to apply there is nothing
+    // a pull request could hold, and discovering that only after step 3 left
+    // a `pr-patch-*` branch behind on every such call (w5/053).
+    if (input.changes.length === 0) {
+      throw new BadUserInputError(
+        "changes must not be empty — a pull request needs at least one file to change",
+        "changes",
+      );
+    }
     for (const change of input.changes) assertSafeRepoPath(change.path);
     const userId = identity.userId;
     const client = await this.giteaClientFactory.getUserApiClient(userId);
@@ -136,20 +180,26 @@ export class PullRequestService implements IPullRequestService {
     const timestamp = Date.now();
     const random = Math.random().toString(36).substring(7);
     const headBranch = `pr-patch-${timestamp}-${random}`;
+    let branchCreated = false;
 
     try {
       // 2. Get base branch reference (`format` is load-bearing: without it
       // the generated client resolves `data` to null and every check below
       // misfires against a live Gitea.)
-      const baseBranchRef = await client.repos.repoGetBranch(
-        owner,
-        repo,
-        baseBranch,
-        { format: "json" },
-      );
+      const baseBranchRef = await client.repos
+        .repoGetBranch(owner, repo, baseBranch, { format: "json" })
+        .catch((error: unknown) => {
+          // The client throws on a 404 rather than resolving empty data, so
+          // the guard below never saw an unknown branch: it fell through to
+          // the catch-all and read as a server fault to retry.
+          if (clientFailureStatus(error) === 404) return { data: null };
+          throw error;
+        });
       if (!baseBranchRef.data) {
-        throw new Error(
-          `Base branch '${baseBranch}' not found in repository ${owner}/${repo}`,
+        throw new NotFoundError(
+          "Branch",
+          baseBranch,
+          `No branch named '${baseBranch}' in ${owner}/${repo}. Pass an existing branch as baseBranch.`,
         );
       }
       const baseSha = baseBranchRef.data.commit?.id ?? "";
@@ -168,6 +218,7 @@ export class PullRequestService implements IPullRequestService {
       if (!createBranchResult.data) {
         throw new Error(`Failed to create branch ${headBranch}`);
       }
+      branchCreated = true;
 
       // 4. Apply file changes to new branch
       for (const change of input.changes) {
@@ -271,6 +322,22 @@ export class PullRequestService implements IPullRequestService {
         headBranch: prResult.data.head?.ref || headBranch,
       };
     } catch (error) {
+      // No pull request was opened, so the branch minted for it has no
+      // purpose: a refusal that leaves it behind litters one branch per
+      // failed call. Best effort — the original failure is what the caller
+      // needs, and a cleanup that fails must not replace it.
+      if (branchCreated) {
+        await client.repos
+          .repoDeleteBranch(owner, repo, headBranch)
+          .catch((cleanupError: unknown) => {
+            logger.warn("Failed to delete an unused pull request branch", {
+              owner,
+              repo,
+              headBranch,
+              error: describeClientFailure(cleanupError),
+            });
+          });
+      }
       if (error instanceof DomainError) throw error;
       throw new Error(
         `Failed to create PR from patch: ${describeClientFailure(error)}`,
@@ -313,11 +380,7 @@ export class PullRequestService implements IPullRequestService {
 
       const pr = prResponse.data;
 
-      if (!pr) {
-        throw new Error(
-          `Pull request #${prNumber} not found in ${owner}/${repo}`,
-        );
-      }
+      if (!pr) throw new NotFoundError("Pull request", String(prNumber));
 
       // Process files data
       const filesData = filesResponse.data;
@@ -342,12 +405,19 @@ export class PullRequestService implements IPullRequestService {
         diff: diffResponse.data || "",
       };
     } catch (error) {
+      if (error instanceof DomainError) throw error;
+      // A pull request number Gitea does not know is the caller's to fix, not
+      // a server fault to retry.
+      if (clientFailureStatus(error) === 404) {
+        throw new NotFoundError("Pull request", String(prNumber));
+      }
       logger.error("Gitea API error fetching PR", {
-        error: error instanceof Error ? error.message : String(error),
+        error: describeClientFailure(error),
       });
-      const errorMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      throw new Error(`Failed to fetch PR details: ${errorMessage}`);
+      throw new InternalServerError(
+        "Failed to fetch PR details",
+        error instanceof Error ? error : undefined,
+      );
     }
   }
 
@@ -372,9 +442,7 @@ export class PullRequestService implements IPullRequestService {
 
       return { success: true, message: "PR merged successfully" };
     } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      return { success: false, message: errorMessage };
+      return reviewFailure(error, prNumber);
     }
   }
 
@@ -399,9 +467,7 @@ export class PullRequestService implements IPullRequestService {
 
       return { success: true, message: "PR closed successfully" };
     } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      return { success: false, message: errorMessage };
+      return reviewFailure(error, prNumber);
     }
   }
 }

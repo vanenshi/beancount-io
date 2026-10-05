@@ -1,4 +1,4 @@
-"""BQL, engine-side: upstream's dispatch and renderers, plus bea's two fixes.
+"""BQL, engine-side: upstream's dispatch with bea's path and rendering fixes.
 
 This is where `bea query` runs after ADR014 t005. The frontend has no Beanquery
 and no shell subclass; it passes a ledger path and a query string across the
@@ -6,10 +6,8 @@ process boundary and renders whatever comes back.
 
 Upstream owns everything that makes a query a query: parsing, the statement
 dispatch that makes `PRINT` print directives rather than a `ROW(*)` table,
-`.run` and the rest of the dot commands, the text/CSV/Beancount renderers, and
-the interactive shell. Two things are ours, both of them fixes for behavior
-customers reported, and both of them needing Beancount objects — which is why
-they live here and not in `bea`:
+`.run` and the rest of the dot commands, and the interactive shell. The fixes
+below need Beancount objects, which is why they live here and not in `bea`:
 
 - **Exact paths.** Beanquery attaches a ledger through a `beancount:<path>` DSN
   that it hands to `urlparse`, so a `#` or `?` in a filename reads as a
@@ -21,6 +19,9 @@ they live here and not in `bea`:
   `decimal.InvalidOperation` outright on a balance wider than twelve integer
   digits. `result_context` derives the precision from the values being
   rendered instead.
+- **Directive exports.** The shared writer printer preserves negative custom
+  values, small decimal metadata, string escapes and whole cost specifications
+  so reloading an export does not silently change those values.
 """
 
 from __future__ import annotations
@@ -28,10 +29,12 @@ from __future__ import annotations
 import difflib
 import os
 import re
+import stat
 import sys
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from decimal import Decimal, localcontext
+from functools import partial
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -89,6 +92,31 @@ def _code_mask(text: str) -> str:
     return "".join(out)
 
 
+def _refuse_statement_tail(query_string: str, ledger_errors: list[str] | None = None) -> None:
+    """Refuse BQL text carrying more than one statement.
+
+    Beanquery parses the first statement and silently drops whatever follows
+    a `;` — even text that is not BQL at all — so `SELECT 1; SELECT 2` stored
+    in a `query` directive, or typed at the prompt, answered half and exited 0.
+    Separators are found in the code mask, so a `;` inside a literal or a
+    comment does not count, and a trailing `;` is not a second statement: the
+    same rules as the frontend's one-shot `_split_statements`.
+    """
+    masked = _code_mask(query_string)
+    statements = 0
+    start = 0
+    for index in [*(i for i, char in enumerate(masked) if char == ";"), len(masked)]:
+        if query_string[start:index].strip():
+            statements += 1
+        start = index + 1
+    if statements > 1:
+        raise protocol.UsageError(
+            f"One BQL statement per query; got {statements}. Beanquery would run only the first.",
+            details=["Split the statements into separate queries."],
+            ledger_errors=ledger_errors,
+        )
+
+
 def _quote_reserved_tables(query_string: str) -> str:
     """Rewrite `FROM accounts|balances` to the quoted form discovery documents.
 
@@ -141,7 +169,7 @@ def rows_answer(
         description, rows = numberify_results(description, rows, result_context(rows).build())
     return {
         "columns": columns(description),
-        "rows": [[protocol._jsonable(value) for value in row] for row in rows],
+        "rows": [[protocol._jsonable(_public_value(value)) for value in row] for row in rows],
         "errors": errors,
     }
 
@@ -154,6 +182,7 @@ def text_answer(
     format: str = "text",
     numberify: bool = False,
     allow_errors: bool = False,
+    spreadsheet_safe: bool = False,
 ) -> dict[str, Any]:
     """Upstream's own rendering of one query, plus the ledger's load errors.
 
@@ -166,6 +195,10 @@ def text_answer(
     """
     import io
 
+    if output is not None:
+        # Keep the approved target stable if the user's symlink is retargeted
+        # while the query runs. The alias check below sees this same path.
+        output = output.resolve()
     # The shell renders into a buffer and the destination is opened only once
     # the whole query has succeeded. Opening it before the load would truncate
     # a `-o` naming the ledger under read before the load saw a byte of it;
@@ -177,31 +210,18 @@ def text_answer(
     # `show_errors=False`: the load errors travel in the envelope, and
     # upstream printing them to stderr too would report each one twice.
     shell = build_shell(file, buffer, format=format, numberify=numberify, show_errors=False)
-    # One-shot text tables must keep full headers. Upstream `narrow=True`
-    # treats the boolean as width 1 (`max(..., True, ...)`), truncating
-    # `count(*)` to `c`. Interactive users can still `.set narrow true`.
-    shell.settings.narrow = False
+    shell.spreadsheet_safe = spreadsheet_safe
     errors = _gate([format_error(error, ledger_file=file) for error in shell.context.errors], allow_errors)
     if output is not None:
         # Still before the query: refusing to write over the ledger being read
         # is a refusal, and a refusal has to happen before any work is done.
         _refuse_alias(output, file, shell.context)
+    _replay_init(shell, buffer if output is not None else None)
     _executed(shell.context, query_string, shell.onecmd, errors)
     if output is not None:
-        # Rendered whole, then swapped in. Opening the destination itself
-        # truncated it before the bytes were safely down, so a write that
-        # failed partway — a full disk, a size limit — left a fragment of the
-        # new result where the last good export had been. w3/380 moved this
-        # past the *query*; the write itself still had to become atomic.
-        #
-        # `candidate_file` is the engine's own sibling-temp primitive: same
-        # directory, so the replace is atomic, with fsync and cleanup already
-        # handled. The frontend has its own `cli.utils.atomic_write` for the
-        # JSON path, which is why that path already preserved.
-        from bea_engine.ledger.write import candidate_file
-
-        with candidate_file(output, buffer.getvalue()) as candidate:
-            os.replace(candidate, output)
+        # Rendered whole, then swapped in atomically. w3/380 moved this past
+        # the *query*; the write itself still had to become atomic.
+        _write_export(output, buffer.getvalue())
         # The export is the result; the frontend has nothing left to print.
         return {"text": "", "errors": errors}
     return {"text": buffer.getvalue(), "errors": errors}
@@ -259,6 +279,248 @@ def _refuse_alias(destination: Path, root: Path, context: Any) -> None:
         )
 
 
+def _redirect_output(shell: Any, arg: str, stream: TextIO, file: Path | None) -> None:
+    """Protect loaded inputs and keep the current stream when redirection fails."""
+    if arg and file is not None:
+        member = _find_alias(Path(arg), file, shell.context)
+        if member is not None:
+            protocol.note(
+                f"Refusing to write query output to {arg}: it is one of the ledger files under query ({member})."
+            )
+            return
+    try:
+        destination = open(arg, "w", encoding="utf-8") if arg else stream
+    except OSError as exc:
+        protocol.note(f"Cannot write to {arg}: {exc.strerror or exc}.")
+        return
+    if shell.outfile is not stream:
+        shell.outfile.close()
+    shell.outfile = destination
+
+
+def _native_shell(source: str, *, interactive: bool, format: str, numberify: bool, show_errors: bool) -> Any:
+    """Upstream's `BQLShell` on a native source, with bea's input and exit-status guards.
+
+    Sources and rendering stay upstream's. What changes is what upstream only
+    prints: `.run` naming no stored query, and a statement tail Beanquery would
+    drop, are usage errors here, so a one-shot exits 2 instead of 0 and an
+    interactive session reports them and carries on. `.output` keeps refusing
+    the files the source reads.
+    """
+    from urllib.parse import urlparse
+
+    from beanquery.shell import BQLShell
+
+    dsn = source if re.match("[a-z]{2,}:", source) else "beancount:" + source
+    parts = urlparse(dsn)
+    file = Path(parts.path) if parts.scheme in {"beancount", "csv"} and parts.path else None
+
+    class GuardedShell(BQLShell):  # type: ignore[misc]
+        source_file = file
+
+        def do_output(self, arg: str) -> None:
+            """Send output to FILE or restore stdout, preserving source files."""
+            _redirect_output(self, arg, sys.stdout, file)
+
+        def do_run(self, arg: str) -> None:
+            """Run a named stored query, or list them; missing names are usage errors."""
+            _run_stored(self, arg)
+
+        def execute(self, query: Any, **kwargs: Any) -> Any:
+            statement = query if isinstance(query, str) else ""
+            if statement:
+                _refuse_statement_tail(statement)
+            context = None if self.interactive else self.context
+            return _compiled(partial(super().execute, query, **kwargs), statement, list, context)
+
+        def onecmd(self, line: str) -> Any:
+            return _recovering(self, self._dispatch, line)
+
+        def _dispatch(self, line: str) -> Any:
+            # Upstream runs nothing for a line with no leading identifier — a
+            # query opening with a comment, or a dash-leading string such as
+            # `--output=main.bean` — and the one-shot then exited 0 with no
+            # output. Hand it to the parser, which runs it or says why not.
+            command_name, _, parsed = self.parseline(line)
+            if parsed and not command_name:
+                return self.execute(parsed)
+            return super().onecmd(line)
+
+    # Load before replaying init commands, so .output sees the include closure.
+    return GuardedShell(dsn, sys.stdout, interactive, False, format, numberify, show_errors)
+
+
+def _replay_init(shell: Any, output: TextIO | None = None) -> None:
+    """Replay Beanquery's init file, as `bean-query` does, once the source is loaded.
+
+    Upstream replays it inside the shell's constructor, before the source is
+    attached, so a guarded `.output` there could neither see the files it must
+    not overwrite nor run at all. An explicit `--output` stream, set here once
+    the init file is done, outranks an init-file `.output`.
+    """
+    from beanquery.shell import INIT_FILENAME
+
+    default = shell.outfile
+    init = Path(INIT_FILENAME).expanduser()
+    if init.is_file():
+        for line in init.read_text(encoding="utf-8").splitlines():
+            shell.onecmd(line)
+    if output is not None:
+        if shell.outfile is not default:
+            shell.outfile.close()
+        shell.outfile = output
+
+
+def native_interactive(
+    source: str,
+    *,
+    format: str = "text",
+    output: Path | None = None,
+    numberify: bool = False,
+    show_errors: bool = True,
+) -> None:
+    """Native Beanquery sources and rendering, with bea's destination protection."""
+    import warnings
+
+    warnings.filterwarnings("always")
+    shell = _native_shell(source, interactive=True, format=format, numberify=numberify, show_errors=show_errors)
+    try:
+        if output is not None:
+            if shell.source_file is not None:
+                _refuse_alias(output, shell.source_file, shell.context)
+        _replay_init(shell, None if output is None else output.open("w", encoding="utf-8"))
+        shell.cmdloop()
+    finally:
+        if shell.outfile is not sys.stdout:
+            shell.outfile.close()
+
+
+def native_one_shot(
+    source: str,
+    query_string: str,
+    *,
+    format: str = "text",
+    output: Path | None = None,
+    numberify: bool = False,
+    show_errors: bool = True,
+) -> None:
+    """One native query, the way `bean-query SOURCE QUERY` runs it, with a truthful exit status.
+
+    `bean-query` printed `error: query "x" not found` for a missing stored
+    query and still exited 0, so automation could not tell an unavailable
+    query from an empty answer. Here that failure raises, and the caller exits
+    2. An `--output` export is written only after the query succeeds, so a
+    refused query leaves an existing export as it was.
+    """
+    import io
+
+    shell = _native_shell(source, interactive=False, format=format, numberify=numberify, show_errors=show_errors)
+    buffer = io.StringIO()
+    if output is not None:
+        output = output.resolve()
+        if shell.source_file is not None:
+            _refuse_alias(output, shell.source_file, shell.context)
+    _replay_init(shell, buffer if output is not None else None)
+    from beanquery import Error as BeanqueryError
+
+    try:
+        shell.onecmd(query_string)
+    except BeanqueryError as exc:
+        # `bean-query` let these escape as a Python traceback; name the problem instead.
+        raise _usage_error(exc, query_string, shell.context, []) from None
+    if output is not None:
+        _write_export(output, buffer.getvalue())
+
+
+def _run_stored(shell: Any, arg: str) -> None:
+    """`.run`: list stored queries, run one or all; a missing name is a usage error.
+
+    Upstream prints `error: query "x" not found` and returns, which a one-shot
+    then reports as success.
+    """
+    import shlex
+
+    cleaned = arg.rstrip("; \t")
+    if not cleaned:
+        if shell.queries:
+            print("\n".join(name for name in sorted(shell.queries)), file=shell.outfile)
+        return
+    if cleaned == "*":
+        for name, query in sorted(shell.queries.items()):
+            print(f"{name}:", file=shell.outfile)
+            shell.execute(query.query_string, default_close_date=query.date)
+            print(file=shell.outfile)
+            print(file=shell.outfile)
+        return
+    parts = shlex.split(cleaned)
+    if len(parts) != 1:
+        raise protocol.UsageError('too many arguments for "run" command')
+    name = parts[0]
+    query = shell.queries.get(name)
+    if query is None:
+        known = ", ".join(sorted(shell.queries)) or "(none)"
+        raise protocol.UsageError(
+            f'query "{name}" not found.',
+            details=[f"Stored queries in this ledger: {known}."],
+        )
+    shell.execute(query.query_string, default_close_date=query.date)
+
+
+def _recovering(shell: Any, dispatch: Callable[[str], Any], line: str) -> Any:
+    """Dispatch one shell line; an interactive mistake is reported, not raised.
+
+    A mistake typed at the prompt is ordinary input, not a crash. Upstream's
+    `cmdloop` catches everything and renders anything it does not recognize
+    with `traceback.format_exc()`, so `.run` naming no stored query printed a
+    Python stack — and threw away the `details` line listing the queries that
+    do exist, which the one-shot form shows. `--debug` is the documented way
+    to ask for a traceback.
+
+    One-shot execution must still propagate: its exit code and its JSON error
+    envelope are built from this exception.
+    """
+    try:
+        return dispatch(line)
+    except protocol.EngineError as exc:
+        if not shell.interactive:
+            raise
+        protocol.note(str(exc))
+        for detail in exc.details or ():
+            protocol.note(detail)
+        return False
+
+
+def _write_export(output: Path, text: str) -> None:
+    """Replace `output` with `text` atomically, keeping an existing file's mode.
+
+    Opening the destination itself truncated it before the bytes were safely
+    down, so a write that failed partway — a full disk, a size limit — left a
+    fragment of the new result where the last good export had been.
+    `candidate_file` is the engine's own sibling-temp primitive: same
+    directory, so the replace is atomic, with fsync and cleanup already
+    handled. The frontend has its own `cli.utils.atomic_write` for the JSON
+    path.
+    """
+    from bea_engine.ledger.write import candidate_file
+
+    try:
+        status = output.stat()
+    except FileNotFoundError:
+        mode = None
+    else:
+        if not stat.S_ISREG(status.st_mode):
+            # A device or FIFO (`-o /dev/null`): there is no sibling to stage
+            # in, and replacing it would swap the device for a regular file.
+            with output.open("w", encoding="utf-8") as stream:
+                stream.write(text)
+            return
+        mode = stat.S_IMODE(status.st_mode)
+    with candidate_file(output, text, mode=0o666 if mode is None else 0o600) as candidate:
+        if mode is not None:
+            candidate.chmod(mode)
+        os.replace(candidate, output)
+
+
 def _gate(errors: list[str], allow_errors: bool) -> list[str]:
     """Refuse to answer from a ledger that does not load, unless told otherwise.
 
@@ -282,6 +544,7 @@ def interactive(
     numberify: bool = False,
     show_errors: bool = True,
     allow_errors: bool = False,
+    spreadsheet_safe: bool = False,
 ) -> None:
     """Upstream's interactive shell, on this process's terminal.
 
@@ -300,14 +563,18 @@ def interactive(
 
     warnings.filterwarnings("always")
     shell = build_shell(file, sys.stdout, interactive=True, format=format, numberify=numberify, show_errors=show_errors)
+    shell.spreadsheet_safe = spreadsheet_safe
     # After build_shell, which is what loads the ledger, and before cmdloop.
     _gate([format_error(error, ledger_file=file) for error in shell.context.errors], allow_errors)
+    # The policy outlives startup: `.reload` swaps in whatever the file holds
+    # now, and every later query re-checks it (see PreciseShell.execute).
+    shell.allow_errors = allow_errors
     destination = None
     if output is not None:
         _refuse_alias(output, file, shell.context)
         destination = output.open("w")
-        shell.outfile = destination
     try:
+        _replay_init(shell, destination)
         shell.cmdloop()
     finally:
         if destination is not None:
@@ -329,28 +596,19 @@ def build_shell(
 
     class PreciseShell(BQLShell):  # type: ignore[misc]  # beanquery does not ship type annotations
         outfile: TextIO
+        # The read policy for queries after a `.reload`. One-shot callers gate
+        # the load themselves before executing, so only `interactive()` turns
+        # this off, once the startup load has passed its own gate.
+        allow_errors: bool = True
+        # `--spreadsheet-safe`: neutralise formula-looking text in CSV cells.
+        spreadsheet_safe: bool = False
 
         def do_output(self, arg: str) -> None:
             """Send output to FILE or restore the original output stream."""
             # Beanquery 0.2.0 calls open(sys.stdout) on reset and closes the old
             # stream before opening its replacement. Remove this override when
             # upstream supports reset and failed redirection without losing output.
-            if arg:
-                member = _find_alias(Path(arg), file, self.context)
-                if member is not None:
-                    protocol.note(
-                        f"Refusing to write query output to {arg}: "
-                        f"it is one of the ledger files under query ({member})."
-                    )
-                    return
-            try:
-                destination = open(arg, "w", encoding="utf-8") if arg else stream
-            except OSError as exc:
-                protocol.note(f"Cannot write to {arg}: {exc.strerror or exc}.")
-                return
-            if self.outfile is not stream:
-                self.outfile.close()
-            self.outfile = destination
+            _redirect_output(self, arg, stream, file)
 
         def do_reload(self, arg: Any = None) -> None:
             """Reload the Beancount input file."""
@@ -364,6 +622,13 @@ def build_shell(
             self._extract_queries(self.context.tables["entries"].entries)
             if self.context.errors and self.show_load_errors:
                 printer.print_errors(self.context.errors, file=sys.stderr)  # type: ignore[no-untyped-call]
+            if self.context.errors and not self.allow_errors:
+                # Said even under `--no-errors`: that flag quietens the banner,
+                # it does not waive the strict read the session opened with.
+                protocol.note(
+                    f"Ledger has {len(self.context.errors)} error(s); queries are refused until "
+                    "it loads cleanly. Fix the ledger and .reload, or reopen with --allow-errors."
+                )
 
         def do_help(self, arg: str) -> None:
             """List commands, writing to outfile so one-shot JSON stays clean."""
@@ -383,32 +648,7 @@ def build_shell(
 
         def do_run(self, arg: str) -> None:
             """Run a named stored query, or list them; missing names are usage errors."""
-            import shlex
-
-            cleaned = arg.rstrip("; \t")
-            if not cleaned:
-                if self.queries:
-                    print("\n".join(name for name in sorted(self.queries)), file=self.outfile)
-                return
-            if cleaned == "*":
-                for name, query in sorted(self.queries.items()):
-                    print(f"{name}:", file=self.outfile)
-                    self.execute(query.query_string, default_close_date=query.date)
-                    print(file=self.outfile)
-                    print(file=self.outfile)
-                return
-            parts = shlex.split(cleaned)
-            if len(parts) != 1:
-                raise protocol.UsageError('too many arguments for "run" command')
-            name = parts[0]
-            query = self.queries.get(name)
-            if query is None:
-                known = ", ".join(sorted(self.queries)) or "(none)"
-                raise protocol.UsageError(
-                    f'query "{name}" not found.',
-                    details=[f"Stored queries in this ledger: {known}."],
-                )
-            self.execute(query.query_string, default_close_date=query.date)
+            _run_stored(self, arg)
 
         def execute(self, query: Any, **kwargs: Any) -> Any:
             """Prepare BQL here, where every entry path actually arrives.
@@ -426,32 +666,28 @@ def build_shell(
             BQL. Preparation is idempotent (the quoting pattern skips names
             already quoted), which is what lets the outer wrapper stay as it is
             for the JSON path, which never builds a shell.
+
+            It is also where a strict session re-applies its read policy: the
+            startup gate saw only the first load, and `.reload` used to swap
+            in an invalid ledger that typed and stored queries then answered
+            from as if nothing had changed.
             """
+            if not self.allow_errors:
+                _gate([format_error(error, ledger_file=file) for error in self.context.errors], False)
+            statement = ""
             if isinstance(query, str):
-                query = _quote_reserved_tables(unicodedata.normalize("NFC", query))
+                _refuse_statement_tail(query)
+                query = statement = _quote_reserved_tables(unicodedata.normalize("NFC", query))
                 _refuse_empty_window(query, [])
-            return super().execute(query, **kwargs)
+            return _compiled(
+                partial(super().execute, query, **kwargs),
+                statement,
+                lambda: [format_error(error, ledger_file=file) for error in self.context.errors],
+                None if self.interactive else self.context,
+            )
 
         def onecmd(self, line: str) -> Any:
-            try:
-                return self._dispatch(line)
-            except protocol.EngineError as exc:
-                # A mistake typed at the prompt is ordinary input, not a crash.
-                # Upstream's `cmdloop` catches everything and renders anything
-                # it does not recognize with `traceback.format_exc()`, so
-                # `.run` naming no stored query printed a Python stack — and
-                # threw away the `details` line listing the queries that do
-                # exist, which the one-shot form shows. `--debug` is the
-                # documented way to ask for a traceback.
-                #
-                # One-shot execution must still propagate: its exit code and
-                # its JSON error envelope are built from this exception.
-                if not self.interactive:
-                    raise
-                protocol.note(str(exc))
-                for detail in exc.details or ():
-                    protocol.note(detail)
-                return False
+            return _recovering(self, self._dispatch, line)
 
         def _dispatch(self, line: str) -> Any:
             # Ledger text loads NFC-normalized, so interactive input is too; a
@@ -486,9 +722,11 @@ def build_shell(
                 if self.settings.format == "csv":
                     # Upstream CSV reuses text DecimalRenderer padding. Emit
                     # unpadded machine cells so spreadsheets and Decimal() parse.
-                    return _render_csv(description, rows, out)
+                    return _render_csv(description, rows, out, spreadsheet_safe=self.spreadsheet_safe)
+                if self.settings.format == "beancount":
+                    return _render_beancount(rows, out)
                 if self.settings.format == "text":
-                    rows = [tuple(_inert_cell(value) for value in row) for row in rows]
+                    rows = [tuple(_inert_cell(_public_value(value)) for value in row) for row in rows]
                 renderer = FORMATS[self.settings.format]
                 return renderer(description, rows, out, dcontext=dcontext, **self.settings.todict())
 
@@ -506,7 +744,15 @@ def build_shell(
     # The override above drops upstream's SELECT help; without it, `help
     # select` crashes formatting a missing docstring.
     PreciseShell.on_Select.__doc__ = BQLShell.on_Select.__doc__
-    return PreciseShell(LEDGER_DSN, stream, interactive, True, format, numberify, show_errors)
+    # `runinit=False`: upstream would replay the init file inside the
+    # constructor, before `self.context` exists, so a guarded `.output` there
+    # failed every query. Callers replay it once the ledger is loaded.
+    shell = PreciseShell(LEDGER_DSN, stream, interactive, False, format, numberify, show_errors)
+    # Both one-shot and interactive tables keep full headers by default.
+    # Upstream narrow=True treats the boolean as width 1 and cuts count(*)
+    # to c/co. Interactive users can still explicitly `.set narrow true`.
+    shell.settings.narrow = False
+    return shell
 
 
 def _inert_cell(value: Any) -> Any:
@@ -529,13 +775,12 @@ def _inert_cell(value: Any) -> Any:
 
 
 def _require_entries(description: Any, rows: Any) -> None:
-    """Refuse a column result under the beancount format before upstream's renderer sees it.
+    """Refuse a column result under the beancount format before rendering it.
 
     Upstream's renderer unpacks every row as a single directive, so a column
     `SELECT` fails inside it with 'too many values to unpack' or a missing
-    `meta` attribute. `PRINT` answers one directive per row and still goes to
-    upstream unchanged; the ledger is fine either way, so this is a usage
-    failure rather than a validation one.
+    `meta` attribute. `PRINT` answers one directive per row; the ledger is fine
+    either way, so this is a usage failure rather than a validation one.
 
     An empty result keys on the cursor, not the rows: `SELECT entry` types its
     lone column as the directive, while a column `SELECT` types it scalar, so
@@ -556,22 +801,107 @@ def _require_entries(description: Any, rows: Any) -> None:
     )
 
 
-def _render_csv(description: Any, rows: Any, out: TextIO) -> None:
+def _render_beancount(rows: Any, out: TextIO) -> None:
+    """Use the writer's syntax fixes with upstream's grouping and exact precision."""
+    from beancount.core.data import Commodity, Transaction
+    from beancount.core.display_context import DisplayContext
+
+    from bea_engine.ledger.writer import DirectivePrinter
+
+    # Like upstream's Beancount renderer, a fresh display context retains each
+    # number's natural precision instead of rounding to a result-column width.
+    printer = DirectivePrinter(DisplayContext())  # type: ignore[no-untyped-call]
+    previous_type = type(rows[0][0]) if rows else None
+    for (entry,) in rows:
+        entry_type = type(entry)
+        if entry_type in (Transaction, Commodity) or entry_type is not previous_type:
+            out.write("\n")
+            previous_type = entry_type
+        out.write(printer(entry))
+
+
+def _render_csv(description: Any, rows: Any, out: TextIO, *, spreadsheet_safe: bool = False) -> None:
     """Write CSV without text-table decimal alignment padding."""
     import csv
 
     writer = csv.writer(out)
     writer.writerow([column.name for column in description or ()])
     for row in rows:
-        writer.writerow([_csv_cell(value) for value in row])
+        cells = [_csv_cell(value) for value in row]
+        if spreadsheet_safe:
+            pairs = zip(row, cells, strict=True)
+            cells = [_inert_formula(cell) if isinstance(value, str) else cell for value, cell in pairs]
+        writer.writerow(cells)
+
+
+#: What a spreadsheet reads as the start of a formula (OWASP's CSV-injection list).
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _inert_formula(cell: str) -> str:
+    """A text cell a spreadsheet shows as text: a leading `'` when it would start a formula.
+
+    Only for string values, under `--spreadsheet-safe`: payees and narrations
+    often come from imported bank exports, but numbers and amounts keep their
+    sign, and the default CSV keeps every value exactly as the ledger has it.
+    """
+    return "'" + cell if cell.startswith(_FORMULA_TRIGGERS) else cell
 
 
 def _csv_cell(value: Any) -> str:
-    """One unpadded CSV field from a BQL cell."""
+    """One unpadded CSV field from a BQL cell.
+
+    Metadata is the text table's cell, user keys only. A directive is the
+    Beancount text `--format beancount` prints for it. Both used to go through
+    the JSON walk and `str()`, which leaked the loader's `filename`, `lineno`
+    and `__tolerances__` keys — an absolute path in every exported row.
+    """
+    from beancount.core.data import ALL_DIRECTIVES
+
     if value is None:
         return ""
+    if _is_metadata(value):
+        return str(_user_metadata(value))
+    if isinstance(value, ALL_DIRECTIVES):
+        from beancount.core.display_context import DisplayContext
+
+        from bea_engine.ledger.writer import DirectivePrinter
+
+        return DirectivePrinter(DisplayContext())(value).strip("\n")  # type: ignore[no-untyped-call]
     rendered = protocol._jsonable(value)
     return _csv_from_jsonable(rendered)
+
+
+def _is_metadata(value: Any) -> bool:
+    """True for a directive's or posting's metadata, which the loader stamps with its location."""
+    return isinstance(value, dict) and "filename" in value and "lineno" in value
+
+
+def _user_metadata(meta: Mapping[str, Any]) -> dict[str, Any]:
+    """The keys a ledger author wrote: upstream's `MetadataRenderer` filter."""
+    return {key: item for key, item in meta.items() if key not in {"filename", "lineno"} and not key.startswith("__")}
+
+
+def _public_value(value: Any) -> Any:
+    """A result cell without the loader's internal metadata, at any depth.
+
+    Upstream hides `filename`, `lineno` and `__*` keys only for a column typed
+    as entry metadata, so a posting's `meta`, or the metadata inside a whole
+    directive, carried the ledger's absolute path into every rendering. Only
+    text and JSON use this; `--format beancount` prints directives through the
+    writer, which reads the internal keys and never writes them.
+    """
+    if _is_metadata(value):
+        return _user_metadata(value)
+    fields = getattr(value, "_fields", None)
+    if fields is None or "meta" not in fields:
+        return value
+    changes: dict[str, Any] = {}
+    if isinstance(value.meta, dict):
+        changes["meta"] = _user_metadata(value.meta)
+    if "postings" in fields and value.postings:
+        changes["postings"] = [_public_value(posting) for posting in value.postings]
+    return value._replace(**changes)
 
 
 def _csv_from_jsonable(value: Any) -> str:
@@ -604,11 +934,57 @@ def _executed(conn: Any, query_string: str, run: Any, ledger_errors: list[str]) 
     # comparison literal in another normalization would otherwise miss the
     # identical string. Keywords and column names are ASCII and pass through.
     statement = _quote_reserved_tables(unicodedata.normalize("NFC", query_string))
+    if not statement.lstrip().startswith("."):
+        # Dot commands are not BQL; a stored body `.run` reaches is checked
+        # when the shell executes it.
+        _refuse_statement_tail(statement, ledger_errors)
     _refuse_empty_window(statement, ledger_errors)
     try:
-        return run(statement)
+        return _compiled(lambda: run(statement), statement, lambda: ledger_errors)
     except BeanqueryError as exc:
         raise _usage_error(exc, query_string, conn, ledger_errors) from None
+    except ValueError as exc:
+        # The parser converts literals as it reads them, so `2020-99-01`
+        # surfaces as a bare ValueError from `date.fromisoformat` — a typo in
+        # the query, not an engine failure (w1/085). Only an error raised
+        # inside the parser is the query's; anything later propagates.
+        literal = _parse_literal_error(exc)
+        if literal is None:
+            raise
+        details = [f"  {query_string}"]
+        if literal == "date":
+            details.append("Write dates as YYYY-MM-DD with a real month and day, for example 2020-02-29.")
+        raise protocol.UsageError(
+            f"Cannot run this BQL query: invalid {literal} literal: {exc}.",
+            details=details,
+            ledger_errors=ledger_errors,
+        ) from None
+
+
+def _compiled(
+    run: Callable[[], Any], statement: str, ledger_errors: Callable[[], list[str]], context: Any = None
+) -> Any:
+    """Run one BQL statement, naming the compile failures Beanquery lets escape raw.
+
+    Every path that executes BQL — one-shot, `.run`, and a line typed at the
+    prompt — comes through here, so they all explain the same failure the same
+    way. The prompt used to print these as Python tracebacks while the one-shot
+    named the column and what would work instead.
+
+    With a `context`, Beanquery's own errors are explained here too, against
+    the statement that actually ran: a stored query reached through `.run`
+    used to be explained against the `.run NAME` text, so it lost the caret,
+    the column suggestions and the set-column advice its direct form gets.
+    The interactive prompt passes none and keeps upstream's rendering.
+    """
+    from beanquery import Error as BeanqueryError
+
+    try:
+        return run()
+    except BeanqueryError as exc:
+        if context is None:
+            raise
+        raise _usage_error(exc, statement, context, ledger_errors()) from None
     except SyntaxError as exc:
         # Beanquery compiles a query to Python. `SELECT DISTINCT tags` makes it
         # emit code it cannot parse, and the SyntaxError that escapes says only
@@ -619,13 +995,13 @@ def _executed(conn: Any, query_string: str, run: Any, ledger_errors: list[str]) 
             raise protocol.UsageError(
                 f"Beanquery could not compile this BQL query: {exc}.",
                 details=_SET_COLUMN_ADVICE,
-                ledger_errors=ledger_errors,
+                ledger_errors=ledger_errors(),
             ) from None
         named = ", ".join(columns)
         raise protocol.UsageError(
             f"BQL cannot use DISTINCT or GROUP BY on {named}: a set is not a value it can compare.",
             details=_SET_COLUMN_ADVICE,
-            ledger_errors=ledger_errors,
+            ledger_errors=ledger_errors(),
         ) from None
     except TypeError as exc:
         # The hashability check calls `issubclass(dtype, Hashable)`, which
@@ -638,7 +1014,7 @@ def _executed(conn: Any, query_string: str, run: Any, ledger_errors: list[str]) 
             raise protocol.UsageError(
                 f"BQL cannot use DISTINCT or GROUP BY on {named}: a set is not a value it can compare.",
                 details=_SET_COLUMN_ADVICE,
-                ledger_errors=ledger_errors,
+                ledger_errors=ledger_errors(),
             ) from None
         raise
     except AttributeError as exc:
@@ -648,7 +1024,7 @@ def _executed(conn: Any, query_string: str, run: Any, ledger_errors: list[str]) 
             raise protocol.UsageError(
                 "BQL cannot use a subquery in the SELECT list.",
                 details=["Filter with it instead: SELECT ... WHERE column IN (SELECT ...)"],
-                ledger_errors=ledger_errors,
+                ledger_errors=ledger_errors(),
             ) from None
         raise
 
@@ -705,16 +1081,23 @@ def _refuse_empty_window(query_string: str, ledger_errors: list[str]) -> None:
     Answering `(no rows)` reads as "that day is empty" rather than "you asked
     for no days", so say which it is and how to ask for the day.
     """
-    from datetime import date, timedelta
-
     try:
-        from beanquery.parser import parse
+        from beanquery.parser import ast, parse
 
         parsed = parse(query_string)
     except Exception:  # noqa: BLE001 - a dot command or a broken query; beanquery reports it
         return
-    clause = getattr(parsed, "from_clause", None)
-    begin, end = getattr(clause, "open", None), getattr(clause, "close", None)
+    # Every dated window, not just the outer one: a subquery's `FROM OPEN ON D
+    # CLOSE ON D` answered `(no rows)` just the same (w1/158).
+    for clause in ast.walk(parsed):
+        if isinstance(clause, ast.From):
+            _refuse_window(clause.open, clause.close, ledger_errors)
+
+
+def _refuse_window(begin: Any, end: Any, ledger_errors: list[str]) -> None:
+    """Refuse one `OPEN ON begin CLOSE ON end` window that spans no days."""
+    from datetime import date, timedelta
+
     # A bare `CLOSE` is `True`, not a date, and closes at the end of the ledger.
     if not isinstance(begin, date) or not isinstance(end, date) or begin < end:
         return
@@ -730,6 +1113,17 @@ def _refuse_empty_window(query_string: str, ledger_errors: list[str]) -> None:
         message = f"This BQL window covers no days: OPEN ON {begin} starts after the exclusive CLOSE ON {end}."
         details = [f"Did you mean OPEN ON {end} CLOSE ON {begin + timedelta(days=1)}?"]
     raise protocol.UsageError(message, details=details, ledger_errors=ledger_errors)
+
+
+def _parse_literal_error(exc: BaseException) -> str | None:
+    """The literal kind (`date`, ...) a ValueError came from, if beanquery's parser raised it."""
+    import traceback
+
+    for frame in reversed(traceback.extract_tb(exc.__traceback__)):
+        where = Path(frame.filename).parent
+        if where.name == "parser" and where.parent.name == "beanquery":
+            return frame.name if frame.name in {"date", "decimal", "integer"} else "literal"
+    return None
 
 
 def _usage_error(exc: Exception, query_string: str, conn: Any, ledger_errors: list[str]) -> protocol.UsageError:
@@ -794,7 +1188,7 @@ def format_error(error: Any, ledger_file: Path | str | None = None) -> str:
     source = getattr(error, "source", None) or {}
     message = getattr(error, "message", error)
     if isinstance(message, str):
-        plugin = _plugin_message(message, ledger_file)
+        plugin = _plugin_message(message, ledger_file, source)
         if plugin is not None:
             return plugin
         duplicate = _duplicate_message(error, message)
@@ -803,44 +1197,91 @@ def format_error(error: Any, ledger_file: Path | str | None = None) -> str:
     return f"{source.get('filename', '<ledger>')}:{source.get('lineno', 0)}: {message}"
 
 
-def _plugin_message(message: str, ledger_file: Path | str | None) -> str | None:
+def _plugin_message(message: str, ledger_file: Path | str | None, source: Any) -> str | None:
     """A plugin load failure as `file:line: Cannot ... plugin "name": cause`.
 
     The loader reports these against `<load>:0` with the traceback attached,
-    so the directive's own line is found by scanning the ledger source and
-    only the traceback's final exception line is kept as the cause.
+    so the directive's own line is found by scanning the ledger source — by
+    name and, when the load recorded it, config — and the traceback's final
+    exception block is kept as the cause.
     """
+    from bea_engine.managed_load import PLUGIN_CONFIG_KEY
+
+    config = source.get(PLUGIN_CONFIG_KEY, _UNKNOWN_CONFIG) if isinstance(source, dict) else _UNKNOWN_CONFIG
     match = _PLUGIN_FAILURE.match(message)
     if match is None:
         return None
     kind, name, traceback_text = match.groups()
-    cause = ""
-    for line in traceback_text.splitlines():
-        if line.strip():
-            cause = line.strip()
+    cause = _exception_summary(traceback_text)
     if kind == "importing":
         text = f'Cannot import plugin "{name}": {cause}. Check the name is spelled right and the plugin is installed.'
     else:
         text = f'Plugin "{name}" failed while running: {cause}.'
-    location = _plugin_directive(ledger_file, name)
+    location = _plugin_directive(ledger_file, name, config)
     if location is None:
         return f"<ledger>:0: {text}"
     return f"{location[0]}:{location[1]}: {text}"
 
 
-def _plugin_directive(ledger_file: Path | str | None, name: str) -> tuple[str, int] | None:
-    """The `file, line` of the `plugin "name"` directive in the ledger source."""
+_UNKNOWN_CONFIG = object()
+_FRAME_LINE = re.compile(r'^(\s*)File "')
+
+
+def _exception_summary(traceback_text: str) -> str:
+    """The final exception of a formatted traceback: its type and whole message.
+
+    The message may span lines (and carry notes), so the cause is everything
+    after the last frame's source lines — not just the last non-empty line,
+    which kept `Assets:Old -> ?` and dropped `ValueError: Bad account mapping:`
+    (w1/101). Lines are joined with single spaces into one detail line.
+    """
+    lines = traceback_text.splitlines()
+    start = 0
+    frame_indent: int | None = None
+    for index, line in enumerate(lines):
+        match = _FRAME_LINE.match(line)
+        if match:
+            start, frame_indent = index + 1, len(match.group(1))
+    if frame_indent is not None:
+        # Skip the frame's source and caret lines, indented deeper than `File`.
+        while start < len(lines) and (
+            not lines[start].strip() or len(lines[start]) - len(lines[start].lstrip()) > frame_indent
+        ):
+            start += 1
+    block = [line.strip() for line in lines[start:] if line.strip()]
+    return " ".join(block) if block else traceback_text.strip()
+
+
+def _plugin_directive(
+    ledger_file: Path | str | None, name: str, config: Any = _UNKNOWN_CONFIG
+) -> tuple[str, int] | None:
+    """The `file, line` of the `plugin "name"` directive in the ledger source.
+
+    With a known config, the directive carrying that config wins; the first
+    directive naming the plugin is the fallback.
+    """
     if ledger_file is None:
         return None
-    directive = re.compile(rf"^\s*plugin\s+[\"']{re.escape(name)}[\"']")
+    directive = re.compile(rf"""^\s*plugin\s+"{re.escape(name)}"(?:\s+"((?:[^"\\]|\\.)*)")?""")
     try:
-        lines = Path(ledger_file).read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = Path(ledger_file).read_text(encoding="utf-8", errors="replace").split("\n")
     except OSError:
         return None
+    first: tuple[str, int] | None = None
     for lineno, line in enumerate(lines, start=1):
-        if directive.match(line):
+        match = directive.match(line)
+        if match is None:
+            continue
+        first = first or (str(ledger_file), lineno)
+        written = match.group(1)
+        if config is not _UNKNOWN_CONFIG and (None if written is None else _unescape(written)) == config:
             return (str(ledger_file), lineno)
-    return None
+    return first
+
+
+def _unescape(text: str) -> str:
+    """A Beancount string body as the parser reads it: backslash escapes the next character."""
+    return re.sub(r"\\(.)", r"\1", text)
 
 
 def _duplicate_message(error: Any, message: str) -> str | None:

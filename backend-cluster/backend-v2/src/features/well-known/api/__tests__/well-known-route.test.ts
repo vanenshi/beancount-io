@@ -1,10 +1,16 @@
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import Koa from "koa";
 import Router from "@koa/router";
 import type { AppConfig } from "@/config/config";
 import { MCP_TOOLS } from "@/features/ai-agent/api/mcp-tools";
 import { API_SCOPES } from "@/server/api/identity";
 import { setWellKnownRoutes } from "../well-known-route";
+
+// A syntactically valid record with a throwaway key — not Beancount.io's.
+const MCP_REGISTRY_AUTH_PROOF =
+  "v=MCPv1; k=ed25519; p=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
 const config = {
   dashboard: { url: "https://beancount.io" },
@@ -15,7 +21,18 @@ const config = {
       "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
     ],
   },
+  mcpRegistry: { authProof: MCP_REGISTRY_AUTH_PROOF },
 } as unknown as AppConfig;
+
+/**
+ * The official MCP Registry listing (`server.json` at the package root). It is
+ * what a client that never reads our docs installs from, so it must name the
+ * endpoint the manifest advertises and nothing else (ADR 019 D1).
+ */
+const REGISTRY_LISTING_PATH = path.resolve(
+  __dirname,
+  "../../../../../server.json",
+);
 
 const unsetAppLinksConfig = {
   ...config,
@@ -23,6 +40,7 @@ const unsetAppLinksConfig = {
     appleTeamId: null,
     androidSha256Fingerprints: [],
   },
+  mcpRegistry: { authProof: null },
 } as unknown as AppConfig;
 describe("well-known routes", () => {
   let server: http.Server;
@@ -126,6 +144,37 @@ describe("well-known routes", () => {
     expect(structuredBql?.outputSchema).toHaveProperty("properties");
   });
 
+  it("lists the manifest's endpoint in the MCP Registry listing", async () => {
+    const listing = JSON.parse(
+      fs.readFileSync(REGISTRY_LISTING_PATH, "utf8"),
+    ) as {
+      name: string;
+      version: string;
+      icons: Array<{ src: string }>;
+      remotes: Array<{ type: string; url: string }>;
+    };
+    const response = await fetch(`${origin}/.well-known/mcp.json`);
+    const manifest = (await response.json()) as {
+      endpoint: string;
+      version: string;
+    };
+
+    // Schema rules (description length, version format, $schema) are the
+    // publish workflow's `mcp-publisher validate`; this test guards what the
+    // schema cannot: the name that is the registry identity, and agreement
+    // with the manifest.
+    expect(listing.name).toBe("io.beancount/beancount");
+    expect(listing.version).toBe(manifest.version);
+    // Exactly one remote, exactly these keys: no `headers` (OAuth is discovered
+    // from the 401) and the same URL every host is given.
+    expect(listing.remotes).toEqual([
+      { type: "streamable-http", url: manifest.endpoint },
+    ]);
+    expect(listing.icons.map(({ src }) => new URL(src).origin)).toEqual([
+      new URL(manifest.endpoint).origin,
+    ]);
+  });
+
   it("serves the Apple app-site association as JSON", async () => {
     const response = await fetch(
       `${origin}/.well-known/apple-app-site-association`,
@@ -146,6 +195,16 @@ describe("well-known routes", () => {
         paths: ["/ledger/*"],
       },
     ]);
+  });
+
+  it("serves the MCP Registry domain proof as plain text", async () => {
+    const response = await fetch(`${origin}/.well-known/mcp-registry-auth`);
+    const body = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toMatch(/^text\/plain/);
+    // Exactly the record plus a trailing newline, as `mcp-publisher` writes it.
+    expect(body).toBe(`${MCP_REGISTRY_AUTH_PROOF}\n`);
   });
 
   it("serves Android assetlinks as JSON", async () => {
@@ -209,6 +268,11 @@ describe("well-known app-link routes without config", () => {
 
   it("returns 404 for assetlinks when no fingerprints are configured", async () => {
     const response = await fetch(`${origin}/.well-known/assetlinks.json`);
+    expect(response.status).toBe(404);
+  });
+
+  it("returns 404 for the MCP Registry proof when none is configured", async () => {
+    const response = await fetch(`${origin}/.well-known/mcp-registry-auth`);
     expect(response.status).toBe(404);
   });
 });

@@ -1,4 +1,6 @@
+import { requestPlatform } from "@/server/api/request-platform";
 import "reflect-metadata";
+import { request } from "node:http";
 jest.mock("@ai-sdk/harness/agent", () => ({ HarnessAgent: class {} }));
 jest.mock("@ai-sdk/harness-acp", () => ({ createACP: () => ({}) }));
 jest.mock("@/features/plaid/utils/encryption", () => ({
@@ -22,6 +24,8 @@ import {
   AUTHORIZATION_ACTIONS,
 } from "@/server/api/authorization";
 import { graphqlScopeMiddleware } from "@/server/graphql/scope-middleware";
+import { formatError } from "@/server/graphql/format-error";
+import { FavaApiError } from "@/foundation/fava";
 import { assembleMcpRegistry } from "@/server/api/composition-root";
 import { startV1TestServer } from "@/server/rest/__tests__/v1-test-server";
 import type { Identity } from "@/server/api/identity";
@@ -57,7 +61,9 @@ let resolvers: Map<unknown, object>;
 let schemaPromise: ReturnType<typeof buildSchema> | undefined;
 type Surface = "rest" | "mcp" | "gql";
 const surfaces: Surface[] = ["rest", "mcp", "gql"];
-async function fixture(caller = identity) {
+async function fixture(caller = identity, appId?: string) {
+  const headers: Record<string, string> = appId ? { "x-app-id": appId } : {};
+  const platform = requestPlatform(headers);
   const records = new Map<string, typeof seed>([["alice/main", { ...seed }]]);
   const existingContent =
     '2026-01-01 * "Existing entry"\n  Assets:Cash  25 USD\n  Equity:Initial  -25 USD\n';
@@ -71,18 +77,32 @@ async function fixture(caller = identity) {
     if (!r) throw { status: 404 };
     return { data: r };
   });
+  const getUserByUsername = jest.fn(async () => ({ id: identity.userId }));
+  const adminGet = jest.fn(async (owner: string, name: string) =>
+    envelope(records.get(`${owner}/${name}`)),
+  );
+  const collaboratorPermission = jest.fn(async () =>
+    envelope({ permission: null }),
+  );
   const evaluator = new SourceBackedRelationshipEvaluator(
     {} as never,
     {
-      user: { getUserByUsername: async () => ({ id: identity.userId }) },
+      user: {
+        getUserByUsername,
+        getById: async () => ({ ledger_username: "bob" }),
+      },
     } as never,
     { getUserApiClient: async () => ({ repos: { repoGet } }) } as never,
     {
-      getAdminClient: () => ({
-        ledgers: {
-          getLedger: async (owner: string, name: string) =>
-            envelope(records.get(`${owner}/${name}`)),
+      getApiContext: async () => ({
+        favaApiClient: {
+          collaborators: {
+            getLedgerCollaboratorPermission: collaboratorPermission,
+          },
         },
+      }),
+      getAdminClient: () => ({
+        ledgers: { getLedger: adminGet },
       }),
     } as never,
   );
@@ -240,6 +260,7 @@ async function fixture(caller = identity) {
   const server = assembleMcpRegistry(
     {
       identity: caller,
+      platform,
       ledgerWorkflow: workflow,
       services,
     } as unknown as McpRequestContext,
@@ -263,6 +284,9 @@ async function fixture(caller = identity) {
     getApiContext,
     getPublicApiClient,
     repoGet,
+    getUserByUsername,
+    adminGet,
+    collaboratorPermission,
     client,
     files,
     existingContent,
@@ -298,27 +322,94 @@ async function fixture(caller = identity) {
     },
     call: async (
       surface: Surface,
-      operation: "create" | "update" | "delete",
+      operation: "create" | "read" | "update" | "delete",
       input: Record<string, unknown> = {},
-      ledgerId = "alice/main",
+      target: string | readonly [owner: string, name: string] = "alice/main",
     ) => {
+      const parts =
+        typeof target === "string"
+          ? [
+              target.slice(0, target.indexOf("/")),
+              target.slice(target.indexOf("/") + 1),
+            ]
+          : target;
+      const ledgerId = parts.join("/");
       if (surface === "rest") {
         const suffix =
           operation === "create"
             ? ""
-            : `/${ledgerId.split("/").map(encodeURIComponent).join("/")}`;
-        const r = await fetch(`${rest.url}/api-gateway/v1/ledgers${suffix}`, {
-          method: { create: "POST", update: "PUT", delete: "DELETE" }[
-            operation
-          ],
-          ...(operation !== "delete" && {
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(input),
-          }),
+            : `/${parts.map(encodeURIComponent).join("/")}`;
+        // Send the exact path: fetch normalizes dot segments before Koa can
+        // reject them, hiding the boundary behavior these tests exercise.
+        return new Promise<{
+          failed: boolean;
+          data: unknown;
+          status: number;
+          error?: { code: string; message: string };
+        }>((resolve, reject) => {
+          const r = request(
+            rest.url,
+            {
+              path: `/api-gateway/v1/ledgers${suffix}`,
+              method: {
+                create: "POST",
+                read: "GET",
+                update: "PUT",
+                delete: "DELETE",
+              }[operation],
+              headers: { "Content-Type": "application/json", ...headers },
+            },
+            (response) => {
+              let text = "";
+              response.setEncoding("utf8");
+              response.on("data", (chunk: string) => {
+                text += chunk;
+              });
+              response.on("end", () => {
+                const status = response.statusCode!;
+                try {
+                  const data = JSON.parse(text);
+                  resolve({
+                    failed: status >= 400,
+                    data,
+                    status,
+                    error: data.error,
+                  });
+                } catch (error) {
+                  reject(error);
+                }
+              });
+            },
+          );
+          r.on("error", reject);
+          r.end(
+            operation === "create" || operation === "update"
+              ? JSON.stringify(input)
+              : undefined,
+          );
         });
-        return { failed: !r.ok, data: await r.json(), status: r.status };
       }
       if (surface === "mcp") {
+        if (operation === "read") {
+          try {
+            const response = await client.readResource({
+              uri: `beancount://${parts.map(encodeURIComponent).join("/")}/metadata`,
+            });
+            const content = response.contents[0];
+            if (!("text" in content)) throw new Error("Expected metadata text");
+            return {
+              failed: false,
+              data: JSON.parse(content.text),
+              error: undefined,
+            };
+          } catch (error) {
+            const failure = error as {
+              data?: { code: string; message: string };
+              message: string;
+            };
+            return { failed: true, data: undefined, error: failure.data };
+          }
+        }
         const r = await client.callTool({
           name: "manageLedgers",
           arguments: {
@@ -331,6 +422,11 @@ async function fixture(caller = identity) {
           failed: r.isError === true,
           data: (r.structuredContent as { result?: unknown } | undefined)
             ?.result,
+          error: (
+            r.structuredContent as
+              | { error?: { code: string; message: string } }
+              | undefined
+          )?.error,
         };
       }
       const args = { ...(operation !== "create" && { ledgerId }), ...input };
@@ -340,13 +436,26 @@ async function fixture(caller = identity) {
             `${k}:${k === "template" && v !== null ? v : JSON.stringify(v)}`,
         )
         .join(",");
-      const field = `${operation}Ledger`;
+      const field = operation === "read" ? "getLedger" : `${operation}Ledger`;
       const r = await graphql({
         schema,
-        source: `mutation{${field}(${formatted}){${operation === "delete" ? "ledgerId" : fields}}}`,
-        contextValue: { identity: caller, getCurrentIdentity: () => caller },
+        source: `${operation === "read" ? "query" : "mutation"}{${field}(${formatted}){${operation === "delete" ? "ledgerId" : fields}}}`,
+        contextValue: {
+          identity: caller,
+          getCurrentIdentity: () => caller,
+          platform,
+        },
       });
-      return { failed: Boolean(r.errors), data: r.data?.[field] };
+      const error = r.errors?.[0];
+      const formattedError = error && formatError(error.toJSON(), error);
+      return {
+        failed: Boolean(r.errors),
+        data: r.data?.[field],
+        error: formattedError && {
+          code: formattedError.extensions?.code,
+          message: formattedError.message,
+        },
+      };
     },
     close: async () => {
       await client.close();
@@ -372,6 +481,188 @@ function expected(name: string, description: string, privateValue: boolean) {
   };
 }
 describe("ledger lifecycle through actual adapters and workflow", () => {
+  describe.each(surfaces)("ledger denial contract via %s", (surface) => {
+    it.each(["missing", "inaccessible"] as const)(
+      "conceals %s ledgers identically for reads and deletion",
+      async (state) => {
+        const f = await fixture({ ...identity, userId: "usr_bob" });
+        f.repoGet.mockRejectedValue({ status: 404 });
+        if (state === "missing") {
+          f.records.delete("alice/main");
+          f.adminGet.mockRejectedValue(new FavaApiError("Not found", 404));
+        }
+        try {
+          const deletion = await f.call(surface, "delete");
+          const read = await f.call(surface, "read");
+          for (const response of [deletion, read]) {
+            expect(response.failed).toBe(true);
+            expect(response.error).toMatchObject({
+              code: "NOT_FOUND",
+              message: "Ledger not found",
+            });
+            if ("status" in response) expect(response.status).toBe(404);
+          }
+          expect(f.get).not.toHaveBeenCalled();
+          expect(f.getPublicApiClient).not.toHaveBeenCalled();
+          expect(f.getApiContext).not.toHaveBeenCalled();
+          expect(f.remove).not.toHaveBeenCalled();
+          if (state === "inaccessible")
+            expect(f.collaboratorPermission).toHaveBeenCalledWith(
+              "alice",
+              "main",
+              "bob",
+            );
+        } finally {
+          await f.close();
+        }
+      },
+    );
+    it("keeps credential denials distinct from missing ledgers", async () => {
+      const f = await fixture({ ...identity, scopes: new Set() });
+      try {
+        const response = await f.call(surface, "read");
+        expect(response.failed).toBe(true);
+        expect(response.error?.code).toBe("FORBIDDEN");
+        if ("status" in response) expect(response.status).toBe(403);
+        expect(f.adminGet).not.toHaveBeenCalled();
+        expect(f.get).not.toHaveBeenCalled();
+      } finally {
+        await f.close();
+      }
+    });
+    it("keeps authorization source outages distinct from missing ledgers", async () => {
+      const f = await fixture();
+      f.adminGet.mockRejectedValue(new Error("source unavailable"));
+      try {
+        const response = await f.call(surface, "read");
+        expect(response.failed).toBe(true);
+        expect(response.error?.code).toBe("SERVICE_UNAVAILABLE");
+        if ("status" in response) expect(response.status).toBe(503);
+        expect(f.get).not.toHaveBeenCalled();
+      } finally {
+        await f.close();
+      }
+    });
+  });
+  it.each(surfaces)(
+    "denies the owner a malformed privacy probe before reading ledger content via %s",
+    async (surface) => {
+      const f = await fixture();
+      f.adminGet.mockResolvedValueOnce(envelope({ id: seed.id }));
+      try {
+        const response = await f.call(surface, "read");
+        expect(response.failed).toBe(true);
+        expect(response.error?.code).toBe("NOT_FOUND");
+        if ("status" in response) expect(response.status).toBe(404);
+        expect(f.authorize).toHaveBeenCalledTimes(1);
+        expect(f.getUserByUsername).toHaveBeenCalledTimes(1);
+        expect(f.adminGet).toHaveBeenCalledTimes(1);
+        expect(f.adminGet).toHaveBeenCalledWith("alice", "main");
+        expect(f.getApiContext).not.toHaveBeenCalled();
+        expect(f.getPublicApiClient).not.toHaveBeenCalled();
+        expect(f.get).not.toHaveBeenCalled();
+        expect(f.repoGet).not.toHaveBeenCalled();
+        expect(f.update).not.toHaveBeenCalled();
+        expect(f.remove).not.toHaveBeenCalled();
+        expect(f.records.get("alice/main")).toEqual(seed);
+      } finally {
+        await f.close();
+      }
+    },
+  );
+  describe.each(surfaces)("ledger slug validation via %s", (surface) => {
+    it.each(["read", "update", "delete"] as const)(
+      "rejects malformed targets before any upstream lookup during %s",
+      async (operation) => {
+        const f = await fixture();
+        const names = [
+          "main/branches",
+          "main%2fbranches",
+          "main%252fbranches",
+          "main?x=1",
+          "main#x",
+          "..",
+          "%2e%2e",
+          "%252e%252e",
+          "MAIN",
+          "bad name",
+          "a".repeat(101),
+        ];
+        const owners = [
+          "alice/other",
+          "alice%2fother",
+          "alice%252fother",
+          "alice?x=1",
+          "alice#x",
+          ".",
+          "..",
+          "bad owner",
+          "alice\\other",
+        ];
+        const targets: (readonly [string, string])[] = [
+          ...names.map((name) => ["alice", name] as const),
+          ...owners.map((owner) => [owner, "main"] as const),
+        ];
+        try {
+          for (const target of targets) {
+            const response = await f.call(surface, operation, {}, target);
+            expect(response.failed).toBe(true);
+            // The MCP SDK parses a URL before template matching; a literal
+            // '..' name removes its own segment and cannot match a resource.
+            // Encoded percent signs above survive that normalization and
+            // reach the shared slug validator instead.
+            const unmatchedDotUri =
+              surface === "mcp" && operation === "read" && target[1] === "..";
+            expect(response.error?.code).toBe(
+              surface === "rest"
+                ? "VALIDATION_FAILED"
+                : unmatchedDotUri
+                  ? "NOT_FOUND"
+                  : "BAD_USER_INPUT",
+            );
+            if (surface !== "mcp")
+              expect(response.error?.message).toMatch(/slug/i);
+            if ("status" in response) expect(response.status).toBe(400);
+            expect(f.authorize).not.toHaveBeenCalled();
+            expect(f.getUserByUsername).not.toHaveBeenCalled();
+            expect(f.repoGet).not.toHaveBeenCalled();
+            expect(f.adminGet).not.toHaveBeenCalled();
+            expect(f.getApiContext).not.toHaveBeenCalled();
+            expect(f.getPublicApiClient).not.toHaveBeenCalled();
+            expect(f.get).not.toHaveBeenCalled();
+            expect(f.update).not.toHaveBeenCalled();
+            expect(f.remove).not.toHaveBeenCalled();
+            expect(f.removeItem).not.toHaveBeenCalled();
+          }
+          expect(f.records.get("alice/main")).toEqual(seed);
+        } finally {
+          await f.close();
+        }
+      },
+    );
+    it("preserves accepted owner casing and punctuation", async () => {
+      const f = await fixture();
+      try {
+        for (const owner of ["ALICE", "Alice.Smith", "User_123", "user-name"]) {
+          const ledgerId = `${owner}/main`;
+          f.records.set(ledgerId, { ...seed, full_name: ledgerId });
+          for (const operation of ["read", "update", "delete"] as const) {
+            const response = await f.call(surface, operation, {}, [
+              owner,
+              "main",
+            ]);
+            expect(response.failed).toBe(false);
+            expect(response.data).toMatchObject(
+              operation === "delete" ? { ledgerId } : { id: ledgerId },
+            );
+          }
+          expect(f.records.has(ledgerId)).toBe(false);
+        }
+      } finally {
+        await f.close();
+      }
+    });
+  });
   it.each(surfaces)(
     "creates empty Starter books via %s and reads their contents on every surface",
     async (surface) => {
@@ -701,3 +992,51 @@ describe("ledger lifecycle through actual adapters and workflow", () => {
     }
   });
 });
+
+it.each(surfaces)(
+  "mobile creates beyond the free ledger cap via %s without changing web limits",
+  async (surface) => {
+    for (const [appId, mobile] of [
+      [undefined, false],
+      ["unknown-app", false],
+      ["beancount-mobile,unknown-app", false],
+      ["BEANCOUNT-MOBILE", false],
+      ["beancount-mobile", true],
+      ["mobile-beancount", true],
+    ] as const) {
+      const f = await fixture(identity, appId);
+      f.subscriptions.mockResolvedValue([]);
+      try {
+        const result = await f.call(surface, "create", { name: "second" });
+        expect(result.failed).toBe(!mobile);
+        expect(f.records.has("alice/second")).toBe(mobile);
+        if (mobile) {
+          expect(result.data).toEqual(expected("second", "", false));
+          expect(f.files.get("alice/second")).toEqual(defaultLedgerTemplate);
+        }
+        expect(f.create).toHaveBeenCalledTimes(mobile ? 1 : 0);
+        if (mobile) expect(f.subscriptions).not.toHaveBeenCalled();
+      } finally {
+        await f.close();
+      }
+    }
+  },
+);
+it.each(surfaces)(
+  "mobile cannot create without administrative scope via %s",
+  async (surface) => {
+    const f = await fixture(
+      { ...identity, scopes: new Set(["ledger.read"]) },
+      "beancount-mobile",
+    );
+    try {
+      expect((await f.call(surface, "create", { name: "second" })).failed).toBe(
+        true,
+      );
+      expect(f.create).not.toHaveBeenCalled();
+      expect(f.subscriptions).not.toHaveBeenCalled();
+    } finally {
+      await f.close();
+    }
+  },
+);

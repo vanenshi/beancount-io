@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import sys
+import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -104,14 +106,55 @@ def answering(command: str) -> Iterator[Answer]:
     """
     answer = Answer()
     try:
-        yield answer
+        with _stdout_reserved():
+            yield answer
     except EngineError as exc:
         _write(_failure(command, exc))
         raise SystemExit(exc.exit_code) from None
     except Exception as exc:  # noqa: BLE001 - the protocol owes the caller an envelope
-        _write(_failure(command, EngineError(str(exc) or type(exc).__name__)))
+        # The type and the engine-side traceback travel too: without them a
+        # bare "month must be in 1..12" names neither what failed nor where,
+        # and `--debug` could only show the frontend's own frames (w1/085).
+        message = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        _write(_failure(command, EngineError(message, traceback=traceback.format_exc())))
         raise SystemExit(EXIT_VALIDATION) from None
     _write({"engine": _version(), "command": command, "ok": True, "data": answer.data})
+
+
+@contextmanager
+def _stdout_reserved() -> Iterator[None]:
+    """Point file descriptor 1 at stderr while a command body runs.
+
+    The body runs user code — ledger plugins, importer configurations — and
+    whatever it prints, through `print`, a child process or `os.write(1, …)`,
+    would land in front of the envelope; the frontend then cannot parse the
+    answer and reports a write that happened as an unknown outcome (w1/061).
+    Swapping `sys.stdout` alone is not enough: a child process or a raw write
+    inherits the descriptor, not the Python object. The descriptor comes back
+    before the envelope is written, so the envelope is the only thing stdout
+    carries. A stdout that is not descriptor 1 (an in-process caller that
+    captured it) is left as it is.
+    """
+    try:
+        reserved = sys.stdout.fileno() == 1
+        diverted = sys.stderr.fileno()
+    except (AttributeError, OSError, ValueError):
+        reserved = False
+    if not reserved:
+        yield
+        return
+    sys.stdout.flush()
+    saved = os.dup(1)
+    try:
+        os.dup2(diverted, 1)
+        yield
+    finally:
+        try:
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+        os.dup2(saved, 1)
+        os.close(saved)
 
 
 def note(message: str) -> None:
@@ -139,6 +182,46 @@ def _write(envelope: dict[str, Any]) -> None:
     print(json.dumps(_jsonable(envelope)))
 
 
+def jsonable(value: Any) -> Any:
+    """The envelope's own conversion, for a command that must encode before it writes.
+
+    `answering()` encodes the answer after the command body has returned, so a
+    value it cannot encode fails *after* the file has already been replaced —
+    exit 1 with no envelope, and a caller that retries appends the directive a
+    second time. A write command converts its answer with this first, so an
+    unencodable answer is a refusal with nothing written.
+    """
+    return _jsonable(value)
+
+
+def _cost_spec_jsonable(cost: Any) -> dict[str, Any]:
+    """A parsed cost constraint, reported field by field.
+
+    A CostSpec is not an Amount: it carries a per-unit number, a total number,
+    and a `MISSING` sentinel — a class, which `json.dumps` cannot encode — in
+    any field the caller left open. Encoding it by the Amount shape crashed on
+    `{}`/`{EUR}` (the sentinel currency reached the encoder) and reported
+    `number: 0` for a total-only cost `{{250 USD}}`, which no longer describes
+    the same lot when it is fed back in. Every field is reported explicitly:
+    unspecified parts are null, and the total keeps its own key.
+    """
+    from decimal import Decimal
+
+    total = cost.number_total if isinstance(cost.number_total, Decimal) else None
+    per = cost.number_per if isinstance(cost.number_per, Decimal) else None
+    # `{{250 USD}}` parses as per-unit zero plus a total; that zero is the
+    # grammar's spelling of "no per-unit component", not a cost of nothing.
+    if total is not None and per is not None and not per:
+        per = None
+    return {
+        "number": _jsonable(per),
+        "number_total": _jsonable(total),
+        "currency": cost.currency if isinstance(cost.currency, str) else None,
+        "date": _jsonable(cost.date),
+        "label": cost.label if isinstance(cost.label, str) else None,
+    }
+
+
 def _jsonable(value: Any) -> Any:
     """Serialize a command's result the way the frontend's `cli.output.jsonable` does.
 
@@ -164,23 +247,23 @@ def _jsonable(value: Any) -> Any:
         return {str(k): _jsonable(v) for k, v in value.items()}
     if type(value) is list:
         return [_jsonable(v) for v in value]
+    # Fixed-point, never exponent notation: `str(Decimal("0.00000001"))` is
+    # `1E-8`, which bea's own amount inputs refuse, so the output could not be
+    # fed back in.
     if isinstance(value, Decimal):
-        return str(value)
+        return format(value, "f")
     if isinstance(value, float):
-        return str(Decimal(repr(value)))
+        return format(Decimal(repr(value)), "f")
     if isinstance(value, date | datetime):
         return value.isoformat()
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, type) and value.__module__ == "beancount.core.number" and value.__name__ == "MISSING":
         return None
+    if hasattr(value, "number_per") and hasattr(value, "number_total"):
+        return _cost_spec_jsonable(value)
     number = getattr(value, "number", None)
     currency = getattr(value, "currency", None)
-    if number is None and currency is not None:
-        # Beancount CostSpec uses number_per / number_total, not number.
-        number = getattr(value, "number_per", None)
-        if number is None:
-            number = getattr(value, "number_total", None)
     if number is not None and currency is not None:
         amount: dict[str, Any] = {"number": _jsonable(number), "currency": _jsonable(currency)}
         if hasattr(value, "date") and hasattr(value, "label"):

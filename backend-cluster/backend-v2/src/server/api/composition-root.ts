@@ -23,16 +23,21 @@ import {
 } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { UriTemplate } from "@modelcontextprotocol/sdk/shared/uriTemplate.js";
-import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  GetPromptRequestSchema,
+  ReadResourceRequestSchema,
+  type GetPromptResult,
+} from "@modelcontextprotocol/sdk/types.js";
 import type {
   CallToolResult,
   ReadResourceResult,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { ZodTypeAny } from "zod";
+import { z, type ZodTypeAny } from "zod";
 
 import type { AppConfig } from "@/config/config";
 import type { AppLayers } from "@/foundation/composition";
-import { NotFoundError } from "@/shared/errors";
+import { BadUserInputError, NotFoundError } from "@/shared/errors";
 import { logger } from "@/shared/logger";
 import { runWithOperationId } from "@/shared/async-context";
 
@@ -88,6 +93,7 @@ import type { McpRequestContext } from "@/features/ai-agent/api/mcp-context";
 import { buildInstructions } from "@/features/ai-agent/api/mcp-context";
 import {
   envelopeFromThrown,
+  maskingFor,
   splitToolFailure,
   McpRequestFailure,
   renderErrorText,
@@ -499,9 +505,9 @@ export function assembleMcpRegistry(
           ),
         );
       }
-      const parsed = await entry.descriptor.inputSchema.safeParseAsync(
-        request.params.arguments ?? {},
-      );
+      const parsed = await refusingUnknownArguments(
+        entry.descriptor.inputSchema,
+      ).safeParseAsync(request.params.arguments ?? {});
       if (!parsed.success) {
         // A Zod error's message is its issue array, which `envelopeFromThrown`
         // reduces to `path: reason` per wrong field, nested paths included.
@@ -556,11 +562,30 @@ export function assembleMcpRegistry(
     return sharedListing;
   };
 
+  // Every template with its read handler, in registration order, for the
+  // `resources/read` dispatcher below.
+  const resourceReaders: {
+    template: ResourceTemplate;
+    read: (
+      uri: URL,
+      variables: Record<string, string | string[]>,
+    ) => ReadResourceResult | Promise<ReadResourceResult>;
+  }[] = [];
+  const registerReadableResource = (
+    name: string,
+    template: ResourceTemplate,
+    metadata: { title: string; description: string; mimeType: string },
+    read: (typeof resourceReaders)[number]["read"],
+  ) => {
+    resourceReaders.push({ template, read });
+    server.registerResource(name, template, metadata, read);
+  };
+
   for (const descriptor of MCP_RESOURCES) {
     const listable =
       descriptor.listSegment !== undefined ||
       descriptor.listPerSourceFile === true;
-    server.registerResource(
+    registerReadableResource(
       descriptor.name,
       resourceTemplateFor(
         descriptor,
@@ -604,7 +629,7 @@ export function assembleMcpRegistry(
   // every other refusal on this surface uses. There is no `gateMcpCall`: this
   // reaches no service and always refuses, and the transport limiter has
   // already charged the request by the time it arrives.
-  server.registerResource(
+  registerReadableResource(
     UNKNOWN_RESOURCE,
     new ResourceTemplate(new UriTemplate(`${RESOURCE_SCHEME}://{+rest}`), {
       list: undefined,
@@ -623,7 +648,50 @@ export function assembleMcpRegistry(
         ),
         "MCP resource read failed",
         { resource: UNKNOWN_RESOURCE },
+        config,
       ),
+  );
+
+  // `resources/templates/list` and `resources/list` stay the SDK's, but
+  // `resources/read` is answered here, as `tools/call` is above. The SDK's
+  // dispatcher parses the URI with `new URL()` before it consults any
+  // template, so a string that is not a URI at all threw a bare `TypeError`
+  // — `-32603 Invalid URL`, no `data.code`, no hint — and one in another
+  // scheme matched nothing and got the SDK's own uncoded "not found" (w5/041).
+  // Dispatching over the same templates in the same order keeps every other
+  // read exactly as it was.
+  server.server.setRequestHandler(
+    ReadResourceRequestSchema,
+    async (request): Promise<ReadResourceResult> => {
+      const raw = request.params.uri;
+      if (!URL.canParse(raw)) {
+        return refuseMcpRequest(
+          new BadUserInputError(
+            `Not a resource URI: ${raw.length > 120 ? `${raw.slice(0, 120)}…` : raw}`,
+            "uri",
+            `A resource URI looks like \`${RESOURCE_SCHEME}://{owner}/{name}/<segment>\`. Call \`resources/templates/list\` for the inventory.`,
+          ),
+          "MCP resource read failed",
+          { resource: UNKNOWN_RESOURCE },
+          config,
+        );
+      }
+      const uri = new URL(raw);
+      for (const { template, read } of resourceReaders) {
+        const variables = template.uriTemplate.match(uri.toString());
+        if (variables) return read(uri, variables);
+      }
+      return refuseMcpRequest(
+        new NotFoundError(
+          "Resource",
+          uri.href,
+          `No resource template matches that URI. Call \`resources/templates/list\` for the inventory; a ledger read is \`${RESOURCE_SCHEME}://{owner}/{name}/<segment>\`.`,
+        ),
+        "MCP resource read failed",
+        { resource: UNKNOWN_RESOURCE },
+        config,
+      );
+    },
   );
 
   // Prompts are static playbook text (w2/008): user-initiated, selected
@@ -632,7 +700,40 @@ export function assembleMcpRegistry(
   // tells the agent to do is charged and authorized by the tool or resource
   // it names, at the moment the agent actually calls it. Building the body
   // per request is what lets it address this caller's ledger pin.
+  const promptBuilders = new Map<
+    string,
+    (args: Record<string, string | undefined>) => GetPromptResult
+  >();
   for (const descriptor of MCP_PROMPTS) {
+    const build = (
+      args: Record<string, string | undefined>,
+    ): GetPromptResult => {
+      try {
+        // The fixed-shape arguments are checked here rather than in the
+        // advertised `argsSchema`, so a malformed one is refused in this
+        // server's envelope instead of the SDK's prose (w4/070).
+        validatePromptArgs(args);
+        return {
+          messages: [
+            {
+              role: "user" as const,
+              content: {
+                type: "text" as const,
+                text: descriptor.build(args, toolCtx.identity),
+              },
+            },
+          ],
+        };
+      } catch (err) {
+        return refuseMcpRequest(
+          err,
+          "MCP prompt fetch failed",
+          { prompt: descriptor.name },
+          config,
+        );
+      }
+    };
+    promptBuilders.set(descriptor.name, build);
     server.registerPrompt(
       descriptor.name,
       {
@@ -640,33 +741,68 @@ export function assembleMcpRegistry(
         description: descriptor.description,
         argsSchema: descriptor.argsSchema,
       },
-      (args) => {
-        try {
-          // The fixed-shape arguments are checked here rather than in the
-          // advertised `argsSchema`, so a malformed one is refused in this
-          // server's envelope instead of the SDK's prose (w4/070).
-          validatePromptArgs(args);
-          return {
-            messages: [
-              {
-                role: "user" as const,
-                content: {
-                  type: "text" as const,
-                  text: descriptor.build(args, toolCtx.identity),
-                },
-              },
-            ],
-          };
-        } catch (err) {
-          return refuseMcpRequest(err, "MCP prompt fetch failed", {
-            prompt: descriptor.name,
-          });
-        }
-      },
+      build,
     );
   }
 
+  // `prompts/list` stays the SDK's; `prompts/get` is answered here, like
+  // `tools/call` and `resources/read` above. The SDK refuses an unknown name,
+  // and an argument of the wrong type, as its own `McpError` before any
+  // callback of ours runs: no `data.code`, no hint, and a message the client
+  // prefixes a second time (w5/045). It also refused a prompt fetched with no
+  // `arguments` at all, though every argument here is optional.
+  server.server.setRequestHandler(
+    GetPromptRequestSchema,
+    async (request): Promise<GetPromptResult> => {
+      const { name } = request.params;
+      const build = promptBuilders.get(name);
+      if (!build) {
+        return refuseMcpRequest(
+          new NotFoundError(
+            "Prompt",
+            name.length > 120 ? `${name.slice(0, 120)}…` : name,
+            "No prompt by that name. Call `prompts/list` for the inventory.",
+          ),
+          "MCP prompt fetch failed",
+          { prompt: "unknown" },
+          config,
+        );
+      }
+      const descriptor = MCP_PROMPTS.find((prompt) => prompt.name === name)!;
+      const parsed = z
+        .object(descriptor.argsSchema)
+        .safeParse(request.params.arguments ?? {});
+      if (!parsed.success) {
+        return refuseMcpRequest(
+          parsed.error,
+          "MCP prompt fetch failed",
+          { prompt: name },
+          config,
+        );
+      }
+      return build(parsed.data);
+    },
+  );
+
   return server;
+}
+
+/**
+ * The schema a tool call is validated against: the advertised one, except
+ * that an argument it does not name is refused instead of dropped.
+ *
+ * A plain Zod object strips unknown keys, so a misspelt `dryrun: true` on a
+ * write tool was discarded, `dry_run` took its default of false, and the call
+ * committed what the caller meant to preview (w5/039). Refusing here covers
+ * every tool at once without publishing `additionalProperties: false` on each
+ * schema, which `tools/list` has no byte budget left for. A schema that
+ * already decided — strict, or deliberately loose like `manageApiKeys`, which
+ * folds deprecated spellings before its own strict parse — is left alone.
+ */
+function refusingUnknownArguments(schema: ZodTypeAny): ZodTypeAny {
+  return schema instanceof z.ZodObject && schema.def.catchall === undefined
+    ? schema.strict()
+    : schema;
 }
 
 /** The catch-all template's name, in `resources/templates/list` and the logs. */
@@ -684,14 +820,17 @@ function refuseMcpRequest(
   err: unknown,
   logMessage: string,
   meta: Record<string, unknown>,
+  config: AppConfig,
 ): never {
+  // The log keeps the unexpected error's own message; the caller gets the
+  // masked one in production (ADR 0007 D7).
   const envelope = envelopeFromThrown(err);
   mcpLogger.error(logMessage, {
     ...meta,
     code: envelope.code,
     error: envelope.message,
   });
-  throw new McpRequestFailure(envelope);
+  throw new McpRequestFailure(envelopeFromThrown(err, maskingFor(config)));
 }
 
 /**
@@ -754,9 +893,12 @@ function makeMcpResourceHandler(
         // channel is the JSON-RPC error — so the envelope travels as `data`
         // beside the right code, and the message stays unprefixed so the
         // client's own `McpError` adds the one prefix (w2/m28:t003).
-        return refuseMcpRequest(err, "MCP resource read failed", {
-          resource: descriptor.name,
-        });
+        return refuseMcpRequest(
+          err,
+          "MCP resource read failed",
+          { resource: descriptor.name },
+          config,
+        );
       }
     });
   };
@@ -825,8 +967,11 @@ function makeMcpToolHandler(
           // place every failure passes through, so it is the only place that
           // can promise a client `error.code` and `error.hint` exist
           // (w2/m28:t003).
+          // `runToolSafely` already logged the failure's own message; the
+          // mask covers only what the caller reads (ADR 0007 D7).
           const { envelope, rest } = splitToolFailure(
             result as Record<string, unknown>,
+            maskingFor(config),
           );
           return toolFailureResult(descriptor.name, envelope, rest);
         }
@@ -852,7 +997,10 @@ function makeMcpToolHandler(
           code: envelope.code,
           error: envelope.message,
         });
-        return toolFailureResult(descriptor.name, envelope);
+        return toolFailureResult(
+          descriptor.name,
+          envelopeFromThrown(err, maskingFor(config)),
+        );
       }
     });
   };

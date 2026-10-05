@@ -134,10 +134,12 @@ describe("LedgerCollaboratorsWorkflow authorization", () => {
   });
 
   it("preserves self-leave through the current user's source username", async () => {
-    await expect(workflow.leaveLedger({ identity, ledgerId })).resolves.toEqual({
-      success: true,
-      message: "Removed self from repository successfully",
-    });
+    await expect(workflow.leaveLedger({ identity, ledgerId })).resolves.toEqual(
+      {
+        success: true,
+        message: "Removed self from repository successfully",
+      },
+    );
     expect(deleteLedgerCollaborator).toHaveBeenCalledWith(
       "owner",
       "main",
@@ -162,6 +164,86 @@ describe("LedgerCollaboratorsWorkflow authorization", () => {
       message: "No such user: ghost",
     });
   });
+
+  it("translates Gitea's unknown-user error on delete, and nothing else", async () => {
+    deleteLedgerCollaborator.mockRejectedValueOnce(
+      new Error("user does not exist [uid: 0, name: ghost]"),
+    );
+    await expect(
+      workflow.deleteCollaborator({
+        identity,
+        ledgerId,
+        collaborator: "ghost",
+      }),
+    ).rejects.toMatchObject({
+      name: "BadUserInputError",
+      category: "BAD_USER_INPUT",
+      message: "No such user: ghost",
+    });
+    deleteLedgerCollaborator.mockRejectedValueOnce(new Error("upstream down"));
+    await expect(
+      workflow.deleteCollaborator({
+        identity,
+        ledgerId,
+        collaborator: "ghost",
+      }),
+    ).rejects.toThrow("upstream down");
+  });
+
+  it("translates Gitea's unknown-user error on a permission read, and nothing else", async () => {
+    getLedgerCollaboratorPermission.mockRejectedValueOnce(
+      new Error("user does not exist [uid: 0, name: ghost]"),
+    );
+    await expect(
+      workflow.getCollaboratorPermission({
+        identity,
+        ledgerId,
+        collaborator: "ghost",
+      }),
+    ).rejects.toMatchObject({
+      name: "BadUserInputError",
+      category: "BAD_USER_INPUT",
+      message: "No such user: ghost",
+    });
+    getLedgerCollaboratorPermission.mockRejectedValueOnce(
+      new Error("upstream down"),
+    );
+    await expect(
+      workflow.getCollaboratorPermission({
+        identity,
+        ledgerId,
+        collaborator: "ghost",
+      }),
+    ).rejects.toThrow("upstream down");
+  });
+
+  it.each(["", "   "])(
+    "refuses a blank collaborator name %j on update, delete and permission read before any upstream work",
+    async (collaborator) => {
+      await expect(
+        workflow.addOrUpdateCollaborator({
+          identity,
+          ledgerId,
+          collaborator,
+          permission: "read",
+        }),
+      ).rejects.toMatchObject({ category: "BAD_USER_INPUT" });
+      await expect(
+        workflow.deleteCollaborator({ identity, ledgerId, collaborator }),
+      ).rejects.toMatchObject({ category: "BAD_USER_INPUT" });
+      await expect(
+        workflow.getCollaboratorPermission({
+          identity,
+          ledgerId,
+          collaborator,
+        }),
+      ).rejects.toMatchObject({ category: "BAD_USER_INPUT" });
+      expect(getPublicApiClient).not.toHaveBeenCalled();
+      expect(addOrUpdateLedgerCollaborator).not.toHaveBeenCalled();
+      expect(deleteLedgerCollaborator).not.toHaveBeenCalled();
+      expect(getLedgerCollaboratorPermission).not.toHaveBeenCalled();
+    },
+  );
 
   it("rethrows other collaborator-update failures unchanged", async () => {
     addOrUpdateLedgerCollaborator.mockRejectedValueOnce(

@@ -1,11 +1,16 @@
 """`bea format` — upstream's aligner, run as a child process (ADR014 t004).
 
-`bean-format` owns the formatting: it is a text transformation, deliberately
-regex-based and not a parse, and `bea` neither reimplements nor second-guesses
-it. What `bea` keeps is the two conveniences that upstream has no equivalent
-for — expanding a directory into the ledger files under it, and reporting what
-would change without writing it (`--check` for a pre-commit hook, `--dry-run`
-for a look first).
+The engine uses upstream's text aligner, with Beancount's lexer identifying
+posting indents and protecting multiline strings from whitespace edits. Every
+destination uses that same transformation. The frontend expands directories
+and reports what would change without writing it (`--check` for a pre-commit
+hook, `--dry-run` for a look first).
+
+Rewriting a file is `bea-engine format --in-place` rather than upstream's own
+`--in-place`, because upstream truncates the file it was given. The engine runs
+the same alignment on the bytes it read and replaces each target atomically
+under the ledger lock, which is what makes `-i` safe to run beside another
+`bea` write or to interrupt (w3/434, w3/435).
 
 **Breaking change (ADR014).** Formatting used to rewrite the files it was given.
 It now writes to stdout, like `bean-format`, and rewriting is `--in-place`.
@@ -17,6 +22,7 @@ be recovered by any flag. `bea format -i .` is the old `bea format .`.
 from __future__ import annotations
 
 import shlex
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -25,7 +31,7 @@ import typer
 from cli import context, output
 from cli.engine import launch
 from cli.errors import BeaError, LedgerError, UsageError
-from cli.utils import UTF8_BOM, decode_error_message
+from cli.utils import decode_error_message, single_line
 
 SUFFIXES = {".bean", ".beancount"}
 STDIN = "-"
@@ -45,7 +51,7 @@ def format_beans(
         bool, typer.Option("--in-place", "-i", help="Rewrite each file instead of writing stdout")
     ] = False,
     output_file: Annotated[
-        Path | None, typer.Option("--output", "-o", help="Write to this file instead of stdout")
+        Path | None, typer.Option("--output", "-o", help="Write to this file instead of stdout", readable=False)
     ] = None,
     check: Annotated[bool, typer.Option("--check", help="Write nothing; exit 1 if any file needs formatting")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Write nothing; report what would change")] = False,
@@ -79,15 +85,10 @@ def format_beans(
             raise UsageError("Name the files to format: reading stdin has nothing to compare or rewrite.")
         if ctx.json_output:
             _require_json_destination(in_place, output_file)
-        # Upstream's stdin filter, and the one case where `bea` does not need to
-        # know what the files are. The `-` is what asks for it: `bean-format`
-        # takes filenames, and a call naming none is refused before it reads a
-        # byte of the pipe.
-        status = launch.run_native("bean-format", [*alignment, *_destination(output_file), STDIN])
-        if status == 0 and ctx.json_output and output_file is not None:
+        _render(None, alignment, output_file)
+        if ctx.json_output and output_file is not None:
             output.emit(_wrote(0, output_file), target={"stdin": STDIN})
-            return
-        raise typer.Exit(status)
+        return
 
     target = _target(paths, files)
     # The walk modes see whole ledgers: a root stands for its include closure,
@@ -135,14 +136,7 @@ def format_beans(
         for ledger_file in files:
             output.refuse_ledger_alias(output_file, ledger_file)
 
-    # Upstream decodes the file itself and dies with a raw traceback on a
-    # stray byte, so the encoding is checked here first: the same path, offset,
-    # and re-save hint `--check` gives, before the destination is touched.
-    for ledger_file in files:
-        _text(ledger_file)
-    status = launch.run_native("bean-format", [*alignment, *_destination(output_file), *(str(f) for f in files)])
-    if status != 0:
-        raise typer.Exit(status)
+    _render(files[0], alignment, output_file)
     if ctx.json_output and output_file is not None:
         output.emit(_wrote(len(files), output_file), target=target)
 
@@ -150,63 +144,72 @@ def format_beans(
 def _format_in_place(
     files: list[Path],
     alignment: list[str],
-    target: dict[str, str],
+    target: dict[str, str | list[str]],
     failed: dict[str, list[str]],
     missing: list[output.MissingInclude],
 ) -> None:
     # Unparseable files are skipped, not "formatted": upstream would echo them
     # back with a newline appended and call that a rewrite.
     formattable = [file for file in files if str(file) not in failed]
-    before = {file: _raw(file) for file in formattable}
-    for file in formattable:
-        _strip_bom(file)
-    completed = (
-        launch.capture_native("bean-format", [*alignment, "--in-place", *(str(f) for f in formattable)])
-        if formattable
-        else None
-    )
-    # Read back even after failure: upstream can rewrite earlier files before
-    # encountering one it cannot write. Never invite a retry without that result.
-    if completed is not None and completed.returncode == 0:
-        for file in formattable:
-            # Byte comparison, not text: upstream rewrites through Python's
-            # default text mode, so on Windows it hands back CRLF for every
-            # line it wrote. `--check` reads a carriage return as unformatted,
-            # so without normalizing here `-i` would never converge there.
-            fixed = _canonical_posting_indent(_text(file)).encode("utf-8")
-            if fixed != _raw(file):
-                file.write_bytes(fixed)
-    changed = [str(file) for file in formattable if _raw(file) != before[file]]
+    try:
+        changed = _changed(formattable, alignment, in_place=True)
+    except BeaError as exc:
+        # Report even after a failure: the engine rewrites file by file and can
+        # meet one it cannot write after replacing earlier ones. Never invite a
+        # retry without saying which files are already done.
+        if exc.result is None:
+            # A lost response cannot establish even an empty formatted list.
+            exc.details = _problem_lines(failed, missing) + exc.details
+            raise
+        progress = exc.result
+        partial = [str(name) for name in progress.get("formatted", [])]
+        write_failed = {
+            str(item["file"]): [_file_reason(str(error), partial) for error in item["errors"]]
+            for item in progress.get("failed", [])
+        }
+        details = [f"formatted: {name}" for name in partial] + _problem_lines(failed, missing)
+        details.extend(f"failed: {name}: {errors[0]}" for name, errors in write_failed.items() if errors)
+        result = _result(files, partial, failed | write_failed, missing) | {"in_place": True}
+        # A missing engine result can mean an unknown write outcome. Only
+        # publish these classifications when the engine actually reported them.
+        for key, label in (("unchanged", "unchanged"), ("not_attempted", "not attempted")):
+            if key in progress:
+                names = [str(name) for name in progress[key]]
+                result[key] = names
+                details.extend(f"{label}: {name}" for name in names)
+        exc.details = details + [_file_reason(detail, partial) for detail in exc.details]
+        exc.result = result
+        if partial:
+            # The engine's message describes the one file it stopped on; after
+            # earlier rewrites, "nothing was written" would misreport the run.
+            exc.args = (_partial_message(len(partial), write_failed, failed, missing, progress),)
+        raise
     result = _result(files, changed, failed, missing) | {"in_place": True}
-    if completed is not None and completed.returncode != 0:
-        diagnostic = (completed.stderr or "").strip()
-        # An uncaught upstream exception ends with its type, reason, and path;
-        # the stack itself belongs only in the --debug traceback field.
-        reason = diagnostic.splitlines()[-1] if diagnostic else "No diagnostic was returned."
-        raise LedgerError(
-            f"bean-format could not finish in-place formatting (exit {completed.returncode}): {reason}",
-            details=[f"formatted: {name}" for name in changed],
-            result=result,
-            traceback=diagnostic or None,
-        )
     if failed or missing:
+        completed = set(changed)
+        unchanged = [str(file) for file in formattable if str(file) not in completed]
+        result.update(unchanged=unchanged, not_attempted=[])
         raise LedgerError(
             _problems_message(len(changed), failed, missing) + " Nothing was written to the failed files.",
-            details=[f"formatted: {name}" for name in changed] + _problem_lines(failed, missing),
+            details=(
+                [f"formatted: {name}" for name in changed]
+                + [f"unchanged: {name}" for name in unchanged]
+                + _problem_lines(failed, missing)
+            ),
             result=result,
         )
     if context.current().json_output:
         output.emit(result, target=target)
         return
     for name in changed:
-        typer.echo(f"formatted: {name}")
+        typer.echo(single_line(f"formatted: {name}"))
     output.success(f"{len(changed)}/{len(files)} file(s) formatted.")
 
 
 def _report(
     files: list[Path],
     alignment: list[str],
-    target: dict[str, str],
+    target: dict[str, str | list[str]],
     remedy: str,
     failed: dict[str, list[str]],
     missing: list[output.MissingInclude],
@@ -216,7 +219,7 @@ def _report(
 ) -> None:
     """Which files upstream would rewrite, without rewriting any of them."""
     ctx = context.current()
-    changed = [str(f) for f in files if str(f) not in failed and _would_change(f, alignment)]
+    changed = _changed([file for file in files if str(file) not in failed], alignment, in_place=False)
     result = _result(files, changed, failed, missing) | {"check": check, "dry_run": dry_run}
 
     if check and (changed or failed or missing):
@@ -231,16 +234,40 @@ def _report(
     if not files:
         output.success("No .bean or .beancount files found.")
         return
+    # File names and parse errors are ledger-controlled text (w1/134).
     for name in changed:
-        typer.echo(f"would format: {name}")
+        typer.echo(single_line(f"would format: {name}"))
     for line in _problem_lines(failed, missing):
-        typer.echo(line)
+        typer.echo(single_line(line))
     if check:
         for file in files:
-            typer.echo(f"checked: {file}")
+            typer.echo(single_line(f"checked: {file}"))
         output.success(f"All {len(files)} file(s) are formatted.")
     else:
         output.success(f"Would format {len(changed)}/{len(files)} file(s) (dry run).")
+
+
+def _file_reason(reason: str, partial: list[str]) -> str:
+    """A per-file write failure, worded for that file once other files were rewritten."""
+    return reason.replace("nothing was written", "this file was not changed") if partial else reason
+
+
+def _partial_message(
+    formatted_count: int,
+    write_failed: dict[str, list[str]],
+    failed: dict[str, list[str]],
+    missing: list[output.MissingInclude],
+    progress: dict[str, object],
+) -> str:
+    """The headline of an `-i` run the engine stopped after rewriting some files."""
+    parts = [f"{formatted_count} file(s) formatted"]
+    if write_failed:
+        parts.append(f"{len(write_failed)} file(s) could not be written")
+    parts.extend(_problem_parts(failed, missing))
+    not_attempted = progress.get("not_attempted")
+    if isinstance(not_attempted, list) and not_attempted:
+        parts.append(f"{len(not_attempted)} file(s) not attempted")
+    return "; ".join(parts) + ". Each file is listed below; fix the failures and re-run."
 
 
 def _problem_lines(failed: dict[str, list[str]], missing: list[output.MissingInclude]) -> list[str]:
@@ -293,86 +320,20 @@ def _remedy(named: list[Path], alignment: list[str]) -> str:
     return shlex.join(["bea", "format", "-i", *(str(path.expanduser().resolve()) for path in named), *alignment])
 
 
-def _would_change(file: Path, alignment: list[str]) -> bool:
-    """Whether upstream's output for `file` differs from what is on disk.
+def _changed(files: list[Path], alignment: list[str], *, in_place: bool) -> list[str]:
+    """Which of `files` alignment would rewrite — or, with `in_place`, did rewrite.
 
-    Captured rather than streamed, because the answer is a comparison and not
-    something to print. A formatter that fails is reported as a failure instead
-    of being read as "already formatted".
+    One engine call answers both, so the report and the rewrite can never
+    disagree about what would change. The rewrite itself belongs there too:
+    `bea-engine format --in-place` takes the same ledger lock every other writer
+    takes and replaces each file atomically from a staged candidate, which is
+    what upstream's own `--in-place` cannot do (w3/434, w3/435).
     """
-    try:
-        raw = file.read_bytes()
-    except OSError:
-        pass
-    else:
-        # Upstream cannot parse a BOM at all and always emits LF, so a marked
-        # file or any carriage return means `-i` would rewrite the bytes.
-        # Answered here so `--check` names the remedy instead of failing on
-        # upstream's parse error, and stays coherent with what `-i` reports.
-        if raw.startswith(UTF8_BOM) or b"\r" in raw:
-            return True
-    completed = launch.capture_native("bean-format", [*alignment, str(file)])
-    if completed.returncode != 0:
-        raise BeaError(
-            f"bean-format could not read {file} (exit {completed.returncode}).",
-            details=[line for line in (completed.stderr or "").splitlines() if line.strip()][-20:],
-        )
-    return _canonical_posting_indent(completed.stdout) != _canonical_posting_indent(_text(file))
-
-
-def _canonical_posting_indent(text: str) -> str:
-    """Normalize tab / single-space posting indents to the usual two spaces.
-
-    Upstream bean-format turns tabs into one ASCII space and then treats that
-    as already formatted. Agents and docs use two spaces; rewrite leftover
-    odd indents so --check stays honest.
-    """
-    import re
-
-    lines: list[str] = []
-    for line in text.splitlines(keepends=True):
-        match = re.match(r"^([ \t]+)(.*)$", line)
-        if match and match.group(1) != "  ":
-            rest = match.group(2)
-            if rest and not re.match(r"^\d{4}-\d{2}-\d{2}\b", rest):
-                ending = "\n" if line.endswith("\n") else ""
-                body = line[: -len(ending)] if ending else line
-                lines.append("  " + body.lstrip(" \t") + ending)
-                continue
-        lines.append(line)
-    return "".join(lines)
-
-
-def _strip_bom(file: Path) -> None:
-    """Remove a leading UTF-8 BOM from the file on disk, leaving all other bytes.
-
-    The mark is an encoding declaration, not content: every other byte stays
-    verbatim, so this converges a Windows-saved ledger without reformatting it.
-    """
-    try:
-        raw = file.read_bytes()
-    except OSError:
-        return
-    if not raw.startswith(UTF8_BOM):
-        return
-    try:
-        file.write_bytes(raw[len(UTF8_BOM) :])
-    except OSError:
-        # A file that cannot be rewritten is upstream's failure to report,
-        # not a crash here: bean-format still cannot parse the kept mark.
-        return
-
-
-def _raw(file: Path) -> bytes:
-    """The file's bytes, for comparing what `-i` actually rewrote.
-
-    A BOM strip or a CRLF-to-LF normalization changes no alignment, so a
-    text comparison would report the file untouched while its bytes changed.
-    """
-    try:
-        return file.read_bytes()
-    except OSError as exc:
-        raise LedgerError(f"Could not read {file}: {exc.strerror or exc}.") from exc
+    if not files:
+        return []
+    flag = ["--in-place"] if in_place else []
+    data = launch.helper_json(["format", *flag, *alignment, *(str(file) for file in files)], writes=in_place)
+    return [str(name) for name in data.get("changed", [])]
 
 
 def _text(file: Path) -> str:
@@ -413,6 +374,12 @@ def _targets(
     naming a directory must not rewrite files outside it.
     """
     named = _named(paths, default)
+    if not paths and default is not None and default.expanduser().is_dir():
+        directory = default.expanduser().resolve()
+        raise UsageError(
+            f"Ledger path '{directory}' (from --file) is a directory; expected a ledger file. "
+            f"To format this directory, run bea format -i {shlex.quote(str(directory))}."
+        )
     if any(str(path) == STDIN for path in named):
         if len(named) > 1:
             raise UsageError(f"Read either stdin ('{STDIN}') or named files, not both.")
@@ -421,7 +388,7 @@ def _targets(
         return None, []
 
     files: set[Path] = set()
-    missing: dict[tuple[str, Path], output.MissingInclude] = {}
+    roots: list[Path] = []
     for path in named:
         resolved = path.expanduser().resolve()
         if not resolved.exists():
@@ -433,6 +400,8 @@ def _targets(
                     if match.is_dir():
                         continue
                     if not match.is_file():
+                        if _editor_lock(match):
+                            continue
                         # A walked entry the scan cannot read is not one it may
                         # drop: naming the same path explicitly is an error, and
                         # a `--check` that skips it reports a tree it never
@@ -450,18 +419,20 @@ def _targets(
             if resolved.suffix not in SUFFIXES:
                 raise UsageError("Expected a .bean or .beancount file, or a directory.")
             files.add(resolved)
-            if expand_includes:
-                for member in output.ledger_closure(resolved):
-                    if member.suffix in SUFFIXES:
-                        files.add(member.resolve())
-                for item in output.missing_includes(resolved):
-                    missing[(item.include, item.source)] = item
+            roots.append(resolved)
         else:
             raise UsageError(f"Not a regular file or directory: {resolved}")
-    if expand_includes:
-        for file in sorted(files):
-            for item in output.missing_includes(file):
-                missing[(item.include, item.source)] = item
+    if not expand_includes:
+        return sorted(files), []
+    # Every member, whatever its suffix: `SUFFIXES` says which files a
+    # directory walk treats as ledgers, but an `include` already made
+    # `entries.inc` part of this ledger (w1/041). One shared walk per set of
+    # roots — never one per file, which is quadratic on a long chain (w1/087).
+    members, _ = output.walk_closure(*roots)
+    files.update(member.resolve() for member in members)
+    missing: dict[tuple[str, Path], output.MissingInclude] = {}
+    for item in output.walk_closure(*sorted(files))[1]:
+        missing[(item.include, item.source)] = item
     return sorted(files), list(missing.values())
 
 
@@ -492,6 +463,16 @@ def _syntax_failures(files: list[Path]) -> dict[str, list[str]]:
 # Upstream pads with spaces to these columns; unbounded values rewrite a ledger
 # into hundreds of KiB of whitespace (w3/331). 200 is well above useful layouts.
 _MAX_ALIGNMENT_WIDTH = 200
+
+
+def _editor_lock(path: Path) -> bool:
+    """A dangling `.#name` link: the lock Emacs keeps beside a file with unsaved edits.
+
+    It points at `user@host.pid:boot`, never at a file, and no ledger includes
+    it. Failing the walk on it would make a pre-commit gate demand deleting
+    the editor's edit-collision guard (w1/102).
+    """
+    return path.name.startswith(".#") and path.is_symlink() and not path.exists()
 
 
 def _unreadable(path: Path) -> str:
@@ -527,8 +508,33 @@ def _alignment(prefix_width: int | None, num_width: int | None, currency_column:
     return flags
 
 
-def _destination(output_file: Path | None) -> list[str]:
-    return ["--output", str(output_file)] if output_file is not None else []
+def _render(file: Path | None, alignment: list[str], destination: Path | None) -> None:
+    """Keep every output mode on the engine's single formatting transformation."""
+    data = launch.helper_json(
+        ["format", "--render", *alignment, str(file) if file is not None else STDIN],
+        stdin=_stdin_text() if file is None else None,
+    )
+    text = str(data["text"])
+    if destination is None or str(destination) == STDIN:
+        sys.stdout.write(text)
+    else:
+        destination.write_text(text, encoding="utf-8")
+
+
+def _stdin_text() -> str:
+    """Piped ledger text, held to the same UTF-8 rule as a named file (w1/166).
+
+    Text-mode stdin decodes with surrogateescape, which lets an invalid byte
+    through as a lone surrogate that only fails later, as an "encode" error
+    naming neither the input nor the remedy.
+    """
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is None:
+        return sys.stdin.read()
+    try:
+        return bytes(stream.read()).decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise LedgerError(decode_error_message("stdin", exc)) from exc
 
 
 def _require_json_destination(in_place: bool, output_file: Path | None) -> None:
@@ -571,10 +577,10 @@ def _result(
     }
 
 
-def _target(paths: list[Path] | None, files: list[Path]) -> dict[str, str]:
+def _target(paths: list[Path] | None, files: list[Path]) -> dict[str, str | list[str]]:
     named = [path for path in (paths or []) if str(path)]
     if len(named) == 1 and named[0].expanduser().resolve().is_dir():
         return {"directory": str(named[0].expanduser().resolve())}
     if len(files) == 1:
         return {"file": str(files[0])}
-    return {"files": ", ".join(str(f) for f in files)}
+    return {"files": [str(file) for file in files]}

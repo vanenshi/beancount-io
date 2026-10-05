@@ -127,20 +127,30 @@ def emit_command(cmd: Command, spec: dict[str, Any]) -> str:
     p_params = path_params(op)
     collapses_full_name = [p["name"] for p in p_params] == ["owner", "name"]
     if p_params and not collapses_full_name:
-        fail(f"operation '{cmd.operation_id}' has path params {[p['name'] for p in p_params]}; only owner+name is supported")
+        fail(
+            f"operation '{cmd.operation_id}' has path params {[p['name'] for p in p_params]}; "
+            "only owner+name is supported"
+        )
 
     destructive = is_destructive(method, op)
     if destructive and not cmd.confirm:
         fail(f"operation '{cmd.operation_id}' is destructive; add a `confirm` template to its registry entry")
     if method != "get" and not (cmd.write_action and cmd.success):
-        fail(f"operation '{cmd.operation_id}' is a write; add `write_action` and `success` templates to its registry entry")
+        fail(
+            f"operation '{cmd.operation_id}' is a write; "
+            "add `write_action` and `success` templates to its registry entry"
+        )
 
     module = snake(cmd.operation_id)
-    help_text = esc(f"{op['summary']}.\n\n{op['description']}") if op["summary"] != op["description"] else esc(op["summary"])
+    help_text = (
+        esc(f"{op['summary']}.\n\n{op['description']}") if op["summary"] != op["description"] else esc(op["summary"])
+    )
 
     signature: list[str] = []
     call_args: list[str] = []
     body: list[str] = []
+    names = {p["name"] for p in query_params(op)}
+    paged = method == "get" and bool(cmd.columns) and {"page", "limit"} <= names
 
     if collapses_full_name:
         signature.append(
@@ -169,7 +179,7 @@ def emit_command(cmd: Command, spec: dict[str, Any]) -> str:
     # be answered with "pass --yes".
     lines.extend(body)
 
-    lines.append("    from cli.api.client import authenticated_client, unwrap")
+    lines.append("    from cli.api.client import authenticated_client, call, unwrap")
     lines.append(f"    from cli.api.rest_client.api.ledger_v_1 import {module}")
 
     # Resolve credentials before the destructive confirmation gate so a
@@ -180,10 +190,13 @@ def emit_command(cmd: Command, spec: dict[str, Any]) -> str:
         lines.append('        output.success("Cancelled.")')
         lines.append("        return")
         client_expr = "client"
+    elif paged:
+        lines.append("    client = authenticated_client()")
+        client_expr = "client"
     else:
         client_expr = "authenticated_client()"
 
-    call = f"{module}.sync_detailed({', '.join(call_args)}{', ' if call_args else ''}client={client_expr})"
+    call = f"call({module}.sync_detailed, {', '.join(call_args)}{', ' if call_args else ''}client={client_expr})"
     if method == "get":
         lines.append(f"    result = unwrap({call})")
     else:
@@ -200,11 +213,19 @@ def emit_command(cmd: Command, spec: dict[str, Any]) -> str:
     lines.append("    rows = [snake_keys(item.to_dict()) for item in data]")
 
     if cmd.columns:
-        names = {p["name"] for p in query_params(op)}
         truncated = "truncated=len(rows) >= limit, limit=limit" if "limit" in names else ""
         if truncated and "page" in names:
             truncated += ", page=page"
         lines.append("    if context.current().json_output:")
+        if paged:
+            following_args = [arg for arg in call_args if arg not in {"page=page", "limit=limit"}]
+            following_args += ["page=page * limit + 1", "limit=1", "client=client"]
+            following_call = f"call({module}.sync_detailed, {', '.join(following_args)})"
+            lines.append("        truncated = False")
+            lines.append("        if len(rows) == limit:")
+            lines.append("            # A full page alone cannot distinguish a final page from a middle one.")
+            lines.append(f"            truncated = bool(unwrap({following_call}))")
+            truncated = "truncated=truncated, limit=limit, page=page"
         lines.append(f"        output.emit(rows, target=output.server_target(){', ' + truncated if truncated else ''})")
         lines.append("        return")
         headers = [c.header for c in cmd.columns]
@@ -214,8 +235,7 @@ def emit_command(cmd: Command, spec: dict[str, Any]) -> str:
         lines.append("    if context.current().json_output:")
         lines.append("        output.emit(rows[0], target=output.server_target())")
         lines.append("        return")
-        lines.append("    for key, value in rows[0].items():")
-        lines.append('        typer.echo(f"{key}: {value}")')
+        lines.append("    output.fields(rows[0])")
     else:
         lines.append("    if context.current().json_output:")
         lines.append("        output.emit(rows[0], target=output.server_target())")

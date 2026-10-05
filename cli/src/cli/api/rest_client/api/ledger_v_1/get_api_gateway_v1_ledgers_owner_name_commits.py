@@ -15,27 +15,17 @@ def _get_kwargs(
     name: str,
     *,
     branch: str | Unset = "main",
-    page: int | None | Unset = 1,
-    limit: int | None | Unset = 30,
+    page: int | Unset = 1,
+    limit: int | Unset = 30,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
 
     params["branch"] = branch
 
-    json_page: int | None | Unset
-    if isinstance(page, Unset):
-        json_page = UNSET
-    else:
-        json_page = page
-    params["page"] = json_page
+    params["page"] = page
 
-    json_limit: int | None | Unset
-    if isinstance(limit, Unset):
-        json_limit = UNSET
-    else:
-        json_limit = limit
-    params["limit"] = json_limit
+    params["limit"] = limit
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -122,8 +112,8 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     branch: str | Unset = "main",
-    page: int | None | Unset = 1,
-    limit: int | None | Unset = 30,
+    page: int | Unset = 1,
+    limit: int | Unset = 30,
 ) -> Response[Any | V1Error]:
     """List commits with branch and pagination controls
 
@@ -133,8 +123,8 @@ def sync_detailed(
         owner (str): Ledger owner's username Example: alice.
         name (str): Ledger (repository) name Example: main-ledger.
         branch (str | Unset):  Default: 'main'.
-        page (int | None | Unset):  Default: 1.
-        limit (int | None | Unset):  Default: 30.
+        page (int | Unset):  Default: 1.
+        limit (int | Unset):  Default: 30.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -165,8 +155,8 @@ def sync(
     *,
     client: AuthenticatedClient,
     branch: str | Unset = "main",
-    page: int | None | Unset = 1,
-    limit: int | None | Unset = 30,
+    page: int | Unset = 1,
+    limit: int | Unset = 30,
 ) -> Any | V1Error | None:
     """List commits with branch and pagination controls
 
@@ -176,8 +166,8 @@ def sync(
         owner (str): Ledger owner's username Example: alice.
         name (str): Ledger (repository) name Example: main-ledger.
         branch (str | Unset):  Default: 'main'.
-        page (int | None | Unset):  Default: 1.
-        limit (int | None | Unset):  Default: 30.
+        page (int | Unset):  Default: 1.
+        limit (int | Unset):  Default: 30.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -203,8 +193,8 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     branch: str | Unset = "main",
-    page: int | None | Unset = 1,
-    limit: int | None | Unset = 30,
+    page: int | Unset = 1,
+    limit: int | Unset = 30,
 ) -> Response[Any | V1Error]:
     """List commits with branch and pagination controls
 
@@ -214,8 +204,8 @@ async def asyncio_detailed(
         owner (str): Ledger owner's username Example: alice.
         name (str): Ledger (repository) name Example: main-ledger.
         branch (str | Unset):  Default: 'main'.
-        page (int | None | Unset):  Default: 1.
-        limit (int | None | Unset):  Default: 30.
+        page (int | Unset):  Default: 1.
+        limit (int | Unset):  Default: 30.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -244,8 +234,8 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     branch: str | Unset = "main",
-    page: int | None | Unset = 1,
-    limit: int | None | Unset = 30,
+    page: int | Unset = 1,
+    limit: int | Unset = 30,
 ) -> Any | V1Error | None:
     """List commits with branch and pagination controls
 
@@ -255,8 +245,8 @@ async def asyncio(
         owner (str): Ledger owner's username Example: alice.
         name (str): Ledger (repository) name Example: main-ledger.
         branch (str | Unset):  Default: 'main'.
-        page (int | None | Unset):  Default: 1.
-        limit (int | None | Unset):  Default: 30.
+        page (int | Unset):  Default: 1.
+        limit (int | Unset):  Default: 30.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

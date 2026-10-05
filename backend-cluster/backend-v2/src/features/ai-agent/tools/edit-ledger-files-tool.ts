@@ -1,6 +1,7 @@
 import { tool } from "ai";
 import { z } from "zod";
 import { logger } from "@/shared/logger";
+import { BadUserInputError, NotFoundError } from "@/shared/errors";
 import type { LedgerChangeFileOperation } from "@/foundation/fava/Api";
 import type { ToolContext } from "./types";
 import { toolOutputSchema, withWriteOutcome } from "./types";
@@ -160,7 +161,9 @@ export async function executeEditLedgerFiles(
     logger: toolLogger,
     message: "Failed to commit file operations",
     level: "error",
-    formatError: (msg) => `commit failed: ${msg}`,
+    // A preview commits nothing, so its refusal must not say a commit failed.
+    formatError: (msg) =>
+      `${dry_run ? "preview refused" : "commit failed"}: ${msg}`,
     execute: async (): Promise<EditLedgerFilesResult> => {
       const normalizedFiles = files.map((file) => ({
         ...file,
@@ -202,7 +205,9 @@ export async function executeEditLedgerFiles(
         }
 
         const cached = fileCache.get(f.path);
-        if (!cached) throw new Error(`${f.path}: file not found`);
+        // Categorized rather than left to the boundary's message sniffing,
+        // which made this NOT_FOUND only because of its wording (w5/051).
+        if (!cached) throw new NotFoundError("File", f.path);
 
         if (f.operation === "replace") {
           operations.push({
@@ -226,10 +231,20 @@ export async function executeEditLedgerFiles(
         // update (str_replace)
         const count = cached.content.split(f.old_string).length - 1;
         if (count === 0)
-          throw new Error(`${f.path}: old_string not found in file`);
+          // The file exists; it is the argument that does not match it. The
+          // same wording used to read as NOT_FOUND, as if the file were gone.
+          throw new BadUserInputError(
+            `${f.path}: old_string does not occur in the file`,
+            "old_string",
+            "Read the file's current text with `readLedgerFiles` and copy `old_string` from it exactly, whitespace included.",
+          );
         if (count > 1)
-          throw new Error(
+          // The caller's to fix by sending more context. As a plain Error it
+          // read as a server fault with a hint to retry (w5/036).
+          throw new BadUserInputError(
             `${f.path}: old_string matches ${count} times (must match exactly once — add more context lines)`,
+            "old_string",
+            "Extend `old_string` with neighbouring lines until it is unique in the file, or use `replace` to overwrite the whole file.",
           );
         operations.push({
           operation: "update",

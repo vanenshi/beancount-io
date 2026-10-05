@@ -46,7 +46,7 @@ from bea_engine.ledger.models import (
     Posting,
     PriceDirective,
     SourceLocation,
-    TransactionDirective,
+    TransactionHeader,
 )
 from bea_engine.ledger.text import fold_account
 
@@ -75,11 +75,23 @@ def load_file(file_path: Path) -> tuple[list[Any], list[Any]]:
 #: reuse). Being permissive is the safe direction here: what actually
 #: distinguishes a synthesized entry is the directive word after the date, and
 #: that check is unchanged.
-_DATE_TOKEN = re.compile(r"^\s*\d{4}[-/]\d+[-/]\d+\s+(\S+)")
+#:
+#: The lexer needs no whitespace between tokens either: `2024-01-07*"P"`,
+#: `2024-01-06 txn"T"` and `2024-01-01open` all declare directives, so the
+#: whitespace after the date is optional and the directive word is matched at
+#: the start of what follows rather than as a whole whitespace-delimited token.
+#:
+#: The date is captured too: a plugin that clones a written entry to other
+#: dates (the bundled forecast and amortize plugins, via `_replace`) keeps the
+#: template's location, so only the copy whose date the line declares is the
+#: one on disk (w1/113).
+_DATE_TOKEN = re.compile(r"^\s*(\d{4})[-/](\d+)[-/](\d+)\s*(\S+)")
 
 # A transaction line carries a flag where the other directives carry their
-# own word: `txn`, `*`, the lexer's FLAG characters, or one capital letter.
-_TXN_TOKEN = re.compile(r"\*|txn|[!&#?%]|[A-Z]")
+# own word: `txn`, `*`, the lexer's FLAG characters — all of which may run
+# straight into the payee string — or one capital letter, which the lexer
+# reads as a flag only when it stands alone (`P"x"` is a lexing error).
+_TXN_TOKEN = re.compile(r"txn|[*!&#?%]|[A-Z]\Z")
 
 
 @lru_cache(maxsize=64)
@@ -93,7 +105,9 @@ def _source_lines(filename: str) -> tuple[str, ...] | None:
         text = (
             Path(filename).read_text(encoding="utf-8", errors="replace").removeprefix("\ufeff")
         )  # a BOM glued to the first line
-        return tuple(text.splitlines())
+        # The lexer numbers lines by `\n` alone; `splitlines` would also break
+        # on U+2028, U+0085, form feed and friends inside strings or comments.
+        return tuple(text.split("\n"))
     except OSError:
         return None
 
@@ -103,9 +117,11 @@ def entry_generated(entry: Any, directive_type: str) -> bool:
 
     A synthesized entry either points nowhere real (`<auto_accounts>`) or
     borrows a real line that declares something else (an implicit price
-    stamped with its transaction's location). So the entry is on disk only
-    when its file exists and the line there starts this directive — exactly
-    what `grep` would find.
+    stamped with its transaction's location), or copies a real entry to
+    another date while keeping its location (a forecast or amortization
+    plugin). So the entry is on disk only when its file exists and the line
+    there starts this directive on this entry's date — exactly what `grep`
+    would find.
     """
     meta = getattr(entry, "meta", None) or {}
     filename = meta.get("filename")
@@ -118,10 +134,17 @@ def entry_generated(entry: Any, directive_type: str) -> bool:
     match = _DATE_TOKEN.match(lines[lineno - 1])
     if match is None:
         return True
-    token = match.group(1)
+    year, month, day, token = match.groups()
+    entry_date = getattr(entry, "date", None)
+    if isinstance(entry_date, datetime.date):
+        try:
+            if entry_date != datetime.date(int(year), int(month), int(day)):
+                return True
+        except ValueError:
+            return True
     if directive_type == "transaction":
-        return _TXN_TOKEN.fullmatch(token) is None
-    return token != directive_type
+        return _TXN_TOKEN.match(token) is None
+    return not token.startswith(directive_type)
 
 
 def _in_date_range(
@@ -148,16 +171,18 @@ def metadata_to_json(meta: dict[str, Any] | None) -> dict[str, Any]:
         if key in {"filename", "lineno"} or key.startswith("__"):
             continue
         if isinstance(value, Decimal):
-            value = {"kind": "number", "value": str(value)}
+            value = {"kind": "number", "value": format(value, "f")}
         elif isinstance(value, datetime.date):
             value = {"kind": "date", "value": value.isoformat()}
         elif isinstance(value, BcAmount):
-            value = {"kind": "amount", "number": str(value.number), "currency": value.currency}
+            value = {"kind": "amount", "number": format(value.number, "f"), "currency": value.currency}
         result[key] = value
     return result
 
 
-def _to_transaction(entry: Any) -> TransactionDirective:
+def _to_transaction(entry: Any) -> TransactionHeader:
+    # A loaded transaction may legitimately have no postings (Beancount accepts
+    # one), so reads use the header model; only input requires a posting.
     postings = []
     for p in entry.postings:
         cost = None
@@ -179,7 +204,7 @@ def _to_transaction(entry: Any) -> TransactionDirective:
                 meta=metadata_to_json(p.meta),
             )
         )
-    return TransactionDirective(
+    return TransactionHeader(
         date=entry.date,
         flag=entry.flag,
         payee=entry.payee,
@@ -215,8 +240,9 @@ def list_transactions(
     search: list[str] | None = None,
     tags: list[str] | None = None,
     links: list[str] | None = None,
-) -> list[TransactionDirective]:
-    terms = [_nfc(term or "").casefold() for term in search or []]
+) -> list[TransactionHeader]:
+    # The same fold account filters use, so Turkish `İ`/`ı` match `i` (w1/132).
+    terms = [fold_account(term or "") for term in search or []]
     wanted_tags = {_nfc(tag.lstrip("#")) for tag in tags or []}
     wanted_links = {_nfc(link.lstrip("^")) for link in links or []}
     results = []
@@ -230,8 +256,7 @@ def list_transactions(
         if account and not any(fold_account(account) in fold_account(p.account) for p in entry.postings):
             continue
         if terms and not all(
-            term in _nfc(entry.payee or "").casefold() or term in _nfc(entry.narration or "").casefold()
-            for term in terms
+            term in fold_account(entry.payee or "") or term in fold_account(entry.narration or "") for term in terms
         ):
             continue
         if wanted_tags and not wanted_tags.issubset({_nfc(tag) for tag in entry.tags or ()}):

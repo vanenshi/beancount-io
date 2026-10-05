@@ -485,6 +485,7 @@ type FeedResponse {
 """Source type of the feed item"""
 enum FeedSource {
   BLOG
+  CHANGELOG
   LEDGER_RSS
 }
 
@@ -970,7 +971,9 @@ type Mutation {
   Initiate a CLI authentication session. Returns the device code the CLI polls with and the user code to display for the person to enter in the browser.
   """
   createCliAuthSession(client: CliAuthClientInfoInput): CreateCliAuthSessionResponse!
-  """Create a new ledger for the current user"""
+  """
+  Create a new ledger for the current user. STARTER (the default, including null) contains options and accounts without transactions or opening balances; SAMPLE contains demonstration transactions. Existing ledgers are unchanged.
+  """
   createLedger(description: String, name: String!, private: Boolean, template: LedgerTemplate): Ledger!
   """Create a new file in a specific ledger"""
   createLedgerFile(content: String!, ledgerId: String!, message: String, path: String!): LedgerFileContent!
@@ -1404,6 +1407,9 @@ type Query {
     """
     locale: String
     offset: Float! = 0
+    """
+    Restrict the feed to one source: BLOG, LEDGER_RSS, or CHANGELOG. Omit for the merged feed.
+    """
     source: String
   ): FeedResponse!
   getLatestLedgerCommit(branchName: String! = "main", ledgerId: String!): LedgerCommit

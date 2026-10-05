@@ -41,7 +41,7 @@ def cloud_login() -> None:
 @cloud_app.command("logout")
 def cloud_logout() -> None:
     """Revoke the token and clear stored credentials."""
-    from cli.api.client import bearer_client, unwrap
+    from cli.api.client import bearer_client, call, unwrap_or_none
     from cli.api.rest_client.api.ledger_v_1 import logout
     from cli.auth.credentials import ENVIRONMENT, clear_credentials, load_credentials
 
@@ -59,13 +59,34 @@ def cloud_logout() -> None:
             "unchanged and does not revoke it. Unset BEA_TOKEN to stop using it."
         )
         return
+    import httpx
+
+    from cli.errors import BeaError, ConflictError, to_bea_error
+
+    failure: BeaError | None = None
     try:
-        unwrap(logout.sync_detailed(client=bearer_client(creds.token)))
-    except Exception:
-        # The local credential goes either way: a server that cannot be
-        # reached must not leave a token sitting on this disk.
-        pass
+        response = call(logout.sync_detailed, client=bearer_client(creds.token))
+        # A 401 means the server no longer accepts this token: it is already
+        # revoked (or expired), which is the outcome logout is after.
+        if response.status_code != 401:
+            unwrap_or_none(response)
+    except httpx.TimeoutException as exc:
+        failure = ConflictError(
+            f"Removed the local credential, but server revocation timed out ({type(exc).__name__}); "
+            "the outcome is unknown. The session may still be valid: revoke it from the dashboard."
+        )
+    except Exception as exc:
+        reason = to_bea_error(exc)
+        failure = BeaError(
+            f"Removed the local credential, but server revocation failed: {str(reason).rstrip('.')}. "
+            "The session may still be valid: revoke it from the dashboard.",
+            request_id=reason.request_id,
+        )
+    # The local credential goes either way: a server that cannot be reached
+    # must not leave a token sitting on this disk.
     clear_credentials()
+    if failure is not None:
+        raise failure
     output.success("Logged out.")
 
 
@@ -73,13 +94,13 @@ def cloud_logout() -> None:
 def cloud_status() -> None:
     """Show who is logged in, where the credential came from, and when it expires."""
     ctx = context.current()
-    from cli.api.client import bearer_client, unwrap_or_none
+    from cli.api.client import bearer_client, call, unwrap_or_none
     from cli.api.rest_client.api.ledger_v_1 import get_user_profile
     from cli.auth.credentials import require_credentials
     from cli.errors import error_from_status
 
     creds = require_credentials()
-    user = unwrap_or_none(get_user_profile.sync_detailed(client=bearer_client(creds.token)))
+    user = unwrap_or_none(call(get_user_profile.sync_detailed, client=bearer_client(creds.token)))
     if user is None:
         # A revoked or unknown bearer answers this endpoint with an empty
         # profile rather than a 401. Report it exactly the way every other
@@ -104,8 +125,12 @@ def cloud_status() -> None:
         )
         return
 
+    from cli.utils import single_line
+
+    # Email, username and tier are server text, and the expiry is read from a
+    # file: escape them so none can drive the terminal or forge a line.
     typer.echo(f"Source:    {creds.source}")
-    typer.echo(f"Expires:   {creds.expire_at or '(unknown — supplied by BEA_TOKEN)'}")
-    typer.echo(f"Email:     {user.email}")
-    typer.echo(f"Username:  {username if username else '(not set)'}")
-    typer.echo(f"Tier:      {user.tier}")
+    typer.echo(f"Expires:   {single_line(creds.expire_at) if creds.expire_at else '(unknown — supplied by BEA_TOKEN)'}")
+    typer.echo(f"Email:     {single_line(user.email)}")
+    typer.echo(f"Username:  {single_line(username) if username else '(not set)'}")
+    typer.echo(f"Tier:      {single_line(user.tier)}")

@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import re
+import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -50,6 +51,10 @@ class CsvMapping:
         return self.columns.get(name)
 
 
+# The spellings of "match every row" a rules file may use on purpose.
+_EXPLICIT_CATCH_ALL = frozenset({".*", "^.*", ".*$", "^.*$"})
+
+
 @dataclass(frozen=True)
 class CsvRule:
     """One categorization rule: the first matching pattern wins."""
@@ -67,9 +72,18 @@ class CsvRule:
         if not match.strip():
             raise UsageError(f"Rule {index + 1} has an empty match; write a regex, or .* for a catch-all.")
         try:
-            expression = re.compile(match, re.IGNORECASE)
+            # NFC like the engine's copy, which matches NFC-normalized cells.
+            expression = re.compile(unicodedata.normalize("NFC", match), re.IGNORECASE)
         except re.error as exc:
             raise UsageError(f"Rule {index + 1} has an invalid regex {match!r}: {exc}.") from exc
+        # A pattern that matches empty text (`a|b|`, `(x)?`, `y*`) matches every
+        # row, so a typo would silently categorize all of them. Only the
+        # documented spelling of a catch-all may do that.
+        if expression.search("") is not None and match.strip() not in _EXPLICIT_CATCH_ALL:
+            raise UsageError(
+                f"Rule {index + 1} pattern {match!r} matches empty text, so it would categorize every row; "
+                "drop the empty alternative (such as a trailing |), or write .* for an explicit catch-all."
+            )
         return CsvRule(pattern=match, account=account, expression=expression)
 
 
@@ -174,7 +188,7 @@ def load_rules(path: Path) -> list[CsvRule]:
     import tomllib
 
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        raw = tomllib.loads(path.read_text(encoding="utf-8-sig"))
     except OSError as exc:
         raise UsageError(f"Cannot read rules file {path}: {exc}.") from exc
     except ValueError as exc:
@@ -295,6 +309,33 @@ def _read_codec(encoding: str) -> str:
     return "utf-8-sig" if encoding == "utf-8" else encoding
 
 
+_UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
+
+
+def _refuse_utf16(source: Path) -> None:
+    """Refuse UTF-16 text (Excel's "Unicode Text") and binaries before any codec reads them.
+
+    cp1252 and latin-1 decode nearly any bytes, so a UTF-16 export used to be
+    diagnosed as cp1252 and then read as a header of `ÿþD a t e`. No supported
+    encoding reads a file with a UTF-16 byte-order mark or NUL bytes; say what
+    can. NULs all on one byte parity are BOM-less UTF-16; scattered ones are a
+    binary file such as a spreadsheet.
+    """
+    with open(source, "rb") as stream:
+        head = stream.read(4096)
+    if b"\x00" not in head and not head.startswith(_UTF16_BOMS):
+        return
+    even, odd = head[0::2].count(0), head[1::2].count(0)
+    if head.startswith(_UTF16_BOMS) or (min(even, odd) == 0 and 4 * max(even, odd) >= len(head) // 2):
+        raise UsageError(
+            f"{source.name} is UTF-16 text, which import cannot read; re-save it as UTF-8 (Excel: CSV UTF-8) and retry."
+        )
+    raise UsageError(
+        f"{source.name} contains NUL bytes, so it is not a CSV text file (a spreadsheet or other binary?); "
+        "export it as CSV UTF-8 and retry."
+    )
+
+
 def probe_decoding(source: Path) -> str:
     """First of utf-8, cp1252, latin-1 that decodes this file.
 
@@ -366,12 +407,16 @@ def detect_delimiter(source: Path, encoding: str = "utf-8") -> str:
     """Pick comma, semicolon, tab, or pipe from the first non-empty lines.
 
     Bank exports often use ``;`` (EU), tabs, or ``|`` (brokers). Prefer the
-    separator with a consistent multi-field column count across the sampled
-    body rows, so a header tied on field count resolves by the body; the
-    header itself stays out of the uniformity check (a merged header cell is
-    not a vote), and when no candidate is consistent the most fields on the
-    header line wins as before.
+    separator on which the header and every sampled body row agree on one
+    multi-field count, so a header tied on field count resolves by the body
+    and a body tie resolves by the header: a comma file whose quoted cells
+    hold semicolons, or a tab file whose dates hold commas, splits its header
+    on the real separator only. A separator the body agrees on but the header
+    does not (a merged header cell) comes next, provided the header splits on
+    it at all; when nothing is consistent the most fields on the header line
+    wins.
     """
+    _refuse_utf16(source)
     try:
         with open(source, encoding=_read_codec(encoding), newline="") as stream:
             sample = []
@@ -384,19 +429,30 @@ def detect_delimiter(source: Path, encoding: str = "utf-8") -> str:
         raise _decode_usage_error(source, exc, encoding) from None
     if not sample:
         return ","
-    best = ","
-    best_count = 0
-    body = sample[1:]
+    header, body = sample[0], sample[1:]
+    agreed: tuple[int, str] | None = None
+    body_only: tuple[int, str] | None = None
     for delim in _CANDIDATE_DELIMITERS:
         counts = {_field_count(line, delim) for line in body}
-        if len(counts) == 1:
-            (count,) = counts
-            if count is not None and count > 1 and count > best_count:
-                best, best_count = delim, count
-    if best_count > 1:
-        return best
+        if len(counts) != 1:
+            continue
+        (count,) = counts
+        header_count = _field_count(header, delim)
+        if count is None or count < 2 or header_count is None or header_count < 2:
+            continue
+        if header_count == count:
+            if agreed is None or count > agreed[0]:
+                agreed = (count, delim)
+        elif body_only is None or count > body_only[0]:
+            body_only = (count, delim)
+    if agreed is not None:
+        return agreed[1]
+    if body_only is not None:
+        return body_only[1]
+    best = ","
+    best_count = 0
     for delim in _CANDIDATE_DELIMITERS:
-        count = _field_count(sample[0], delim)
+        count = _field_count(header, delim)
         if count is not None and count > best_count:
             best, best_count = delim, count
     return best
@@ -420,8 +476,8 @@ def parse_delimiter(value: str) -> str:
 @contextmanager
 def open_records(
     source: Path, *, delimiter: str | None = None, encoding: str = "utf-8"
-) -> Iterator[tuple[list[str], Iterator[dict[str, str]]]]:
-    """The stripped header row and one dict per data row, keyed by those names.
+) -> Iterator[tuple[list[str], Iterator[tuple[int, dict[str, str]]]]]:
+    """The stripped header row, and each data row with the line it starts on.
 
     This is the one reader every CSV path shares, so discovery, date inference,
     and extraction agree on what a column is called: names are stripped (and
@@ -430,33 +486,71 @@ def open_records(
     folding every later row into one field. When ``delimiter`` is omitted the
     sampled rows choose among comma, semicolon, tab, and pipe.
     """
+    _refuse_utf16(source)
     delim = detect_delimiter(source, encoding=encoding) if delimiter is None else delimiter
     with open(source, encoding=_read_codec(encoding), newline="") as stream:
         reader = csv.reader(stream, delimiter=delim, strict=True)
+        # A malformed record is reported where it starts: `line_num` has by
+        # then run to the end of the file when an unclosed quote swallowed it.
+        header_start = 1
         try:
             first = next(reader, None)
+            # Blank lines before the header (some bank exports start with
+            # one) are not the header; `detect_delimiter` skips them too, and
+            # `line_num` keeps counting them, so file lines stay right.
+            while first is not None and not any(cell.strip() for cell in first):
+                header_start = reader.line_num + 1
+                first = next(reader, None)
         except csv.Error as exc:
-            raise _malformed(source, reader.line_num, exc) from None
+            raise _malformed(source, header_start, exc) from None
         except UnicodeDecodeError as exc:
             raise _decode_usage_error(source, exc, encoding) from None
         headers = [cell.strip() for cell in first or []]
 
-        def rows() -> Iterator[dict[str, str]]:
+        def rows() -> Iterator[tuple[int, dict[str, str]]]:
+            # As in the engine's reader: a record starts one line past wherever
+            # the reader was before it, which stays right across multiline cells.
+            start = reader.line_num + 1
             try:
                 for record in reader:
-                    yield {name: record[i] if i < len(record) else "" for i, name in enumerate(headers)}
+                    yield start, {name: record[i] if i < len(record) else "" for i, name in enumerate(headers)}
+                    start = reader.line_num + 1
             except csv.Error as exc:
-                raise _malformed(source, reader.line_num, exc) from None
+                raise _malformed(source, start, exc) from None
             except UnicodeDecodeError as exc:
                 raise _decode_usage_error(source, exc, encoding) from None
 
         yield headers, rows()
 
 
+@dataclass(frozen=True)
+class DateRejection:
+    """The date cell that ruled out the last candidate format."""
+
+    row: int
+    line: int
+    value: str
+    first: bool
+
+
 def infer_date_format(
     source: Path, column: str, *, delimiter: str | None = None, encoding: str = "utf-8"
 ) -> tuple[str | None, bool]:
-    """The one date format that parses this column, and whether others also did.
+    """The one date format that parses this column, and whether others also did."""
+    date_format, ambiguous, _rejection = inspect_date_column(source, column, delimiter=delimiter, encoding=encoding)
+    return date_format, ambiguous
+
+
+def inspect_date_column(
+    source: Path,
+    column: str,
+    *,
+    delimiter: str | None = None,
+    encoding: str = "utf-8",
+    mapped_columns: dict[str, str] | None = None,
+) -> tuple[str | None, bool, DateRejection | None]:
+    """The one date format that parses this column, whether others also did,
+    and — when none fits — the cell that ruled out the last candidate.
 
     Day-first and month-first columns are indistinguishable until a row carries
     a day past the twelfth, so the caller is told when the choice was a guess
@@ -466,26 +560,38 @@ def infer_date_format(
     sample that stopped at 200 chose month-first for an export whose 201st date
     was `13/04/2024`, then refused that valid date. Candidates are narrowed as
     the rows stream, so no value is kept.
+
+    The rejection names its row the way the import preview does — data rows
+    counted from 1, skipping rows whose mapped cells are all blank — so the
+    error points at the record to fix. ``mapped_columns`` is the `--csv`
+    mapping that decides which cells count; without it only the date cell does.
     """
     working = list(_DATE_FORMATS)
     seen = False
     try:
         with open_records(source, delimiter=delimiter, encoding=encoding) as (headers, rows):
             if column not in headers:
-                return None, False
-            for row in rows:
+                return None, False, None
+            counted = set((mapped_columns or {"date": column}).values())
+            if mapped_columns is not None and "category" not in mapped_columns:
+                counted.update(header for header in headers if header.casefold() == "category")
+            row_number = 0
+            for line, row in rows:
+                if any((row.get(header) or "").strip() for header in counted):
+                    row_number += 1
                 value = row[column].strip()
                 if not value:
                     continue
+                first = not seen
                 seen = True
                 working = [candidate for candidate in working if _parses(value, candidate)]
                 if not working:
-                    return None, False
+                    return None, False, DateRejection(row=row_number, line=line, value=value, first=first)
     except (OSError, UnicodeDecodeError, UsageError):
-        return None, False
+        return None, False, None
     if not seen:
-        return None, False
-    return working[0], len(working) > 1
+        return None, False, None
+    return working[0], len(working) > 1, None
 
 
 def _parses(value: str, date_format: str) -> bool:

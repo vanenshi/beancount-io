@@ -25,14 +25,21 @@ def register_ledger_commands(ledger_app: typer.Typer) -> None:
         page: Annotated[int, typer.Option("--page", help="1-based page number")] = 1,
         limit: Annotated[int, typer.Option("--limit", help="Page size, at most 100")] = 50,
     ) -> None:
-        from cli.api.client import authenticated_client, unwrap
+        from cli.api.client import authenticated_client, call, unwrap
         from cli.api.rest_client.api.ledger_v_1 import accessible_ledgers
 
-        result = unwrap(accessible_ledgers.sync_detailed(page=page, limit=limit, client=authenticated_client()))
+        client = authenticated_client()
+        result = unwrap(call(accessible_ledgers.sync_detailed, page=page, limit=limit, client=client))
         data = result if isinstance(result, list) else [result]
         rows = [snake_keys(item.to_dict()) for item in data]
         if context.current().json_output:
-            output.emit(rows, target=output.server_target(), truncated=len(rows) >= limit, limit=limit, page=page)
+            truncated = False
+            if len(rows) == limit:
+                # A full page alone cannot distinguish a final page from a middle one.
+                truncated = bool(
+                    unwrap(call(accessible_ledgers.sync_detailed, page=page * limit + 1, limit=1, client=client))
+                )
+            output.emit(rows, target=output.server_target(), truncated=truncated, limit=limit, page=page)
             return
         output.table(
             ["NAME", "FULLNAME", "PRIVATE", "CREATED"],
@@ -49,23 +56,22 @@ def register_ledger_commands(ledger_app: typer.Typer) -> None:
 
     @ledger_app.command(
         "show",
-        help="Get one ledger.\n\nMetadata for a single ledger: description, visibility, default branch, and the caller's permissions on it.",
+        help="Get one ledger.\n\nMetadata for a single ledger: description, visibility, clone URLs, timestamps, and the caller's permissions when available.",
     )
     def ledger_show(
         full_name: Annotated[str, typer.Argument(help="Ledger full name (e.g. username/my-ledger)")],
     ) -> None:
         owner, name = owner_and_name(full_name)
-        from cli.api.client import authenticated_client, unwrap
+        from cli.api.client import authenticated_client, call, unwrap
         from cli.api.rest_client.api.ledger_v_1 import get_ledger
 
-        result = unwrap(get_ledger.sync_detailed(owner, name, client=authenticated_client()))
+        result = unwrap(call(get_ledger.sync_detailed, owner, name, client=authenticated_client()))
         data = result if isinstance(result, list) else [result]
         rows = [snake_keys(item.to_dict()) for item in data]
         if context.current().json_output:
             output.emit(rows[0], target=output.server_target())
             return
-        for key, value in rows[0].items():
-            typer.echo(f"{key}: {value}")
+        output.fields(rows[0])
 
     @ledger_app.command(
         "delete",
@@ -75,7 +81,7 @@ def register_ledger_commands(ledger_app: typer.Typer) -> None:
         full_name: Annotated[str, typer.Argument(help="Ledger full name (e.g. username/my-ledger)")],
     ) -> None:
         owner, name = owner_and_name(full_name)
-        from cli.api.client import authenticated_client, unwrap
+        from cli.api.client import authenticated_client, call, unwrap
         from cli.api.rest_client.api.ledger_v_1 import delete_ledger
 
         client = authenticated_client()
@@ -87,7 +93,7 @@ def register_ledger_commands(ledger_app: typer.Typer) -> None:
         from cli.errors import unknown_write_outcome
 
         try:
-            result = unwrap(delete_ledger.sync_detailed(owner, name, client=client))
+            result = unwrap(call(delete_ledger.sync_detailed, owner, name, client=client))
         except (httpx.TimeoutException, httpx.TransportError) as e:
             raise unknown_write_outcome(f"Deleting ledger '{full_name}'", e) from e
         data = result if isinstance(result, list) else [result]

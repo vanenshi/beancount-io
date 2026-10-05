@@ -152,6 +152,65 @@ describe("executeReadLedgerFiles", () => {
     });
   });
 
+  it("refuses a reversed line range before reading anything", async () => {
+    const ledgerRepo = serviceReturning("line1\nline2\nline3");
+    const result = await executeReadLedgerFiles(
+      {
+        services: { ledgerRepo } as any,
+        identity: IDENTITY,
+        ledgerId: LEDGER_ID,
+      },
+      { files: [{ path: "main.bean", start_line: 10, end_line: 9 }] },
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: "BAD_USER_INPUT",
+      error: expect.stringContaining("start_line 10 is after end_line 9"),
+    });
+    expect(ledgerRepo.getFilesContent).not.toHaveBeenCalled();
+  });
+
+  it("refuses a start past the end of the file, naming its length", async () => {
+    const ledgerRepo = serviceReturning("line1\nline2\nline3");
+    const result = await executeReadLedgerFiles(
+      {
+        services: { ledgerRepo } as any,
+        identity: IDENTITY,
+        ledgerId: LEDGER_ID,
+      },
+      { files: [{ path: "main.bean", start_line: 4 }] },
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: "BAD_USER_INPUT",
+      error: expect.stringContaining("past the end of the file (3 lines)"),
+    });
+  });
+
+  it("clamps an end_line past the end instead of refusing it", async () => {
+    const ledgerRepo = serviceReturning("line1\nline2\nline3");
+    const result = await executeReadLedgerFiles(
+      {
+        services: { ledgerRepo } as any,
+        identity: IDENTITY,
+        ledgerId: LEDGER_ID,
+      },
+      { files: [{ path: "main.bean", start_line: 3, end_line: 500 }] },
+    );
+    expect(result).toEqual({
+      ok: true,
+      result: [
+        {
+          path: "main.bean",
+          startLine: 3,
+          endLine: 3,
+          totalLines: 3,
+          content: "line3",
+        },
+      ],
+    });
+  });
+
   it("slices to the requested 1-based, inclusive line range", async () => {
     const ledgerRepo = serviceReturning("line1\nline2\nline3\nline4");
     const result = await executeReadLedgerFiles(
@@ -364,7 +423,83 @@ describe("executeEditLedgerFiles", () => {
       },
     );
     expect(result.ok).toBe(false);
+    // The file is there; the argument is what does not match (w5/051).
+    expect(result).toMatchObject({
+      errorCode: "BAD_USER_INPUT",
+      error: expect.stringMatching(/^commit failed: main\.bean: old_string/),
+    });
     expect(ledgerRepo.changeFiles).not.toHaveBeenCalled();
+  });
+
+  it.each(["update", "replace", "delete"] as const)(
+    "%s: a file that does not exist is NOT_FOUND by category, not by wording",
+    async (operation) => {
+      const ledgerRepo = {
+        getFilesContent: jest.fn().mockResolvedValue([]),
+        changeFiles: jest.fn(),
+      };
+      const result = await executeEditLedgerFiles(
+        {
+          services: { ledgerRepo } as any,
+          identity: IDENTITY,
+          ledgerId: LEDGER_ID,
+        },
+        {
+          description: "edit",
+          files: [
+            {
+              operation,
+              path: "ghost.bean",
+              old_string: "a",
+              new_string: "b",
+              content: "x",
+            } as any,
+          ],
+          dry_run: false,
+        },
+      );
+      expect(result).toMatchObject({
+        ok: false,
+        errorCode: "NOT_FOUND",
+        error: expect.stringContaining("ghost.bean"),
+      });
+      expect(ledgerRepo.changeFiles).not.toHaveBeenCalled();
+    },
+  );
+
+  it("dry_run: a refusal says the preview was refused, not that a commit failed", async () => {
+    const ledgerRepo = {
+      getFilesContent: jest
+        .fn()
+        .mockResolvedValue([
+          { path: "main.bean", content: "abc", sha: "sha1" },
+        ]),
+      changeFiles: jest.fn(),
+    };
+    const result = await executeEditLedgerFiles(
+      {
+        services: { ledgerRepo } as any,
+        identity: IDENTITY,
+        ledgerId: LEDGER_ID,
+      },
+      {
+        description: "edit",
+        files: [
+          {
+            operation: "update",
+            path: "main.bean",
+            old_string: "zzz",
+            new_string: "y",
+          },
+        ],
+        dry_run: true,
+      },
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/^preview refused: /),
+    });
+    expect((result as { error: string }).error).not.toContain("commit failed");
   });
 
   it("update (str_replace): rejects an ambiguous match (appears more than once)", async () => {
@@ -396,6 +531,12 @@ describe("executeEditLedgerFiles", () => {
       },
     );
     expect(result.ok).toBe(false);
+    // Ambiguity is the caller's to fix, not a server fault to retry (w5/036).
+    expect(result).toMatchObject({
+      errorCode: "BAD_USER_INPUT",
+      error: expect.stringContaining("matches 2 times"),
+      errorHint: expect.stringContaining("old_string"),
+    });
     expect(ledgerRepo.changeFiles).not.toHaveBeenCalled();
   });
 

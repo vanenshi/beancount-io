@@ -3,6 +3,7 @@
 import datetime
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from decimal import Decimal
@@ -266,7 +267,8 @@ def test_import_writes_skill_shaped_import_ids(book: Path) -> None:
     assert book.read_text().count("bea_import_id") == 0
     assert _import_ids(book)[-2:] == [
         "bank:bank-001",
-        "csv:sha256:" + hashlib.sha256(b"2026-08-04|-5.25 USD|COFFEE|Assets:Checking").hexdigest()[:16],
+        # Payee and narration are both hashed, so rows differing in payee differ (w1/149).
+        "csv:sha256:" + hashlib.sha256(b"2026-08-04|-5.25 USD|CAFE|COFFEE|Assets:Checking").hexdigest()[:16],
     ]
 
 
@@ -303,7 +305,8 @@ def test_hash_matches_the_skill_worked_example(tmp_path: Path) -> None:
     )
     source = tmp_path / "bank.csv"
     source.write_text(
-        "Date,Payee,Narration,Amount\n2026-05-07,Store,Trader Joes #123 Seattle WA,-54.20\n",
+        # No payee, exactly as in the reference's narration-only worked example.
+        "Date,Payee,Narration,Amount\n2026-05-07,,Trader Joes #123 Seattle WA,-54.20\n",
     )
     assert run(book, source, "--apply", config=config).exit_code == 0
     # The worked example from the skill reference, recomputed for the exact
@@ -317,7 +320,7 @@ def test_identical_same_day_rows_take_occurrence_suffixes(book: Path) -> None:
     source = book.parent / "bank.csv"
     source.write_text(HEADER + row + row)
     assert run(book, source, "--apply", "--duplicates", "include").exit_code == 0
-    base = "2026-08-02|-5.25 USD|COFFEE|Assets:Checking"
+    base = "2026-08-02|-5.25 USD|CAFE|COFFEE|Assets:Checking"
     first = "csv:sha256:" + hashlib.sha256(base.encode()).hexdigest()[:16]
     second = "csv:sha256:" + hashlib.sha256(f"{base}|2".encode()).hexdigest()[:16]
     assert first != second
@@ -1105,8 +1108,7 @@ class TestCsvBankAmountSpellings:
             ('"$1,000.00"', "1000.00 USD"),
             ("(4.50)", "-4.50 USD"),
             ("4.50-", "-4.50 USD"),
-            ("€12.50", "12.50 USD"),
-            ("4.50€", "4.50 USD"),
+            ("$12.50", "12.50 USD"),
             ('"1,00,000"', "100000 USD"),
             ("1\u2009000.00", "1000.00 USD"),
         ],
@@ -1347,6 +1349,33 @@ class TestCsvRulesMatching:
         assert "Rule 1" in result.stderr
         assert "empty match" in result.stderr
 
+    @pytest.mark.parametrize("pattern", ["whole foods|trader joe|", "|cafe", "(cafe)?", "x*", "^"])
+    def test_pattern_matching_empty_text_refused(self, book: Path, isolated_config: Path, pattern: str) -> None:
+        rules = rules_file(book, f'[[rule]]\nmatch = "{pattern}"\naccount = "Expenses:Food"\n')
+        before = book.read_bytes()
+        result = csv_result(book, CSV_HEADER + CSV_ROW, "--rules", str(rules), "--apply")
+        assert result.exit_code == 2, result.output
+        assert "Rule 1" in result.stderr
+        assert "matches empty text" in result.stderr
+        assert ".*" in result.stderr
+        assert book.read_bytes() == before
+
+    @pytest.mark.parametrize("pattern", ["whole foods|trader joe|", "(cafe)?"])
+    def test_engine_refuses_pattern_matching_empty_text(self, pattern: str) -> None:
+        from bea_engine.csv_mapper import CsvRule as EngineCsvRule
+        from bea_engine.protocol import UsageError as EngineUsageError
+
+        with pytest.raises(EngineUsageError, match="Rule 2 pattern .* matches empty text"):
+            EngineCsvRule.compile(1, {"match": pattern, "account": "Expenses:Food"})
+
+    @pytest.mark.parametrize("pattern", [".*", "^.*$", " .* "])
+    def test_explicit_catch_all_spellings_still_load(self, pattern: str) -> None:
+        from bea_engine.csv_mapper import CsvRule as EngineCsvRule
+        from cli.csv_mapper import CsvRule
+
+        assert CsvRule.compile(0, {"match": pattern, "account": "Expenses:Food"}).pattern == pattern
+        assert EngineCsvRule.compile(0, {"match": pattern, "account": "Expenses:Food"}).pattern == pattern
+
     def test_explicit_catch_all_categorizes_everything(self, book: Path, isolated_config: Path) -> None:
         rules = rules_file(book, '[[rule]]\nmatch = ".*"\naccount = "Expenses:Food"\n')
         result = csv_result(book, CSV_HEADER + CSV_ROW, "--rules", str(rules))
@@ -1371,13 +1400,167 @@ class TestCsvRulesMatching:
         assert "Expenses:Food" in row["entry"]
         assert "STARBUCKS" not in " ".join(data["notes"])
 
+    @pytest.mark.parametrize("rule_form", ["NFC", "NFD"])
+    def test_rule_matches_either_unicode_normalization(self, book: Path, isolated_config: Path, rule_form: str) -> None:
+        import unicodedata
+
+        nfc, nfd = (unicodedata.normalize(form, "Café Nero") for form in ("NFC", "NFD"))
+        label = unicodedata.normalize("NFD", "Crème")
+        rules = rules_file(
+            book,
+            f'[[rule]]\nmatch = "{unicodedata.normalize(rule_form, "café")}"\naccount = "Expenses:Food"\n'
+            f'[[rule]]\nmatch = "{unicodedata.normalize(rule_form, "^crème$")}"\naccount = "Expenses:Dining"\n',
+        )
+        result = csv_result(
+            book,
+            "Date,Description,Amount,Category\n"
+            f"2026-08-02,{nfd},-4.00,\n2026-08-03,{nfc},-5.00,\n2026-08-04,Card,-6.00,{label}\n",
+            "--rules",
+            str(rules),
+            mapping="date=Date,amount=Amount,narration=Description,category=Category",
+        )
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.stdout)["data"]["rows"]
+        assert [row["rule"] != "unmatched" for row in rows] == [True, True, True]
+        assert "Expenses:Food" in rows[0]["entry"] and "Expenses:Food" in rows[1]["entry"]
+        assert "Expenses:Dining" in rows[2]["entry"]
+
 
 class TestStickyRecall:
     MAPPING = "date=Date,amount=Amount,narration=Description"
+    BAD_MAPPING = "date=Date,amount=Description,narration=Amount"
 
     def _record(self, book: Path, cfg: Path) -> Path:
         key = hashlib.sha256(str(book.resolve()).encode()).hexdigest()
         return cfg / "importers" / f"csv-{key}.json"
+
+    def _remember_rule_mapping(self, book: Path) -> tuple[Path, Path]:
+        source = book.parent / "bank.csv"
+        source.write_text("Date,Description,Amount\n2026-08-02,Coffee,-5.25\n")
+        rules = rules_file(book, '[[rule]]\nmatch = "Coffee"\naccount = "Expenses:Dining"\n')
+        seed = run_csv(book, source, "--csv", self.MAPPING, "--account", "Assets:Checking", "--rules", str(rules))
+        assert seed.exit_code == 0, seed.output
+        assert json.loads(seed.stdout)["data"]["ready"] == 1
+        return source, rules
+
+    def test_failed_first_mapping_leaves_the_next_import_free_to_infer(self, book: Path, isolated_config: Path) -> None:
+        source = book.parent / "bank.csv"
+        source.write_text("Date,Description,Amount\n2026-08-02,Coffee,-5.25\n")
+        before = book.read_bytes()
+
+        failed = run_csv(book, source, "--csv", self.BAD_MAPPING, "--account", "Assets:Checking")
+
+        assert failed.exit_code == 2, failed.output
+        assert "cannot parse amount 'Coffee'" in failed.stderr
+        assert not self._record(book, isolated_config).exists()
+        assert book.read_bytes() == before
+        retry = run_csv(book, source, "--account", "Assets:Checking")
+        assert retry.exit_code == 0, retry.output
+        data = json.loads(retry.stdout)["data"]
+        assert data["config_source"] == "inferred --csv"
+        assert data["ready"] == 1
+        assert data["rows"][0]["amount"] == "-5.25 USD"
+        assert book.read_bytes() == before
+
+    @pytest.mark.parametrize("apply", [False, True], ids=["preview", "apply"])
+    @pytest.mark.parametrize("as_json", [False, True], ids=["human", "json"])
+    def test_failed_explicit_mapping_preserves_the_working_rules(
+        self, book: Path, isolated_config: Path, apply: bool, as_json: bool
+    ) -> None:
+        source, rules = self._remember_rule_mapping(book)
+        record = self._record(book, isolated_config)
+        remembered = record.read_bytes()
+        before = book.read_bytes()
+
+        failed = runner.invoke(
+            app,
+            [
+                *(["--json"] if as_json else []),
+                "--file",
+                str(book),
+                "import",
+                str(source),
+                "--csv",
+                self.BAD_MAPPING,
+                "--account",
+                "Assets:Checking",
+                *(["--apply"] if apply else []),
+            ],
+        )
+
+        assert failed.exit_code == 2, failed.output
+        assert "cannot parse amount 'Coffee'" in failed.stderr
+        assert record.read_bytes() == remembered
+        assert book.read_bytes() == before
+        assert "Discarded remembered" not in failed.output
+        retry = run_csv(book, source)
+        assert retry.exit_code == 0, retry.output
+        data = json.loads(retry.stdout)["data"]
+        assert data["config_source"] == "remembered --csv"
+        assert data["remembered"]["rules"] == str(rules)
+        assert data["rows"][0]["rule"] == "Coffee"
+        assert "Expenses:Dining" in data["rows"][0]["entry"]
+        assert record.read_bytes() == remembered
+        assert book.read_bytes() == before
+
+    def test_review_blocked_apply_preserves_the_working_memory(self, book: Path, isolated_config: Path) -> None:
+        source, rules = self._remember_rule_mapping(book)
+        record = self._record(book, isolated_config)
+        remembered = record.read_bytes()
+        before = book.read_bytes()
+
+        failed = run_csv(
+            book,
+            source,
+            "--csv",
+            self.MAPPING,
+            "--account",
+            "Assets:Checking",
+            "--default-account",
+            "Expenses:NotOpened",
+            "--apply",
+        )
+
+        assert failed.exit_code == 4, failed.output
+        error = json.loads(failed.stderr)["error"]
+        assert error["result"]["written"] == 0
+        assert error["result"]["rows"][0]["status"] == "blocked"
+        assert record.read_bytes() == remembered
+        assert book.read_bytes() == before
+        assert "Discarded remembered" not in failed.output
+        retry = run_csv(book, source)
+        assert retry.exit_code == 0, retry.output
+        data = json.loads(retry.stdout)["data"]
+        assert data["remembered"]["rules"] == str(rules)
+        assert data["rows"][0]["rule"] == "Coffee"
+        assert data["ready"] == 1
+        assert record.read_bytes() == remembered
+        assert book.read_bytes() == before
+
+    @pytest.mark.parametrize("stale_setting", ["missing-rules", "corrupt-rules", "legacy-sign"])
+    def test_failed_extraction_does_not_persist_stale_memory_repairs(
+        self, book: Path, isolated_config: Path, stale_setting: str
+    ) -> None:
+        source, rules = self._remember_rule_mapping(book)
+        record = self._record(book, isolated_config)
+        if stale_setting == "missing-rules":
+            rules.unlink()
+        elif stale_setting == "corrupt-rules":
+            rules.write_text("NOT TOML {{{")
+        else:
+            payload = json.loads(record.read_text())
+            payload["sources"][0]["mapping"] += ",sign=ledger"
+            record.write_text(json.dumps(payload, indent=2) + "\n")
+        remembered = record.read_bytes()
+        before = book.read_bytes()
+        source.write_text("Date,Description,Amount\n2026-08-03,Coffee,not-a-number\n")
+
+        failed = run_csv(book, source)
+
+        assert failed.exit_code == 2, failed.output
+        assert "cannot parse amount 'not-a-number'" in failed.stderr
+        assert record.read_bytes() == remembered
+        assert book.read_bytes() == before
 
     def test_remembered_run_lists_every_setting(self, book: Path, isolated_config: Path) -> None:
         rules = rules_file(book, '[[rule]]\nmatch = "Coffee"\naccount = "Expenses:Food"\n')
@@ -1448,6 +1631,31 @@ class TestStickyRecall:
         assert repeat.exit_code == 0, repeat.output
         (row,) = json.loads(repeat.stdout)["data"]["rows"]
         assert row["amount"] == "-4.50 USD"
+        notes = " ".join(json.loads(repeat.stdout)["data"]["notes"])
+        assert "ledger-sign.csv was imported with sign=ledger" in notes
+        assert "bank.csv is read bank-signed" in notes
+
+    def test_flag_free_apply_of_the_previewed_file_keeps_sign_ledger(self, book: Path, isolated_config: Path) -> None:
+        """w1/150: the documented preview-then-flag-free-apply wrote the opposite sign."""
+        source = book.parent / "cc.csv"
+        source.write_text("Date,Description,Amount\n2026-08-02,Grocery,25.00\n")
+        preview = run_csv(book, source, "--csv", f"{self.MAPPING},sign=ledger", "--account", "Assets:Checking")
+        assert preview.exit_code == 0, preview.output
+        (previewed,) = json.loads(preview.stdout)["data"]["rows"]
+        assert previewed["amount"] == "-25.00 USD"
+        stored = json.loads(self._record(book, isolated_config).read_text())["sources"][0]
+        assert "sign=" not in stored["mapping"]
+
+        applied = run_csv(book, source, "--apply")
+
+        assert applied.exit_code == 0, applied.output
+        data = json.loads(applied.stdout)["data"]
+        (row,) = data["rows"]
+        assert row["amount"] == "-25.00 USD"
+        assert data["written"] == 1
+        assert data["remembered"]["mapping"].endswith(",sign=ledger")
+        assert any("Re-applied sign=ledger: cc.csv" in note for note in data["notes"])
+        assert re.search(r"^\s+Assets:Checking\s+-25\.00 USD$", book.read_text(), re.MULTILINE)
 
     def test_explicit_sign_ledger_still_works(self, book: Path, isolated_config: Path) -> None:
         source = book.parent / "bank.csv"
@@ -1834,3 +2042,171 @@ class TestImportFixtureSet:
         assert result.exit_code == 2
         assert "narration (Description, Memo)" in result.stderr
         assert book.read_bytes() == before
+
+
+class TestCsvDebitCreditSigns:
+    """A debit posts negative by magnitude, and a zero cell is an empty cell (w3/424)."""
+
+    MAPPING = "date=Date,debit=Money Out,credit=Money In,narration=Description"
+
+    def _posted(self, book: Path) -> list[str]:
+        entries, errors, _ = loader.load_file(book)
+        assert not errors, errors
+        return [str(e.postings[0].units) for e in entries if isinstance(e, Transaction)]
+
+    def test_a_debit_cell_that_carries_its_own_minus_still_posts_out(self, book: Path, isolated_config: Path) -> None:
+        body = "Date,Description,Money Out,Money In\n2026-08-02,Coffee,-4.50,\n2026-08-03,Salary,,1000.00\n"
+
+        result = csv_result(book, body, "--apply", mapping=self.MAPPING)
+
+        assert result.exit_code == 0, result.output
+        # Negating a cell that was already negative booked the outflow as income.
+        assert sorted(self._posted(book)) == ["-4.50 USD", "1000.00 USD"]
+
+    def test_a_positive_debit_cell_still_posts_out(self, book: Path, isolated_config: Path) -> None:
+        body = "Date,Description,Money Out,Money In\n2026-08-02,Coffee,20.00,\n"
+
+        result = csv_result(book, body, "--apply", mapping=self.MAPPING)
+
+        assert result.exit_code == 0, result.output
+        assert self._posted(book) == ["-20.00 USD"]
+
+    def test_a_zero_filled_companion_cell_is_treated_as_empty(self, book: Path, isolated_config: Path) -> None:
+        body = "Date,Description,Money Out,Money In\n2026-08-02,Shop,30.00,0.00\n"
+
+        result = csv_result(book, body, "--apply", mapping=self.MAPPING)
+
+        assert result.exit_code == 0, result.output
+        assert self._posted(book) == ["-30.00 USD"]
+
+    def test_two_nonzero_cells_are_still_refused(self, book: Path, isolated_config: Path) -> None:
+        body = "Date,Description,Money Out,Money In\n2026-08-02,Shop,30.00,5.00\n"
+        before = book.read_bytes()
+
+        result = csv_result(book, body, mapping=self.MAPPING)
+
+        assert result.exit_code == 2, result.output
+        assert "fill exactly one of 'Money Out' or 'Money In'" in result.stderr
+        assert book.read_bytes() == before
+
+    def test_a_debit_column_mixing_signs_is_refused_naming_the_column(self, book: Path, isolated_config: Path) -> None:
+        body = "Date,Description,Money Out,Money In\n2026-08-02,A,-5,\n2026-08-03,B,7,\n"
+        before = book.read_bytes()
+
+        result = csv_result(book, body, mapping=self.MAPPING)
+
+        assert result.exit_code == 2, result.output
+        assert "Column 'Money Out' mixes signs" in result.stderr
+        assert "row 1" in result.stderr and "row 2" in result.stderr
+        assert book.read_bytes() == before
+
+
+class TestCsvRowCurrency:
+    """An imported row's commodity comes from the account, not the ledger (w3/421)."""
+
+    MAPPING = "date=Date,amount=Amount,narration=Description"
+
+    def _units(self, book: Path, account: str) -> list[str]:
+        entries, errors, _ = loader.load_file(book)
+        assert not errors, errors
+        return [str(p.units) for e in entries if isinstance(e, Transaction) for p in e.postings if p.account == account]
+
+    def _euro_account(self, book: Path) -> None:
+        """A euro source account, plus a counter account any commodity may reach."""
+        book.write_text(book.read_text() + "2026-08-01 open Assets:EurBank EUR\n2026-08-01 open Expenses:Foreign\n")
+
+    def test_an_account_opened_for_one_currency_books_that_currency(self, book: Path, isolated_config: Path) -> None:
+        self._euro_account(book)
+        body = "Date,Description,Amount\n2026-08-02,Cafe Paris,-4.50\n"
+
+        result = csv_result(
+            book,
+            body,
+            "--default-account",
+            "Expenses:Foreign",
+            "--apply",
+            mapping=self.MAPPING,
+            account="Assets:EurBank",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert self._units(book, "Assets:EurBank") == ["-4.50 EUR"]
+
+    def test_a_euro_symbol_posted_to_a_dollar_account_is_refused(self, book: Path, isolated_config: Path) -> None:
+        body = 'Date,Description,Amount\n2026-08-02,Cafe Paris,"-4,50 €"\n'
+        before = book.read_bytes()
+
+        result = csv_result(book, body, mapping=self.MAPPING)
+
+        assert result.exit_code == 2, result.output
+        assert "Row 1" in result.stderr and "(EUR)" in result.stderr and "currency=EUR" in result.stderr
+        assert book.read_bytes() == before
+
+    def test_a_constant_currency_needs_no_column_in_the_bank_file(self, book: Path, isolated_config: Path) -> None:
+        self._euro_account(book)
+        body = 'Date,Description,Amount\n2026-08-02,Cafe Paris,"-4,50 €"\n2026-08-03,London Pub,"-12,00"\n'
+
+        result = csv_result(
+            book,
+            body,
+            "--default-account",
+            "Expenses:Foreign",
+            "--apply",
+            mapping=f"{self.MAPPING},currency=EUR",
+            account="Assets:EurBank",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert self._units(book, "Assets:EurBank") == ["-4.50 EUR", "-12.00 EUR"]
+        assert any("every row posts in EUR" in note for note in json.loads(result.stdout)["data"]["notes"])
+
+    def test_a_currency_column_misspelled_by_case_is_refused_not_a_constant(
+        self, book: Path, isolated_config: Path
+    ) -> None:
+        self._euro_account(book)
+        body = "Date,Description,Amount,Currency\n2026-08-02,Hotel Paris,-120.00,EUR\n"
+        before = book.read_bytes()
+
+        result = csv_result(book, body, "--apply", mapping=f"{self.MAPPING},currency=CURRENCY")
+
+        assert result.exit_code == 2, result.output
+        assert "'CURRENCY'" in result.stderr and "Did you mean 'Currency'?" in result.stderr
+        assert book.read_bytes() == before
+
+    def test_a_constant_the_ledger_does_not_know_is_refused(self, book: Path, isolated_config: Path) -> None:
+        body = "Date,Description,Amount\n2026-08-02,Hotel Paris,-120.00\n"
+        before = book.read_bytes()
+
+        result = csv_result(book, body, "--apply", mapping=f"{self.MAPPING},currency=XYZ")
+
+        assert result.exit_code == 2, result.output
+        assert "currency=XYZ" in result.stderr and "bea add commodity" in result.stderr
+        assert book.read_bytes() == before
+
+    def test_a_declared_commodity_is_a_valid_constant(self, book: Path, isolated_config: Path) -> None:
+        book.write_text(
+            book.read_text()
+            + "2026-08-01 commodity GBP\n2026-08-01 open Assets:Foreign\n2026-08-01 open Expenses:Foreign\n"
+        )
+        body = "Date,Description,Amount\n2026-08-02,London Pub,-12.00\n"
+
+        result = csv_result(
+            book,
+            body,
+            "--default-account",
+            "Expenses:Foreign",
+            "--apply",
+            mapping=f"{self.MAPPING},currency=GBP",
+            account="Assets:Foreign",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert self._units(book, "Assets:Foreign") == ["-12.00 GBP"]
+
+    def test_an_ambiguous_dollar_symbol_is_unchanged(self, book: Path, isolated_config: Path) -> None:
+        body = "Date,Description,Amount\n2026-08-02,Cafe,$4.50\n"
+
+        result = csv_result(book, body, "--apply", mapping=self.MAPPING)
+
+        assert result.exit_code == 0, result.output
+        assert self._units(book, "Assets:Checking") == ["4.50 USD"]

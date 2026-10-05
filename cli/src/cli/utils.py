@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 import re
-import tempfile
+import secrets
+import stat
 import unicodedata
 from datetime import date as Date
 from pathlib import Path
@@ -31,7 +32,29 @@ def single_line(text: str) -> str:
     span. The engine twin (`bea_engine.ledger.text.single_line`) must agree,
     and a test pins that it does.
     """
-    return CONTROL_CHARACTERS.sub(lambda m: f"\\x{ord(m.group()):02x}", re.sub(r"[\r\n]+", " ", text))
+    return _escape_controls(re.sub(r"[\r\n]+", " ", text))
+
+
+def inert_text(text: str) -> str:
+    """The same neutralization for text that is allowed to span several lines.
+
+    A proposed directive and a model's answer are multi-line by nature, so
+    `single_line` would destroy them — but they carry exactly the same hazard
+    that `single_line` exists for, and more sharply: the `ask` approval panel is
+    the only gate between AI-proposed text and the user's books, so the text
+    being approved must not be able to repaint the panel asking about it.
+
+    Line breaks are kept (CRLF and lone CR normalized to LF, so a stray CR
+    cannot return the cursor to the start of the line it was just shown on);
+    every other control character becomes a visible `\\xNN`, as `single_line`
+    does, for the same reason — the oddity stays legible instead of vanishing.
+    """
+    return _escape_controls(re.sub(r"\r\n?", "\n", text))
+
+
+def _escape_controls(text: str) -> str:
+    """Every control character as a visible `\\xNN`. The one place that mapping lives."""
+    return CONTROL_CHARACTERS.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
 
 
 UTF8_BOM = b"\xef\xbb\xbf"
@@ -84,19 +107,38 @@ def fold_account(name: str) -> str:
     account the user can see. Neither side may import the other, and a filter
     applied here must agree with the one applied there.
     """
-    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold())
+    turkish = unicodedata.normalize("NFC", name).replace("İ", "i").replace("ı", "i")
+    return unicodedata.normalize("NFC", turkish.casefold().replace("i\u0307", "i"))
 
 
 def owner_and_name(full_name: str) -> tuple[str, str]:
-    """REST addresses a ledger as `{owner}/{name}` — two segments, exactly."""
+    """REST addresses a ledger as `{owner}/{name}` — two segments, exactly.
+
+    Each segment is checked against the spec's own path-parameter pattern, not
+    just for presence: percent-encoding leaves `.` intact and httpx removes dot
+    segments client-side, so `../account` would otherwise address
+    `/api-gateway/v1/account` — a different endpoint, never a ledger.
+    """
     owner, _, name = full_name.partition("/")
     if not owner or not name or "/" in name:
         raise UsageError(f"'{full_name}' is not a ledger full name; expected 'owner/name'.")
+    if not _LEDGER_OWNER.fullmatch(owner) or owner in {".", ".."}:
+        raise UsageError(
+            f"'{full_name}' is not a ledger full name; the owner '{owner}' must use letters, digits, "
+            "dots, hyphens and underscores, and cannot be '.' or '..'."
+        )
+    if not _LEDGER_NAME.fullmatch(name) or len(name) > _LEDGER_NAME_MAX:
+        raise UsageError(
+            f"'{full_name}' is not a ledger full name; the name '{name}' must use lowercase letters, digits, "
+            f"hyphens and underscores, at most {_LEDGER_NAME_MAX} characters."
+        )
     return owner, name
 
 
-# The server accepts exactly this, in REST v1 and in GraphQL alike. Keep the two
-# in step: a stricter rule here would refuse a name the service would have taken.
+# The server accepts exactly these, in REST v1 and in GraphQL alike (the v1
+# spec's `owner`/`name` path patterns). Keep them in step: a stricter rule here
+# would refuse a name the service would have taken.
+_LEDGER_OWNER = re.compile(r"^[A-Za-z0-9_.-]+$")
 _LEDGER_NAME = re.compile(r"^[a-z0-9_-]+$")
 _LEDGER_NAME_MAX = 100
 
@@ -129,7 +171,15 @@ def snake_keys(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def parse_date(date_str: str) -> Date:
+    """A `YYYY-MM-DD` calendar date only.
+
+    `date.fromisoformat` also reads ISO basic (`20260102`) and week dates
+    (`2026-W01-1` is 2025-12-29), so a typo could start books in another year.
+    The engine holds JSON dates to the same rule (`bea_engine.ledger.text`).
+    """
     try:
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date_str):
+            raise ValueError(date_str)
         return Date.fromisoformat(date_str)
     except ValueError as err:
         raise typer.BadParameter(f"Invalid date '{date_str}'. Use YYYY-MM-DD format.") from err
@@ -141,21 +191,44 @@ def parse_opt_date(date_str: str | None) -> Date | None:
     return parse_date(date_str)
 
 
-def atomic_write(path: Path, content: str) -> None:
-    """Replace `path` with `content` without a half-written file."""
+def atomic_write(path: Path, content: str, *, export: bool = False) -> None:
+    """Replace atomically; exports preserve modes and follow destination links.
+
+    Internal configuration remains private. Export creation lets the OS apply
+    the umask, avoiding any process-wide mask change while other threads run.
+    """
+    if export:
+        path = path.resolve()
     try:
-        mode = path.stat().st_mode
+        status = path.stat()
     except FileNotFoundError:
         mode = None
+    else:
+        if export and not stat.S_ISREG(status.st_mode):
+            # A device or FIFO (`-o /dev/null`) cannot be staged beside: its
+            # directory is not ours to write, and replacing it would swap the
+            # device for a regular file. There is nothing to keep atomic.
+            with path.open("w", encoding="utf-8") as stream:
+                stream.write(content)
+            return
+        mode = stat.S_IMODE(status.st_mode)
     if mode is not None and not mode & 0o222:
         raise PermissionError(f"Output file is read-only: {path}")
-    fd, name = tempfile.mkstemp(prefix=".bea-", suffix=".tmp", dir=path.parent)
-    candidate = Path(name)
+    creation_mode = 0o666 if export and mode is None else 0o600
+    while True:
+        candidate = path.parent / f".bea-{secrets.token_hex(8)}.tmp"
+        try:
+            fd = os.open(candidate, os.O_RDWR | os.O_CREAT | os.O_EXCL, creation_mode)
+            break
+        except FileExistsError:
+            continue
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+        if export and mode is not None:
+            candidate.chmod(mode)
         os.replace(candidate, path)
     finally:
         candidate.unlink(missing_ok=True)

@@ -4,6 +4,7 @@ import { PullRequestService } from "../pull-request-service";
 jest.mock("@/shared/logger", () => ({
   logger: {
     error: jest.fn(),
+    warn: jest.fn(),
     child: jest.fn().mockReturnValue({
       error: jest.fn(),
       warn: jest.fn(),
@@ -20,6 +21,7 @@ type MockGiteaClient = {
     repoDownloadPullDiffOrPatch: jest.Mock;
     repoGetBranch: jest.Mock;
     repoCreateBranch: jest.Mock;
+    repoDeleteBranch: jest.Mock;
     repoGetContents: jest.Mock;
     repoUpdateFile: jest.Mock;
     repoCreateFile: jest.Mock;
@@ -55,6 +57,7 @@ describe("PullRequestService", () => {
         repoDownloadPullDiffOrPatch: jest.fn().mockResolvedValue({ data: "" }),
         repoGetBranch: jest.fn(),
         repoCreateBranch: jest.fn(),
+        repoDeleteBranch: jest.fn().mockResolvedValue({ data: null }),
         repoGetContents: jest.fn(),
         repoUpdateFile: jest.fn(),
         repoCreateFile: jest.fn(),
@@ -164,7 +167,32 @@ describe("PullRequestService", () => {
 
       await expect(
         service.createPRFromPatch(identity, owner, repo, input),
-      ).rejects.toThrow("Base branch 'main' not found");
+      ).rejects.toMatchObject({ category: "NOT_FOUND" });
+    });
+
+    it("maps the client's thrown 404 for the base branch to NOT_FOUND before creating anything", async () => {
+      // The generated client throws the response itself for an unknown branch.
+      mockClient.repos.repoGetBranch.mockRejectedValue({
+        status: 404,
+        error: { message: "branch does not exist [name: main]" },
+      });
+
+      const failure = await service
+        .createPRFromPatch(identity, owner, repo, input)
+        .catch((error: unknown) => error);
+      expect(failure).toMatchObject({ category: "NOT_FOUND" });
+      expect((failure as Error).message).toContain("main");
+      expect(mockClient.repos.repoCreateBranch).not.toHaveBeenCalled();
+    });
+
+    it("does not relabel another base-branch failure as not found", async () => {
+      mockClient.repos.repoGetBranch.mockRejectedValue({ status: 502 });
+
+      const failure = await service
+        .createPRFromPatch(identity, owner, repo, input)
+        .catch((error: unknown) => error);
+      expect(failure).not.toMatchObject({ category: "NOT_FOUND" });
+      expect(mockClient.repos.repoCreateBranch).not.toHaveBeenCalled();
     });
 
     it.each([
@@ -194,10 +222,76 @@ describe("PullRequestService", () => {
 
       await expect(
         service.createPRFromPatch(identity, owner, repo, input),
-      ).rejects.toThrow(/No differences between main \(base-sha\) and \S+ \(head-sha\)/);
-      expect(
-        mockClient.repos.repoCreatePullRequest,
-      ).not.toHaveBeenCalled();
+      ).rejects.toThrow(
+        /No differences between main \(base-sha\) and \S+ \(head-sha\)/,
+      );
+      expect(mockClient.repos.repoCreatePullRequest).not.toHaveBeenCalled();
+    });
+
+    it("refuses empty changes before creating a branch", async () => {
+      mockSuccessfulCreate();
+
+      await expect(
+        service.createPRFromPatch(identity, owner, repo, {
+          ...input,
+          changes: [],
+        }),
+      ).rejects.toMatchObject({ category: "BAD_USER_INPUT" });
+      expect(mockClient.repos.repoGetBranch).not.toHaveBeenCalled();
+      expect(mockClient.repos.repoCreateBranch).not.toHaveBeenCalled();
+    });
+
+    it("deletes the branch it created when the diff turns out empty", async () => {
+      mockSuccessfulCreate();
+      mockClient.repos.repoCompareDiff.mockResolvedValue({
+        data: { total_commits: 0 },
+      });
+
+      await expect(
+        service.createPRFromPatch(identity, owner, repo, input),
+      ).rejects.toMatchObject({ category: "BAD_USER_INPUT" });
+      const created =
+        mockClient.repos.repoCreateBranch.mock.calls[0][2].new_branch_name;
+      expect(mockClient.repos.repoDeleteBranch).toHaveBeenCalledTimes(1);
+      expect(mockClient.repos.repoDeleteBranch).toHaveBeenCalledWith(
+        owner,
+        repo,
+        created,
+      );
+    });
+
+    it("deletes the branch when a later step fails, and reports that failure", async () => {
+      mockSuccessfulCreate();
+      mockClient.repos.repoCreatePullRequest.mockRejectedValue({
+        status: 422,
+        error: { message: "pull request already exists" },
+      });
+      // A cleanup that itself fails must not replace the original failure.
+      mockClient.repos.repoDeleteBranch.mockRejectedValue({ status: 500 });
+
+      await expect(
+        service.createPRFromPatch(identity, owner, repo, input),
+      ).rejects.toThrow(/pull request already exists/);
+      expect(mockClient.repos.repoDeleteBranch).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the branch of a pull request that was opened", async () => {
+      mockSuccessfulCreate();
+
+      await service.createPRFromPatch(identity, owner, repo, input);
+      expect(mockClient.repos.repoDeleteBranch).not.toHaveBeenCalled();
+    });
+
+    it("does not try to delete a branch that was never created", async () => {
+      mockClient.repos.repoGetBranch.mockResolvedValue({
+        data: { name: "main", commit: { id: "base-sha" } },
+      });
+      mockClient.repos.repoCreateBranch.mockRejectedValue({ status: 500 });
+
+      await expect(
+        service.createPRFromPatch(identity, owner, repo, input),
+      ).rejects.toThrow();
+      expect(mockClient.repos.repoDeleteBranch).not.toHaveBeenCalled();
     });
 
     it("requests parsed bodies from the generated client on every call", async () => {
@@ -275,7 +369,35 @@ describe("PullRequestService", () => {
 
       await expect(
         service.getPRDetails(identity, owner, repo, prNumber),
-      ).rejects.toThrow("Pull request #42 not found");
+      ).rejects.toMatchObject({ category: "NOT_FOUND" });
+    });
+
+    it("maps the client's thrown 404 response to NOT_FOUND", async () => {
+      // The generated client throws the response itself, not an Error.
+      mockClient.repos.repoGetPullRequest.mockRejectedValue({
+        status: 404,
+        error: { message: "pull request does not exist [id: 0]" },
+      });
+
+      const failure = await service
+        .getPRDetails(identity, owner, repo, prNumber)
+        .catch((error: unknown) => error);
+      expect(failure).toMatchObject({ category: "NOT_FOUND" });
+      expect((failure as Error).message).toContain("42");
+      expect((failure as Error).message).not.toContain("Unknown error");
+    });
+
+    it("keeps any other upstream failure internal, without its detail", async () => {
+      mockClient.repos.repoGetPullRequest.mockRejectedValue({
+        status: 502,
+        error: { message: "upstream detail" },
+      });
+
+      const failure = await service
+        .getPRDetails(identity, owner, repo, prNumber)
+        .catch((error: unknown) => error);
+      expect(failure).toMatchObject({ category: "INTERNAL_SERVER_ERROR" });
+      expect((failure as Error).message).not.toContain("upstream detail");
     });
   });
 
@@ -310,6 +432,46 @@ describe("PullRequestService", () => {
 
       expect(result.success).toBe(true);
       expect(result.message).toBe("PR closed successfully");
+    });
+  });
+
+  describe.each([
+    ["mergePR", "repoMergePullRequest"],
+    ["closePR", "repoEditPullRequest"],
+  ] as const)("%s failures", (method, clientCall) => {
+    it("throws NOT_FOUND for a pull request number Gitea does not know", async () => {
+      // The generated client throws the response itself, not an Error.
+      mockClient.repos[clientCall].mockRejectedValue({ status: 404 });
+
+      const failure = await service[method](identity, "o", "r", 999999).catch(
+        (error: unknown) => error,
+      );
+      expect(failure).toMatchObject({ category: "NOT_FOUND" });
+      expect((failure as Error).message).toContain("999999");
+    });
+
+    it("keeps any other refusal as a described success:false result", async () => {
+      mockClient.repos[clientCall].mockRejectedValue({
+        status: 405,
+        error: { message: "pull request is not mergeable" },
+      });
+
+      const result = await service[method](identity, "o", "r", 42);
+      expect(result).toEqual({
+        success: false,
+        message: "Gitea 405: pull request is not mergeable",
+      });
+    });
+
+    it("keeps an Error's own message", async () => {
+      mockClient.repos[clientCall].mockRejectedValue(
+        new Error("PR is no longer open"),
+      );
+
+      expect(await service[method](identity, "o", "r", 42)).toEqual({
+        success: false,
+        message: "PR is no longer open",
+      });
     });
   });
 });

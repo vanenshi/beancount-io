@@ -55,7 +55,9 @@ There is no automatic categorization model or hosted request in this command.
 For split ledgers, add `--into 2026.bean` to write an included file while
 `--file books/main.bean` continues to identify the validation root. The
 destination is relative to the root ledger's directory and must already be
-included. The preview's `into` and diff identify the actual destination.
+included by a literal path or glob. The preview's `into` and diff identify the
+actual destination. If it does not exist, a successful `--apply` creates it;
+previews, rejected imports, and imports with nothing new leave it absent.
 
 ## CSV without an importer (`--csv`)
 
@@ -69,22 +71,50 @@ reference:
 `narration`, which keeps the payee field free for the merchant that
 payee-based reporting groups by. `id` and `currency` are optional. Amounts
 take either `amount=Column` or the `debit=A,credit=B` pair (exactly one of the
-two): with the pair, exactly one cell per row must be filled, debits post
-negative. Amount, debit, and credit cells must use decimal notation (`1000`,
+two). With the pair, the *column* decides the direction and the cell supplies
+only the magnitude: a debit posts negative and a credit positive however the
+bank signed the cell, so a `Money Out` column printed `-4.50` still posts
+`-4.50`. A column that mixes non-zero signs is refused naming the column and
+the two disagreeing rows — map it as `amount=` instead, where the sign *is* the
+direction. Exactly one cell per row must be filled, and a cell that parses to
+zero counts as empty, so the `Debit=30.00,Credit=0.00` shape banks zero-fill
+imports as `-30.00`. Amount, debit, and credit cells must use decimal notation (`1000`,
 not `1e3`); a notation error names the row and column before anything is written.
 Cells may carry currency symbols (`$4.50`, `4,50 €`), thousands separators,
-accounting parentheses or a trailing minus for negatives, and comma decimals —
+accounting parentheses or a trailing minus for negatives (one marker per cell:
+`(-5.00)` is refused rather than read as `+5.00`), and comma decimals —
 the point-vs-comma convention is resolved from the whole column, and a column
-mixing `1,000.00` with `1.000,00` is refused rather than guessed. `NaN` and
+mixing `1,000.00` with `1.000,00` is refused rather than guessed. A lone
+`1,234` stays a thousands group, but `0,125` and `1613,030` cannot be one,
+so they import as `0.125` and `1613.030`. `NaN` and
 `Infinity` are blocked at preview time with the row named, so `--apply` can
 never write them. A failed parse names the cell, the row, and the accepted
 spellings.
 Amounts default to bank sign (outflows negative); add `sign=ledger`
-when the export uses the opposite convention. The currency defaults to the
-ledger's single operating currency. `--account` names the source account and
-is required. The file may start with a BOM; header cells are stripped before
+when the export uses the opposite convention. A row's commodity is resolved in
+this order: the `currency=` column, then the source account's own currency when
+its `open` directive names exactly one, then the ledger's single
+`operating_currency`; with none of the three, the row is refused. `currency=`
+also takes a commodity name the file has no column for — `--csv
+…,currency=EUR` — for an export that never states its own currency. Such a
+constant must be a commodity the ledger already knows (declared with
+`commodity`, named by an `open`, posted, priced, or the operating currency),
+and the preview notes that every row posts in it; a value that differs from a
+header only by case (`currency=CURRENCY` for a `Currency` column) is refused
+with the header it probably meant, as is any other mistyped column. A
+currency cell must be exactly one commodity name (`USD`, `VFIAX`, `NT.TO`);
+anything else — a space, a comma, a line break — is refused naming the row and
+column before the preview, and nothing is written. A cell
+carrying a symbol that names exactly one commodity (`€`, `£`, `₹`, …) and
+contradicts the resolved currency is refused naming the row and the symbol,
+rather than relabelled; `$` and `¥` name several commodities each and are
+accepted as before. `--account` names the source account and
+is required. The file may start with a BOM and with blank lines before the
+header (error line numbers still count them); header cells are stripped before
 matching. Field separators are detected from the header among comma,
-semicolon, tab, and pipe; pass `--delimiter ','`, `--delimiter ';'`, or
+semicolon, tab, and pipe — the one on which the header and the first rows
+split into the same number of fields, so quoted `;` or dates like
+`Jan 05, 2026` cannot outvote the real separator; pass `--delimiter ','`, `--delimiter ';'`, or
 `--delimiter tab` to force one — or `delimiter=';'` inside `--csv` itself.
 Files read as UTF-8 (with or without a BOM) unless `--csv encoding=` names
 cp1252 or latin-1 — Windows exports with accented payees need
@@ -92,7 +122,10 @@ cp1252 or latin-1 — Windows exports with accented payees need
 and then infers the mapping like `auto`. Without the key, a non-UTF-8 file
 fails before anything is read: the error names the byte offset and, when the
 file decodes as cp1252, says so with the override to pass. A file no
-candidate decodes lists the encodings tried instead. Unknown fields, missing columns, bad dates, and bad amounts fail
+candidate decodes lists the encodings tried instead. UTF-16 text (Excel's
+"Unicode Text", recognized by its byte-order mark or NUL bytes) is refused
+under any `encoding=` with a request to re-save it as UTF-8, and a `--rules`
+file may start with a UTF-8 BOM. Unknown fields, missing columns, bad dates, and bad amounts fail
 with the row number and column name, as `Row 2 (line 5)`: the row is the one
 the preview's `ROW` column shows, and the physical file line follows it for
 hand-editing. Rows whose mapped cells are all empty or
@@ -111,7 +144,13 @@ Rows that would post to an account the ledger never opened — or a currency
 the open directive disallows — are shown `blocked`, not ready: the row names
 the missing account and the `bea add open` line that fixes it, stays in the
 diff so the proposal stays visible, and `--apply` refuses with exit **4**
-while any row is blocked.
+while any row is blocked. A currency mismatch offers the currency setting
+first and widening the `open` directive last: widening it would book the
+foreign amounts as the wrong commodity. An account under a root the ledger
+does not use (`Foo:Bar`; the roots are its `name_*` options) can never be
+opened: `--account`, `--default-account`, and rule accounts naming one exit
+**2**, a category cell naming one queues the row for review, and an importer
+posting to one is blocked without an `add open` suggestion.
 
 ### Reading the header row
 
@@ -127,7 +166,9 @@ role unmapped rather than guessing. `Description`-style headers map to
 `--date-format` is likewise read from the file when unset: bea keeps the one
 `strptime` format that parses every date in the column. A column whose days
 never pass the twelfth cannot distinguish `%m/%d/%Y` from `%d/%m/%Y`, and bea
-says so instead of choosing quietly. Anything read this way is printed as the
+says so instead of choosing quietly. When no known format reads the whole
+column, the error names the row whose date ruled out the last one; correct
+that cell or pass `--date-format`. Anything read this way is printed as the
 equivalent flags, so a wrong reading is visible in the preview that writes
 nothing. An option you type always wins over one bea read or remembered.
 
@@ -138,8 +179,9 @@ described under [Duplicate decisions](#duplicate-decisions).
 ### Categorization rules (`--rules`)
 
 A TOML rules file categorizes rows by regex over three fields — payee,
-narration, then the category label (case-insensitive); the first matching
-rule wins:
+narration, then the category label (case-insensitive, with pattern and text
+compared NFC-normalized, so a composed `café` matches a decomposed one); the
+first matching rule wins:
 
 ```toml
 [[rule]]
@@ -149,8 +191,10 @@ account = "Expenses:Groceries"
 
 See the bundled [rules example](examples/rules.toml). Each entry needs
 `match` and `account`; a bad regex or a file without a `[[rule]]` list fails
-naming the rule number. An empty or whitespace-only `match` is refused —
-write `match = ".*"` for an explicit catch-all. Rules beat a `category`
+naming the rule number. An empty or whitespace-only `match` is refused, and
+so is any pattern that matches empty text (a trailing `|` as in
+`"whole foods|"`, `(cafe)?`), since it would match every row — write
+`match = ".*"` for an explicit catch-all. Rules beat a `category`
 column, and also match its labels: a rule pattern matching a bank's own
 label categorizes the row before the category column is considered. An
 explicit `category=Column` mapping, or a `Category` header when unmapped,
@@ -181,8 +225,11 @@ bea --file books/main.bean import category.csv --csv date=Date,amount=Amount,nar
 
 The mapping is remembered per root ledger, CSV header row, and source account,
 along with the `--rules` path, `--default-account`, an explicit
-`--date-format`, and the delimiter — but never `sign=`, which always needs an
-explicit pass. When only one account uses those headers, the next import needs
+`--date-format`, and the delimiter — but never `sign=`, which a different file
+always needs passed explicitly. The one exception keeps a preview honest: after
+`sign=ledger`, a flag-free `--apply` of the byte-identical file re-applies it
+and says so; another file sharing the header is read bank-signed, with a note
+naming the file that used `sign=ledger`. When only one account uses those headers, the next import needs
 no flags. If checking and savings exports share headers, their mappings are
 kept separately and subsequent previews and applies require
 `--account ACCOUNT`; bea refuses to choose between them. Always specify
@@ -193,14 +240,18 @@ For a remembered mapping, human output reports
 `Using remembered settings for <file>` (or `Using settings remembered from
 <seeding file> for <file>`) listing every setting in force, and JSON reports
 `config_source` `remembered --csv` plus a `remembered` object with the same
-fields (`null` when the run used no memory). An explicit `--csv` run replaces
-the remembered settings; settings it drops are named, never silently
-discarded. Only a `--date-format` you passed is remembered, and even that is
-re-validated per file: when the new export unambiguously uses another
-convention, the import refuses and names the expected format, since two
+fields (`null` when the run used no memory). A successful explicit `--csv`
+preview or apply replaces the remembered settings; settings it drops are named,
+never silently discarded. Failed runs leave the saved settings unchanged,
+including an apply rejected for review with exit 4. A successful preview can
+remember its mapping even when some rows need review. Only a `--date-format`
+you passed is remembered, and even that is re-validated per file: when the new
+export unambiguously uses another convention, the import refuses and names the
+expected format, since two
 exports can share a header row without sharing a date convention. A
 remembered `--rules` path that is missing or unreadable degrades to a warning
-and an unruled import rather than failing. A changed header row matches
+and an unruled import rather than failing; that repair is saved only after a
+successful preview or apply. A changed header row matches
 nothing remembered, and bea falls back to reading that header directly.
 
 ## A Python importer (`--config`)
@@ -230,8 +281,9 @@ includes the path in `config` and its source in `config_source`.
 If multiple importers recognize the export, select one with `--importer NAME`.
 An unknown name lists the available importer names; a recognized name whose
 importer rejects the file reports that separately.
-The configuration can import sibling modules. Importer output is captured in
-the preview's `importer_output` field so it does not corrupt JSON.
+The configuration can import sibling modules. Importer output — including what a child
+process it runs prints — is captured in the preview's `importer_output` field
+so it does not corrupt JSON.
 For importer exceptions, put `--debug` before the command to see the traceback:
 
 ```bash norun
@@ -270,7 +322,7 @@ configuration; the CLI calls the current interface directly.
 
 ## Duplicate decisions
 
-`bea import` follows the [`import-id` convention](../../../skills/.claude/skills/beancount-import/references/dedup.md),
+`bea import` follows the [`import-id` convention](../../skills/.claude/skills/beancount-import/references/dedup.md),
 so entries written by the CLI and by the `beancount-import` / `beancount-migrate`
 skills deduplicate against each other: the ledger itself is the dedup database.
 
@@ -282,8 +334,11 @@ skills deduplicate against each other: the ledger itself is the dedup database.
   `--id-key id` is accepted as an alias for `bank_id`, the canonical key the
   `--csv` path writes, so it never silently disables bank-ID dedupe.
   IDs must be stable and unique within that account. An exact match is skipped;
-  reused native IDs with different dates, payees, narration, or source amounts
-  are conflicts requiring review (generated ids: see below). The preview's `ID` column names each row's
+  reused native IDs with different source amounts or commodities are conflicts
+  requiring review. An ID repeated within one export with different data is a
+  conflict too; it names the earlier row of the import, and the fix is in the
+  source file rather than the ledger. Payee, narration, date, flag, and counter-account edits do
+  not change that identity (generated ids: see below). The preview's `ID` column names each row's
   identifier source: `bank` for a bank column, `hash` for a content hash, or
   `importer` for an `import-id` the importer supplied.
 - A row with a native ID is written with `import-id: "<kind>:<id>"` (`bank_id`
@@ -293,8 +348,10 @@ skills deduplicate against each other: the ledger itself is the dedup database.
   exact source amount with its commodity and trailing zeros stripped
   (`-54.2 USD`), the narration (or payee when
   narration is empty) uppercased with whitespace collapsed, and the source
-  account. Identical rows within one file take an occurrence suffix, so
-  re-importing the same file skips every row. Keep this metadata when editing
+  account. A row with both a payee and a narration hashes both, as
+  `date|amount|payee|narration|account`, so rows that differ only in payee
+  keep distinct ids however the export orders them. Identical rows within one
+  file take an occurrence suffix, so re-importing the same file skips every row. Keep this metadata when editing
   entries. New writes no longer carry the pre-release `bea_import_id` key, but
   existing entries with it still match on re-import.
 - A generated id matches by its digest under any documented prefix, so a bank
@@ -302,19 +359,30 @@ skills deduplicate against each other: the ledger itself is the dedup database.
   `monarch:sha256:…` (or `mint:`/`qbo:`) is skipped rather than written
   again. For each side of a merged transfer, the digest is found through
   `import-id` or `import-id-2`. The digest already binds the date, amount,
-  description, and account, so a generated-id hit is a duplicate when its date
-  and source amounts agree, even if migration or cleanup changed the payee or
-  narration.
+  description, and account of the original source row, so a canonical
+  generated-id hit is a duplicate even if the ledger's date, amounts, payee, or
+  narration were edited later. Preserve the ID while reviewing an entry; it
+  records where that entry came from, not its current presentation. A canonical
+  hit also takes precedence over older file IDs retained on the same entry.
 - Ids written before the amount was exact (it was rounded to two decimals with
-  no commodity) or before the description was NFC-normalized are still
+  no commodity, or later to 28 significant digits) or before the description
+  was NFC-normalized are still
   recognized: import offers every older spelling as a lookup-only key, matches
   it, and writes only the current one, so no re-hash pass is needed. An older
-  *amount* digest also has to agree with the whole source row before it counts
+  *amount* digest also has to agree with the date and source amounts before it counts
   as a match, because that form was lossy enough to give two different rows one
   digest — a disagreement is ignored rather than reported as a conflict. A
-  reused **native** bank ID whose data changed is still a conflict.
+  reused **native** bank ID with different source amounts or commodities is
+  still a conflict.
+- Ids written before payees were hashed (narration only) also stay
+  lookup-only. Because their occurrence suffixes followed the old export's row
+  order, every such id that a group of same-narration rows reaches is given to
+  the row with that entry's payee; an id whose payee no row has (edited since)
+  stays with the row at its old position.
 - Date, normalized payee, and signed source amount/currency identify a *possible*
-  duplicate even when bank IDs or narration differ. This does not prove
+  duplicate even when bank IDs or narration differ. A row with no payee (the
+  one-description mapping) is compared by its normalized narration instead, so
+  two different same-day purchases of one amount are both new. This does not prove
   duplication: two real purchases can have identical details. `--apply` requires
   `--duplicates skip` or `--duplicates include`; choose include to preserve
   legitimate repeated purchases. Review the rows before choosing;

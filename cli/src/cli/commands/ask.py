@@ -44,10 +44,16 @@ def ask(
     if ctx.json_output:
         raise UsageError("bea ask has no JSON output. Use 'bea query' for machine-readable results.")
 
+    question = question or ""
+    if not question.strip():
+        if print_mode or ctx.no_input:
+            raise UsageError("A question is required without a terminal (or with --print).")
+        question = ""
+
     # The missing extra is checked before the credential: without it the
     # command cannot run at all, and "log in first" would be misleading advice.
     try:
-        from cli.ask.agent import BqlDeps, make_agent, translated_failures
+        from cli.ask.agent import BqlDeps, make_agent, translated_failures, usage_limits
     except ImportError as exc:
         raise UsageError(_MISSING_EXTRA) from exc
 
@@ -68,15 +74,20 @@ def ask(
     deps = BqlDeps(file=file, skills={s.name: s for s in skills}, into=into)
 
     if print_mode or ctx.no_input:
-        if not question:
-            raise UsageError("A question is required without a terminal (or with --print).")
         from rich.console import Console
         from rich.markdown import Markdown
 
+        from cli.utils import inert_text
+
         console = Console()
-        with console.status("[dim]Thinking…[/dim]", spinner="dots"), translated_failures():
-            result = agent.run_sync(question, deps=deps)
-        console.print(Markdown(result.output))
+        with console.status("[dim]Thinking…[/dim]", spinner="dots"), translated_failures(deps):
+            result = agent.run_sync(question, deps=deps, usage_limits=usage_limits())
+        # The answer is model-controlled text on its way to a terminal, so it
+        # obeys the same invariant as every other untrusted string the CLI
+        # prints (w3/392): no control character reaches the screen raw. Rich
+        # would otherwise emit one itself — an OSC 8 hyperlink whose visible
+        # text the model chose — so a link is rendered with its target shown.
+        console.print(Markdown(inert_text(result.output), hyperlinks=False))
     else:
         from cli.ask.repl import print_welcome, run_repl
 

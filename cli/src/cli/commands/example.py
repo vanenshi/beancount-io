@@ -10,6 +10,7 @@ import typer
 
 from cli.engine import launch
 from cli.errors import ConflictError, UsageError, refuse_json
+from cli.output import forwarded_option
 
 _FORCE = "--force"
 
@@ -21,32 +22,11 @@ def _split_output(args: list[str]) -> tuple[list[str], Path | None, bool]:
     `-o`/`--output` stays, since upstream is what writes it. Only an existing
     destination needs refusing — a fresh path is upstream's normal case.
     """
-    forwarded: list[str] = []
-    output: Path | None = None
-    force = False
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--":
-            forwarded.extend(args[index:])
-            break
-        if arg == _FORCE:
-            force = True
-            index += 1
-            continue
-        if arg in ("-o", "--output"):
-            if index + 1 < len(args):
-                output = Path(args[index + 1])
-                forwarded.extend(args[index : index + 2])
-                index += 2
-                continue
-        elif arg.startswith("--output="):
-            output = Path(arg.split("=", 1)[1])
-        elif arg.startswith("-o") and len(arg) > 2:
-            output = Path(arg[2:])
-        forwarded.append(arg)
-        index += 1
-    return forwarded, output, force
+    stop = args.index("--") if "--" in args else len(args)
+    force = _FORCE in args[:stop]
+    forwarded = [arg for index, arg in enumerate(args) if arg != _FORCE or index > stop]
+    value = forwarded_option(forwarded, "-o", "--output")
+    return forwarded, None if value is None else Path(value), force
 
 
 def example(ctx: typer.Context) -> None:
@@ -67,11 +47,19 @@ def example(ctx: typer.Context) -> None:
         sys.stderr.write(completed.stderr)
 
 
-def _check_date_order(args: list[str]) -> None:
-    """Refuse an inverted `--date-begin`/`--date-end` before upstream dies on it.
+#: The shortest range bean-example reliably generates. Its rules schedule
+#: monthly entries, and a shorter range crashes it with IndexError or
+#: StopIteration (30 days still fails for some seeds; 31 never did).
+_MIN_SPAN_DAYS = 31
 
-    Only ISO dates both sides can read are compared; anything else passes
-    through to upstream's own parsing.
+
+def _check_date_order(args: list[str], today: date | None = None) -> None:
+    """Refuse a date range bean-example cannot generate before upstream dies on it.
+
+    A missing side takes upstream's default (January 1 two years back, and
+    today), so a lone `--date-end` in the past or `--date-begin` in the
+    future is caught as inverted too. Only ISO dates are compared; anything
+    else passes through to upstream's own parsing.
     """
     values: dict[str, str] = {}
     index = 0
@@ -88,12 +76,20 @@ def _check_date_order(args: list[str]) -> None:
         elif arg.startswith("--date-end="):
             values["--date-end"] = arg.split("=", 1)[1]
         index += 1
-    try:
-        begin = date.fromisoformat(values["--date-begin"])
-        end = date.fromisoformat(values["--date-end"])
-    except (KeyError, ValueError):
+    if not values:
         return
+    today = today or date.today()
+    try:
+        begin = date.fromisoformat(values["--date-begin"]) if "--date-begin" in values else date(today.year - 2, 1, 1)
+        end = date.fromisoformat(values["--date-end"]) if "--date-end" in values else today
+    except ValueError:
+        return
+    shown_begin = f"--date-begin {begin.isoformat()}" + ("" if "--date-begin" in values else " (default)")
+    shown_end = f"--date-end {end.isoformat()}" + ("" if "--date-end" in values else " (default: today)")
     if begin > end:
+        raise UsageError(f"{shown_begin} is after {shown_end}; begin must be on or before end.")
+    if (end - begin).days < _MIN_SPAN_DAYS:
         raise UsageError(
-            f"--date-begin {begin.isoformat()} is after --date-end {end.isoformat()}; begin must be on or before end."
+            f"{shown_begin} to {shown_end} spans {(end - begin).days} days; "
+            f"bean-example needs at least {_MIN_SPAN_DAYS}."
         )

@@ -37,6 +37,7 @@ vi.mock("@tanstack/react-router", async (importOriginal) => ({
     </a>
   ),
   useParams: () => ({ ledgerOwner: "demo", ledgerName: "empty" }),
+  useLoaderData: () => ({}),
 }));
 
 vi.mock("@/common/hooks/use-ledger-search-params", () => ({
@@ -152,7 +153,7 @@ describe("LedgerOverviewPage empty state", () => {
     );
   });
 
-  it("uses Income Statement as the primary overview shortcut", () => {
+  it("leaves page navigation to the sidebar instead of header shortcuts", () => {
     render(<LedgerOverviewPage />);
 
     const shortcuts = screen
@@ -161,21 +162,11 @@ describe("LedgerOverviewPage empty state", () => {
     const shortcutFor = (to: string) =>
       shortcuts.find((link) => link.getAttribute("data-to") === to);
 
-    const incomeStatementShortcut = shortcutFor(
-      "/ledger/$ledgerOwner/$ledgerName/income-statement",
-    );
-    expect(incomeStatementShortcut).toHaveTextContent("Income Statement");
-    expect(incomeStatementShortcut).toHaveClass("bg-primary");
-
-    const journalShortcut = shortcutFor(
-      "/ledger/$ledgerOwner/$ledgerName/journal",
-    );
-    expect(journalShortcut).toHaveTextContent("Journal");
-    expect(journalShortcut).toHaveClass("bg-secondary");
-
-    expect(
-      shortcutFor("/ledger/$ledgerOwner/$ledgerName/balance-sheet"),
-    ).toBeUndefined();
+    for (const page of ["income-statement", "journal", "query"]) {
+      expect(
+        shortcutFor(`/ledger/$ledgerOwner/$ledgerName/${page}`),
+      ).toBeUndefined();
+    }
   });
 });
 

@@ -58,6 +58,7 @@ export const bg: Translations = {
   openInBrowser: "Отвори в браузър",
   shareLink: "Сподели връзка",
   copyLink: "Копирай връзка",
+  drawerCurrentLedger: "Текуща счетоводна книга",
   drawerNew: "Нова",
   drawerLedgerActions: "Действия за {{name}}",
   drawerPrivateLinkHint:
@@ -409,7 +410,7 @@ export const bg: Translations = {
   receiptRevealHint:
     "Още нищо не е запазено — проверете подробностите на следващия екран.",
   total: "Общо",
-  receiptQuotaExhausted: "Квотата за ИИ е изчерпана. Надградете плана си.",
+  receiptQuotaExhausted: "Квотата за ИИ е изчерпана.",
   receiptParseFailed: "Бележката не можа да бъде разчетена. Опитайте отново.",
   receiptUploadFailed: "Качването е неуспешно. Опитайте отново.",
   receiptCameraPermission:
@@ -535,7 +536,7 @@ export const bg: Translations = {
     "Прегледах книгата ти, но изчерпах стъпките, преди да отговоря. По-конкретен въпрос обикновено помага.",
   agentQuotaTitle: "Месечният лимит за ИИ е достигнат",
   agentQuotaBody:
-    "Изчерпа ИИ лимита за този месец. Той се възстановява следващия месец или можеш да надградиш плана си.",
+    "Изчерпа ИИ лимита за този месец. Той се възстановява следващия месец.",
   agentApprovalTitle: "Потвърди в уеб версията",
   agentApprovalBody:
     "Тази промяна трябва да бъде прегледана, преди да засегне книгата ти, а приложението още не може да покаже пълната разлика. Отвори книгата в beancount.io, за да я потвърдиш.",
@@ -563,7 +564,7 @@ export const bg: Translations = {
   createLedgerTemplateSampleHint:
     "Примерни транзакции, за да разгледате приложението.",
   createLedgerTierLimit:
-    "Достигнахте лимита за книги в плана си. Надградете или архивирайте книга, за да създадете друга.",
+    "Достигнат е лимитът за книги. Не може да се създаде друга книга.",
   createLedgerGenericError:
     "Книгата не можа да бъде създадена. Опитайте отново.",
   createLedgerDrawerRow: "Нова книга",
@@ -593,4 +594,7 @@ export const bg: Translations = {
   breakdownRowShare: "{{amount}}, {{percent}}% от общото",
   budgetChartSummary:
     "Бюджет спрямо действителни за {{span}}. Действителни {{actual}} от бюджет {{budget}} за {{count}} периода, {{over}} над целта.",
+  feedSourceLedger: "Счетоводна книга",
+  feedSourceBlog: "Блог",
+  feedSourceRelease: "Издание",
 };

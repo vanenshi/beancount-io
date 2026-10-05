@@ -34,17 +34,23 @@ function readStoredLayout(storageKey: string): string {
   }
 }
 
-function parseStoredLayout(raw: string): DashboardLayout {
-  if (!raw) return DEFAULT_DASHBOARD_LAYOUT;
+function parseStoredLayout(
+  raw: string,
+  defaultLayout: DashboardLayout,
+): DashboardLayout {
+  if (!raw) return defaultLayout;
   try {
-    return normalizeDashboardLayout(JSON.parse(raw));
+    return normalizeDashboardLayout(JSON.parse(raw), defaultLayout);
   } catch {
-    return DEFAULT_DASHBOARD_LAYOUT;
+    return defaultLayout;
   }
 }
 
-export function normalizeDashboardLayout(value: unknown): DashboardLayout {
-  if (!value || typeof value !== "object") return DEFAULT_DASHBOARD_LAYOUT;
+export function normalizeDashboardLayout(
+  value: unknown,
+  defaultLayout = DEFAULT_DASHBOARD_LAYOUT,
+): DashboardLayout {
+  if (!value || typeof value !== "object") return defaultLayout;
   const candidate = value as Partial<DashboardLayout>;
   const known = new Set<DashboardWidgetId>(DASHBOARD_WIDGET_IDS);
   const suppliedOrder = Array.isArray(candidate.order)
@@ -54,7 +60,7 @@ export function normalizeDashboardLayout(value: unknown): DashboardLayout {
       )
     : [];
   const deduplicatedOrder = Array.from(new Set(suppliedOrder));
-  const missing = DASHBOARD_WIDGET_IDS.filter(
+  const missing = defaultLayout.order.filter(
     (id) => !deduplicatedOrder.includes(id),
   );
   const hidden = Array.isArray(candidate.hidden)
@@ -76,6 +82,7 @@ export function normalizeDashboardLayout(value: unknown): DashboardLayout {
 }
 
 export function useDashboardLayout(ledgerId: string) {
+  const defaultLayout = DEFAULT_DASHBOARD_LAYOUT;
   const storageKey = useMemo(
     () => `ledger.${ledgerId}.overview.layout.v1`,
     [ledgerId],
@@ -100,11 +107,19 @@ export function useDashboardLayout(ledgerId: string) {
     [storageKey],
   );
   const rawLayout = useSyncExternalStore(subscribe, getSnapshot, () => "");
-  const layout = useMemo(() => parseStoredLayout(rawLayout), [rawLayout]);
+  const layout = useMemo(
+    () => parseStoredLayout(rawLayout, defaultLayout),
+    [rawLayout, defaultLayout],
+  );
 
   const updateLayout = useCallback(
     (update: (current: DashboardLayout) => DashboardLayout) => {
-      const next = update(parseStoredLayout(readStoredLayout(storageKey)));
+      const current = parseStoredLayout(
+        readStoredLayout(storageKey),
+        defaultLayout,
+      );
+      const next = update(current);
+      if (next === current) return;
       try {
         window.localStorage.setItem(storageKey, JSON.stringify(next));
       } catch {
@@ -112,7 +127,7 @@ export function useDashboardLayout(ledgerId: string) {
       }
       window.dispatchEvent(new Event(localEventName));
     },
-    [localEventName, storageKey],
+    [localEventName, storageKey, defaultLayout],
   );
 
   const setVisible = useCallback(
@@ -144,8 +159,8 @@ export function useDashboardLayout(ledgerId: string) {
   );
 
   const reset = useCallback(() => {
-    updateLayout(() => DEFAULT_DASHBOARD_LAYOUT);
-  }, [updateLayout]);
+    updateLayout(() => defaultLayout);
+  }, [updateLayout, defaultLayout]);
 
   return {
     layout,

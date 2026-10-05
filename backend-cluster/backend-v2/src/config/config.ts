@@ -53,6 +53,18 @@ interface AppLinksConfig {
   androidSha256Fingerprints: readonly string[];
 }
 
+/**
+ * Domain proof for the official MCP Registry (registry.modelcontextprotocol.io):
+ * the public record a `mcp-publisher login http` signature is verified against,
+ * served at `/.well-known/mcp-registry-auth`. Unset on a self-host — serving
+ * Beancount.io's key there would let Beancount.io publish under that domain's
+ * registry namespace.
+ */
+interface McpRegistryConfig {
+  /** `v=MCPv1; k=ed25519; p=<base64 public key>` (`k=ecdsap384` for P-384), or null. */
+  authProof: string | null;
+}
+
 export interface GiteaConfig {
   hostname: string;
   internalHostname: string;
@@ -198,6 +210,7 @@ export interface AppConfig {
   favaApi: FavaAPIConfig;
   dashboard: DashboardConfig;
   appLinks: AppLinksConfig;
+  mcpRegistry: McpRegistryConfig;
   gitea: GiteaConfig;
   blockeden: BlockEdenConfig;
   claudeCodeSandbox: ClaudeCodeSandboxConfig;
@@ -252,6 +265,28 @@ export function getOAuthPublicUrl(
     );
   }
   return url.toString().replace(/\/$/, "");
+}
+
+/**
+ * The registry's parser accepts `v=MCPv1;\s*k=<algo>;\s*p=<base64>`; we
+ * require the exact spacing `mcp-publisher` emits so a value that "almost"
+ * matches fails here, at startup, rather than as a generic signature error at
+ * publish time.
+ */
+const MCP_REGISTRY_AUTH_PROOF_PATTERN =
+  /^v=MCPv1; k=(ed25519|ecdsap384); p=[A-Za-z0-9+/]+={0,2}$/;
+
+export function getMcpRegistryAuthProof(
+  value: string | undefined,
+): string | null {
+  const record = value?.trim();
+  if (!record) return null;
+  if (!MCP_REGISTRY_AUTH_PROOF_PATTERN.test(record)) {
+    throw new Error(
+      "MCP_REGISTRY_AUTH_PROOF must be the whole proof record `v=MCPv1; k=<ed25519|ecdsap384>; p=<base64 public key>`",
+    );
+  }
+  return record;
 }
 
 export function assertOAuthInteractionHost(
@@ -350,6 +385,9 @@ export const config: AppConfig = {
       .split(",")
       .map((value) => value.trim())
       .filter(Boolean),
+  },
+  mcpRegistry: {
+    authProof: getMcpRegistryAuthProof(process.env.MCP_REGISTRY_AUTH_PROOF),
   },
   gitea: {
     hostname: process.env.EXTERNAL_GITEA_HOST_NAME || "git.beancount.io",

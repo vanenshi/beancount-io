@@ -509,6 +509,138 @@ describe("collaborators through actual adapters, workflow, PDP, and relationship
       }
     },
   );
+  it("refuses a permission read with an empty collaborator as bad input on every surface", async () => {
+    const f = await fixture();
+    try {
+      const rest = await f.request("collaborators/permission?collaborator=");
+      expect(rest.status).toBe(400);
+      await expect(
+        f.read("collaborators/permission?collaborator="),
+      ).rejects.toMatchObject({
+        code: -32602,
+        data: { code: "BAD_USER_INPUT" },
+      });
+      const gql = await f.gql(
+        '{getLedgerCollaboratorPermission(ledgerId:"alice/main",collaborator:""){permission}}',
+      );
+      expect(gql.errors).toHaveLength(1);
+      expect(gql.errors?.[0].originalError).toMatchObject({
+        category: "BAD_USER_INPUT",
+      });
+      expect(f.permission).not.toHaveBeenCalled();
+    } finally {
+      await f.close();
+    }
+  });
+  it("answers a permission read for an unknown user as bad input, without upstream internals, on every surface", async () => {
+    const f = await fixture();
+    try {
+      f.permission.mockRejectedValue(
+        new Error("user does not exist [uid: 0, name: zz-ghost]"),
+      );
+      const rest = await f.request(
+        "collaborators/permission?collaborator=zz-ghost",
+      );
+      expect(rest.status).toBe(400);
+      expect(await rest.text()).not.toContain("uid");
+      await expect(
+        f.read("collaborators/permission?collaborator=zz-ghost"),
+      ).rejects.toMatchObject({
+        code: -32602,
+        data: { code: "BAD_USER_INPUT", message: "No such user: zz-ghost" },
+      });
+      const gql = await f.gql(
+        '{getLedgerCollaboratorPermission(ledgerId:"alice/main",collaborator:"zz-ghost"){permission}}',
+      );
+      expect(gql.errors).toHaveLength(1);
+      expect(gql.errors?.[0].originalError).toMatchObject({
+        category: "BAD_USER_INPUT",
+        message: "No such user: zz-ghost",
+      });
+    } finally {
+      await f.close();
+    }
+  });
+  it.each(["update", "delete"] as const)(
+    "refuses an empty collaborator name on %s as bad input without mutation",
+    async (operation) => {
+      const f = await fixture();
+      try {
+        const mcp = await f.client.callTool({
+          name: "manageLedgerCollaborators",
+          arguments: {
+            operation,
+            ledger: "alice/main",
+            collaborator: "",
+            ...(operation === "update" && { permission: "read" }),
+          },
+        });
+        expect(mcp.isError).toBe(true);
+        expect(mcp.structuredContent).toMatchObject({
+          error: { code: "BAD_USER_INPUT" },
+        });
+        const field =
+          operation === "update"
+            ? 'addOrUpdateLedgerCollaborator(ledgerId: "alice/main", collaborator: "", permission: "read")'
+            : 'deleteLedgerCollaborator(ledgerId: "alice/main", collaborator: "")';
+        const gql = await f.gql(`mutation { ${field} { success } }`);
+        expect(gql.errors).toHaveLength(1);
+        expect(gql.errors?.[0].originalError).toMatchObject({
+          category: "BAD_USER_INPUT",
+        });
+        // REST names the collaborator in the path, so an empty one is not a
+        // route at all.
+        expect(
+          (
+            await f.request(
+              "collaborators/",
+              operation === "update" ? "PUT" : "DELETE",
+              operation === "update" ? { permission: "read" } : undefined,
+            )
+          ).status,
+        ).toBe(405);
+        expect(f.update).not.toHaveBeenCalled();
+        expect(f.remove).not.toHaveBeenCalled();
+        expect(f.members.size).toBe(2);
+      } finally {
+        await f.close();
+      }
+    },
+  );
+  it("answers deleting an unknown user as bad input, without upstream internals, on every surface", async () => {
+    const f = await fixture();
+    try {
+      f.remove.mockRejectedValue(
+        new Error("user does not exist [uid: 0, name: zz-ghost]"),
+      );
+      const rest = await f.request("collaborators/zz-ghost", "DELETE");
+      expect(rest.status).toBe(400);
+      expect(await rest.text()).not.toContain("uid");
+      const mcp = await f.client.callTool({
+        name: "manageLedgerCollaborators",
+        arguments: {
+          operation: "delete",
+          ledger: "alice/main",
+          collaborator: "zz-ghost",
+        },
+      });
+      expect(mcp.isError).toBe(true);
+      expect(mcp.structuredContent).toMatchObject({
+        error: { code: "BAD_USER_INPUT", message: "No such user: zz-ghost" },
+      });
+      const gql = await f.gql(
+        'mutation { deleteLedgerCollaborator(ledgerId: "alice/main", collaborator: "zz-ghost") { success } }',
+      );
+      expect(gql.errors).toHaveLength(1);
+      expect(gql.errors?.[0].originalError).toMatchObject({
+        category: "BAD_USER_INPUT",
+        message: "No such user: zz-ghost",
+      });
+      expect(f.members.size).toBe(2);
+    } finally {
+      await f.close();
+    }
+  });
   it.each(surfaces)(
     "leaves as the caller and refuses owners or stale membership via %s",
     async (surface) => {

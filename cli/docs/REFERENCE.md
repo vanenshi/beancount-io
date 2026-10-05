@@ -65,7 +65,7 @@ Usage: bea balance [OPTIONS] [accounts]...
 
 | Option | Type | Default | Help |
 | --- | --- | --- | --- |
-| `--conversion, -x` | str |  | Currency; defaults to the single operating currency, otherwise units |
+| `--conversion, -x` | str |  | Currency or units/at_cost/at_value; defaults to the single operating currency, otherwise units |
 | `--time, -t` | str |  | Time filter: year, month, 2026, 2026-08, or "2026-01 - 2026-06" |
 | `--allow-errors` | flag |  | Show partial data with errors on stderr; opts strict reads into partial answers |
 
@@ -151,12 +151,13 @@ Usage: bea query [OPTIONS] [query_string]
 
 | Option | Type | Default | Help |
 | --- | --- | --- | --- |
-| `--source` | str |  | Native Beanquery source URI (beancount:<path>, csv:..., or a bare path); delegates to bean-query |
+| `--source` | str |  | Native Beanquery source URI (beancount:<path>, csv:..., or a bare path); native bean-query rendering |
 | `--allow-errors` | flag |  | Answer with errors on stderr; opts strict reads into partial answers |
 | `--format, -f` | str |  | Rendering for a printed result: text, csv, beancount |
 | `--output, -o` | str |  | Write the result to this file instead of stdout |
 | `--numberify, -m` | flag |  | Split amounts into one column per currency |
 | `--no-errors, -q` | flag |  | Hide ledger load errors |
+| `--spreadsheet-safe` | flag |  | With --format csv, prefix text cells starting with = + - @ tab or CR with ' so spreadsheets do not run them as formulas |
 
 ### `bea price`
 
@@ -552,7 +553,7 @@ Usage: bea add event [OPTIONS]
 
 ### `bea add price`
 
-Append a price, or report an exact existing date/commodity/amount match.
+Append a price, or report an exact ledger-authored date/commodity/amount match.
 
 ```text
 Usage: bea add price [OPTIONS]
@@ -565,7 +566,7 @@ Usage: bea add price [OPTIONS]
 | `--amount` | str (repeatable) | required | 'NUMBER CURRENCY' (pass once) |
 | `--allow-errors` | flag |  | Allow semantic ledger errors; syntax and pad account references must be valid |
 | `--into` | path |  | Write to an included file, relative to the root ledger |
-| `--force` | flag |  | Record another quote when the date/commodity already has one |
+| `--force` | flag |  | Record another quote when the ledger already has one for the date/commodity |
 
 ### `bea add commodity`
 
@@ -835,7 +836,7 @@ Usage: bea report overview [OPTIONS]
 
 | Option | Type | Default | Help |
 | --- | --- | --- | --- |
-| `--conversion, -x` | str |  | Currency; defaults to the single operating currency, otherwise units |
+| `--conversion, -x` | str |  | Currency or units/at_cost/at_value; defaults to the single operating currency, otherwise units |
 | `--time, -t` | str |  | Time filter: year, month, 2026, 2026-08, or "2026-01 - 2026-06" |
 | `--account, -a` | str |  | Account filter: a parent account or a regular expression |
 | `--interval, -i` | choice: monthly \| quarterly \| yearly \| weekly \| daily | monthly | Reporting interval |
@@ -851,7 +852,7 @@ Usage: bea report income-statement [OPTIONS]
 
 | Option | Type | Default | Help |
 | --- | --- | --- | --- |
-| `--conversion, -x` | str |  | Currency; defaults to the single operating currency, otherwise units |
+| `--conversion, -x` | str |  | Currency or units/at_cost/at_value; defaults to the single operating currency, otherwise units |
 | `--time, -t` | str |  | Time filter: year, month, 2026, 2026-08, or "2026-01 - 2026-06" |
 | `--account, -a` | str |  | Account filter: a parent account or a regular expression |
 | `--interval, -i` | choice: monthly \| quarterly \| yearly \| weekly \| daily | monthly | Reporting interval |
@@ -867,7 +868,7 @@ Usage: bea report balance-sheet [OPTIONS]
 
 | Option | Type | Default | Help |
 | --- | --- | --- | --- |
-| `--conversion, -x` | str |  | Currency; defaults to the single operating currency, otherwise units |
+| `--conversion, -x` | str |  | Currency or units/at_cost/at_value; defaults to the single operating currency, otherwise units |
 | `--time, -t` | str |  | Time filter: year, month, 2026, 2026-08, or "2026-01 - 2026-06" |
 | `--account, -a` | str |  | Account filter: a parent account or a regular expression |
 | `--interval, -i` | choice: monthly \| quarterly \| yearly \| weekly \| daily | monthly | Reporting interval |
@@ -883,7 +884,7 @@ Usage: bea report trial-balance [OPTIONS]
 
 | Option | Type | Default | Help |
 | --- | --- | --- | --- |
-| `--conversion, -x` | str |  | Currency; defaults to the single operating currency, otherwise units |
+| `--conversion, -x` | str |  | Currency or units/at_cost/at_value; defaults to the single operating currency, otherwise units |
 | `--time, -t` | str |  | Time filter: year, month, 2026, 2026-08, or "2026-01 - 2026-06" |
 | `--account, -a` | str |  | Account filter: a parent account or a regular expression |
 | `--allow-errors` | flag |  | Show partial data with errors on stderr; opts strict reads into partial answers |

@@ -8,10 +8,10 @@ import glob
 import hashlib
 import os
 import re
+import secrets
 import shlex
 import stat
 import sys
-import tempfile
 import time
 import unicodedata
 from collections import Counter
@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from bea_engine import stopping
 from bea_engine.protocol import AuthError, ConflictError, LedgerError, UsageError
 from bea_engine.query import format_error
 
@@ -30,8 +31,12 @@ def cache_dir() -> Path:
 
     Every writer — `bea add`, `bea import`, `bea ask` via `bea-engine append` —
     runs in the engine process and must contend for the same lock file.
+    A relative `XDG_CACHE_HOME` is ignored, as the XDG Base Directory spec
+    requires: it would resolve against whatever directory a command ran from,
+    and the managed price cache writes this path into staged includes.
     """
-    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache").expanduser()
+    xdg = Path(os.environ.get("XDG_CACHE_HOME") or "").expanduser()
+    base = xdg if xdg.is_absolute() else Path.home() / ".cache"
     return base / "bea"
 
 
@@ -49,16 +54,22 @@ def _includes(content: bytes) -> Iterator[tuple[int, int, str]]:
 
 @dataclass
 class LedgerSnapshot:
-    """Freeze the root and its include graph for validation and conflict checks."""
+    """Freeze the root and its include graph for validation and conflict checks.
+
+    A planned destination has empty contents and a None stat. It participates
+    in staged loads, but must remain absent until the validated write commits.
+    """
 
     root: Path
     contents: dict[Path, bytes] = field(default_factory=dict)
-    stats: dict[Path, os.stat_result] = field(default_factory=dict)
+    stats: dict[Path, os.stat_result | None] = field(default_factory=dict)
     patterns: dict[str, tuple[Path, ...]] = field(default_factory=dict)
 
     @classmethod
     def capture(cls, root: Path) -> LedgerSnapshot:
-        snapshot = cls(root.resolve())
+        # Lexical, like Beancount's loader: a symlinked root's includes sit
+        # beside the link, not beside its target (w1/056).
+        snapshot = cls(Path(os.path.abspath(root)))
         pending = [snapshot.root]
         while pending:
             path = pending.pop(0)
@@ -73,7 +84,8 @@ class LedgerSnapshot:
                 pending.extend(matches)
         return snapshot
 
-    def require_target(self, target: Path) -> None:
+    def require_target(self, target: Path) -> bytes:
+        """Register an included destination without creating it; return its frozen bytes."""
         from bea_engine.managed_price_cache import managed_source_for_path
 
         source = managed_source_for_path(target)
@@ -83,23 +95,22 @@ class LedgerSnapshot:
                 "declare a price directive in your own ledger file to override it."
             )
         resolved = target.resolve()
-        if any(path.resolve() == resolved for path in self.contents):
-            return
-        for pattern, matches in self.patterns.items():
-            if not fnmatch.fnmatch(str(resolved), pattern):
-                continue
-            # Covered by an include glob that was expanded before this path existed.
-            if not resolved.parent.is_dir():
-                raise UsageError(
-                    f"Write destination {target} matches include {pattern!r} but its directory "
-                    f"{resolved.parent} does not exist. Create the directory first."
-                )
-            if not resolved.exists():
-                resolved.write_bytes(b"")
-            self.contents[resolved] = resolved.read_bytes()
-            self.stats[resolved] = resolved.stat()
-            self.patterns[pattern] = tuple(sorted({*matches, resolved}))
-            return
+        for path, content in self.contents.items():
+            if path.resolve() == resolved:
+                return content
+        matching = [pattern for pattern in self.patterns if _included_new_file(resolved, pattern)]
+        if matching:
+            if resolved.exists() or resolved.is_symlink():
+                raise ConflictError(f"The ledger changed during the operation: {resolved}. Nothing was written; retry.")
+            self.contents[resolved] = b""
+            self.stats[resolved] = None
+            for pattern in matching:
+                self.patterns[pattern] = tuple(sorted({*self.patterns[pattern], resolved}))
+            return b""
+        if not resolved.parent.is_dir():
+            raise UsageError(
+                f"Write destination directory {resolved.parent} does not exist. Create the directory first."
+            )
         raise UsageError(
             f"Write destination {target} is not included by {self.root}. "
             "Create it and add an include directive to the root first."
@@ -108,40 +119,88 @@ class LedgerSnapshot:
     def verify(self) -> None:
         for path, original in self.contents.items():
             try:
-                current = path.stat()
                 before = self.stats[path]
-                changed = (current.st_ino, current.st_mtime_ns, current.st_size) != (
-                    before.st_ino,
-                    before.st_mtime_ns,
-                    before.st_size,
-                ) or path.read_bytes() != original
+                if before is None:
+                    try:
+                        path.lstat()
+                    except FileNotFoundError:
+                        changed = False
+                    else:
+                        changed = True
+                else:
+                    current = path.stat()
+                    changed = (current.st_ino, current.st_mtime_ns, current.st_size) != (
+                        before.st_ino,
+                        before.st_mtime_ns,
+                        before.st_size,
+                    ) or path.read_bytes() != original
             except OSError:
                 changed = True
             if changed:
                 raise ConflictError(f"The ledger changed during the operation: {path}. Nothing was written; retry.")
         for pattern, before_paths in self.patterns.items():
             current_paths = tuple(sorted(Path(p).absolute() for p in glob.glob(pattern, recursive=True)))
-            if current_paths != before_paths:
+            existing_paths = tuple(path for path in before_paths if self.stats[path] is not None)
+            missing_still_included = all(
+                _included_new_file(path, pattern) for path in before_paths if self.stats[path] is None
+            )
+            if current_paths != existing_paths or not missing_still_included:
                 raise ConflictError(f"The included files changed: {pattern}. Nothing was written; retry.")
+
+    def _includers(self, target: Path) -> set[Path]:
+        """The files whose load reads `target`: itself and everything that includes it, transitively."""
+        included_by: dict[Path, set[Path]] = {}
+        for path, content in self.contents.items():
+            for _, _, name in _includes(content):
+                for match in self.patterns.get(str(path.parent / name), ()):
+                    included_by.setdefault(match, set()).add(path)
+        found = {path for path in self.contents if path.resolve() == target}
+        pending = list(found)
+        while pending:
+            for parent in included_by.get(pending.pop(), ()):
+                if parent not in found:
+                    found.add(parent)
+                    pending.append(parent)
+        return found
 
     @contextmanager
     def staged(self, candidate: Path, target: Path) -> Iterator[tuple[Path, dict[Path, Path]]]:
-        """Keep each staged file beside its source so documents/plugins retain their paths."""
+        """Stage the changed file and its includers, each beside its source.
+
+        Staging beside the source keeps documents and plugins at their paths.
+        Only the destination and the files that (transitively) include it need
+        a copy — their include lines must lead to the candidate — so a file
+        the write cannot affect is read where it is, and a read-only shared
+        directory elsewhere in the include graph does not block the write
+        (w1/073).
+        """
         from beancount.utils import misc_utils
 
         escape_string: Callable[[str], str] = misc_utils.escape_string
 
         with ExitStack() as stack:
-            paths = {path: stack.enter_context(candidate_file(path, "")) for path in self.contents}
-            for path, original in self.contents.items():
-                content = candidate.read_bytes() if path.resolve() == target else original
+            paths = {path: stack.enter_context(candidate_file(path, "")) for path in self._includers(target)}
+            for path, staged in paths.items():
+                content = candidate.read_bytes() if path.resolve() == target else self.contents[path]
                 for start, end, name in reversed(list(_includes(content))):
                     matches = self.patterns.get(str(path.parent / name), ())
                     if matches:
-                        replacement = "\ninclude ".join(f'"{escape_string(str(paths[p]))}"' for p in matches)
+                        replacement = "\ninclude ".join(f'"{escape_string(str(paths.get(p, p)))}"' for p in matches)
                         content = content[:start] + replacement.encode() + content[end:]
-                paths[path].write_bytes(content)
+                staged.write_bytes(content)
             yield paths[self.root], {staged: original for original, staged in paths.items()}
+
+
+def _included_new_file(target: Path, pattern: str) -> bool:
+    """Match an absent leaf using the same directory and hidden-file rules as glob."""
+    parent, name = os.path.split(pattern)
+    if target.name.startswith(".") and not name.startswith("."):
+        return False
+    if not fnmatch.fnmatch(target.name, name):
+        return False
+    if name == "**":
+        parent = os.path.join(parent, "**")
+    return any(Path(directory).resolve() == target.parent for directory in glob.glob(parent, recursive=True))
 
 
 #: How long a staged candidate must have been sitting before another write
@@ -154,6 +213,13 @@ _ABANDONED_CANDIDATE_SECONDS = 3600
 #: already named `.bea-xxxx.tmp` gets `..bea-xxxx.tmp.picklecache` — two
 #: leading dots, which a `.bea-*` glob cannot reach.
 _CANDIDATE_GLOBS = (".bea-*", "..bea-*")
+
+_CANDIDATE_NAME = re.compile(r"\.bea-[0-9a-f]{16}\.tmp")
+
+
+def is_candidate_file(path: Path) -> bool:
+    """Whether `path` is a staged candidate `candidate_file` created."""
+    return _CANDIDATE_NAME.fullmatch(path.name) is not None
 
 
 def pickle_cache_of(candidate: Path) -> Path:
@@ -207,6 +273,46 @@ def sweep_abandoned_candidates(directory: Path) -> None:
             continue
 
 
+def _lock_key(file: Path) -> str:
+    """One key per file, however the path that names it is spelled.
+
+    The resolved path string was not enough: macOS's default volumes are
+    case- and normalization-insensitive, `resolve()` keeps the caller's
+    spelling and `normcase` is the identity there, so `~/Books/main.bean` and
+    `~/books/main.bean` took different locks on one file and concurrent adds
+    could lose an entry (w1/075). The directory is identified by device and
+    inode, which every spelling shares; the name is case-folded and
+    normalized, which at worst makes two distinct files on a case-sensitive
+    volume share a lock — slower, never unsafe. The file itself is not keyed
+    by inode: every atomic replace gives it a new one, and a destination may
+    not exist yet.
+    """
+    resolved = file.resolve()
+    try:
+        parent = resolved.parent.stat()
+    except OSError:
+        identity = os.path.normcase(str(resolved))
+    else:
+        name = unicodedata.normalize("NFD", resolved.name).casefold()
+        identity = f"{parent.st_dev}:{parent.st_ino}/{name}"
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+@contextmanager
+def lock_files(files: Iterable[Path]) -> Iterator[None]:
+    """Lock every file, each once, in one global order so writers queue instead of deadlocking."""
+    with ExitStack() as stack:
+        for file in lock_order(files):
+            stack.enter_context(lock_file(file))
+        yield
+
+
+def lock_order(files: Iterable[Path]) -> list[Path]:
+    """One file per lock, in the global order every writer takes them."""
+    keyed = {_lock_key(file): file for file in files}
+    return [keyed[key] for key in sorted(keyed)]
+
+
 @contextmanager
 def lock_file(file: Path) -> Iterator[None]:
     """Serialize CLI writers across atomic replacements of the ledger inode.
@@ -216,7 +322,7 @@ def lock_file(file: Path) -> Iterator[None]:
     """
     directory = cache_dir() / "locks"
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    key = hashlib.sha256(os.path.normcase(str(file.resolve())).encode()).hexdigest()
+    key = _lock_key(file)
     fd = os.open(directory / f"{key}.lock", os.O_RDWR | os.O_CREAT, 0o600)
     with os.fdopen(fd, "r+b") as stream:
         if sys.platform == "win32":
@@ -242,21 +348,44 @@ def lock_file(file: Path) -> Iterator[None]:
 
 
 @contextmanager
-def candidate_file(file: Path, content: str) -> Iterator[Path]:
-    """Keep relative includes and documents relative to the original directory."""
-    fd, name = tempfile.mkstemp(prefix=".bea-", suffix=".tmp", dir=file.parent)
-    candidate = Path(name)
-    try:
-        # Preserve the supplied bytes: Windows newline translation would turn
-        # existing CRLF into CRCRLF on every append.
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        yield candidate
-    finally:
-        candidate.unlink(missing_ok=True)
-        pickle_cache_of(candidate).unlink(missing_ok=True)
+def candidate_file(file: Path, content: str, *, mode: int = 0o600) -> Iterator[Path]:
+    """Stage beside the original, privately unless an export requests a mode.
+
+    Exclusive creation lets the OS apply the umask without changing the
+    process-wide mask, which would also affect other threads' file writes.
+    """
+    while True:
+        candidate = file.parent / f".bea-{secrets.token_hex(8)}.tmp"
+        # Registered before it exists, so a termination signal at any point
+        # from creation on removes it at once — even while a parse it cannot
+        # interrupt is still running (w1/074).
+        with stopping.staged(candidate):
+            try:
+                fd = os.open(candidate, os.O_RDWR | os.O_CREAT | os.O_EXCL, mode)
+            except FileExistsError:
+                continue
+            except PermissionError as exc:
+                # A raw Errno 13 read as a validation failure (w1/073); this is
+                # the filesystem refusing, which callers treat as exit 3.
+                raise AuthError(
+                    f"Cannot stage a copy of {file.name} in {file.parent}: the directory is not writable. "
+                    "bea validates a write on a staged copy beside each changed file; make the directory "
+                    "writable before retrying. Nothing was written."
+                ) from exc
+            try:
+                # The sidecar's name may import Beancount, so it is registered second.
+                with stopping.staged(pickle_cache_of(candidate)):
+                    # Preserve the supplied bytes: Windows newline translation would turn
+                    # existing CRLF into CRCRLF on every append.
+                    with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+                        stream.write(content)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    yield candidate
+            finally:
+                candidate.unlink(missing_ok=True)
+                pickle_cache_of(candidate).unlink(missing_ok=True)
+            return
 
 
 def _balance_recovery_hints(
@@ -278,10 +407,16 @@ def _balance_recovery_hints(
             f"Review transactions against the existing assertion at {source}:{balance.meta['lineno']}. "
             "Correct missing transactions or edit that assertion; adding another balance would duplicate it.",
         ]
+    # A balance assertion covers the account's subaccounts too, so activity
+    # there is activity here: an opening adjustment on the parent would paper
+    # over a discrepancy in the child.
+    subaccount = f"{balance.account}:"
     if any(
         isinstance(entry, Transaction)
         and entry.date <= balance.date
-        and any(posting.account == balance.account for posting in entry.postings)
+        and any(
+            posting.account == balance.account or posting.account.startswith(subaccount) for posting in entry.postings
+        )
         for entry in entries
     ):
         return [date_hint]
@@ -342,6 +477,18 @@ def _balance_recovery_hints(
     return hints
 
 
+class CandidateRejected(LedgerError):
+    """A refused candidate, with the file and line of each error behind the refusal.
+
+    The locations let a batch writer tell which of its appended rows failed
+    from the one load it already paid for, instead of reloading per row.
+    """
+
+    def __init__(self, message: str, *, details: list[str], locations: list[tuple[Path, int | None]]) -> None:
+        super().__init__(message, details=details)
+        self.locations = locations
+
+
 @dataclass(frozen=True)
 class _ErrorRecord:
     """One loader error, kept separable so identical problems can be merged."""
@@ -357,10 +504,25 @@ def _collapse_repeats(records: list[_ErrorRecord]) -> list[str]:
 
     A single unopened account referenced by forty imported rows is one thing to
     fix, and forty identical paragraphs bury the hint that says how.
+
+    Upstream can also report one problem twice for the same line (an unknown
+    account on a balance, an inactive pad source), sometimes with different
+    hints attached. Those are one record, line or no line, carrying every hint
+    either had — otherwise the output names the line as "1 more line" of
+    itself, or prints the same paragraph twice.
     """
+    distinct: dict[tuple[str, str, int | None], _ErrorRecord] = {}
+    for record in records:
+        same = distinct.get((record.kind, record.message, record.lineno))
+        if same is None:
+            distinct[(record.kind, record.message, record.lineno)] = _ErrorRecord(
+                record.kind, record.message, record.lineno, list(record.hints)
+            )
+        else:
+            same.hints.extend(hint for hint in record.hints if hint not in same.hints)
     order: list[tuple[str, tuple[str, ...]]] = []
     grouped: dict[tuple[str, tuple[str, ...]], list[_ErrorRecord]] = {}
-    for record in records:
+    for record in distinct.values():
         key = (record.kind, tuple(record.hints))
         if key not in grouped:
             grouped[key] = []
@@ -403,7 +565,7 @@ def including_root(file: Path) -> Path | None:
 
 
 def root_ledger_hints(file: Path) -> list[str]:
-    """The `--into` recipe when the write target is an included file, else nothing."""
+    """The `--into` recipe when the invoked entry file is an included leaf."""
     root = including_root(file)
     if root is None:
         return []
@@ -490,10 +652,11 @@ def validate_candidate(
     # and message; anything else in the after set is newly introduced.
     before_keys: Counter[tuple[str, int | None, str]] | None = None
     if allow_errors:
-        _, before_errors, _ = managed_load.load_file(snapshot.root if snapshot else file)
+        _, before_errors, _ = managed_load.load_file(snapshot.root if snapshot else file, snapshot=snapshot)
         before_keys = Counter(_error_key(before, {}) for before in before_errors)
     accounts = [entry.account for entry in entries if isinstance(entry, Open)]
     records: list[_ErrorRecord] = []
+    locations: list[tuple[Path, int | None]] = []
     introduced: list[bool] = []
     invalid_pad_accounts = False
     for error in errors:
@@ -538,7 +701,7 @@ def validate_candidate(
                 if matches:
                     message += f" Did you mean {', '.join(matches)}?"
                 message += f" To create it, use bea add open --account {shlex.quote(account)} --date YYYY-MM-DD."
-            hints.extend(root_ledger_hints(file))
+            hints.extend(root_ledger_hints(snapshot.root if snapshot else file))
         if "inactive account '" in message:
             account = message.split("inactive account '", 1)[1].split("'", 1)[0]
             for entry in entries:
@@ -588,17 +751,7 @@ def validate_candidate(
             )
         if "Unused Pad" in message:
             pad_entry = error.entry if isinstance(error.entry, Pad) else None
-            already_paired = pad_entry is not None and any(
-                isinstance(entry, Balance) and entry.account == pad_entry.account and entry.date > pad_entry.date
-                for entry in entries
-            )
-            if already_paired:
-                message += " Book balance already matches the assertion; omit --pad-from and add the balance alone."
-            else:
-                message += (
-                    " Add both directives atomically with bea add balance --pad-from ACCOUNT"
-                    " --date YYYY-MM-DD --amount 'NUMBER CURRENCY' --account ACCOUNT."
-                )
+            message += _unused_pad_hint(pad_entry, entries, errors, filenames)
         elif isinstance(error.entry, Balance) and "Balance failed" in error.message:
             if allow_errors:
                 hints.append(
@@ -611,18 +764,23 @@ def validate_candidate(
                     )
                 )
         records.append(_ErrorRecord(getattr(error, "message", str(error)), message, error.source.get("lineno"), hints))
+        locations.append((source, lineno if isinstance(lineno, int) else None))
     messages = _collapse_repeats(records)
     syntax_errors = [err for err in errors if isinstance(err, ParserError | ParserSyntaxError | LexerError)]
     new_records = [record for record, is_new in zip(records, introduced, strict=True) if is_new]
     if errors and (not allow_errors or syntax_errors or invalid_pad_accounts or new_records):
         if not allow_errors:
-            raise LedgerError("The change would leave the ledger invalid; nothing was written.", details=messages)
+            raise CandidateRejected(
+                "The change would leave the ledger invalid; nothing was written.",
+                details=messages,
+                locations=locations,
+            )
         # A refused `--allow-errors` write names what forced the refusal —
         # the introduced errors, any syntax failure, any invalid pad — and
         # not the pre-existing errors the flag tolerates.
-        reasons = [
-            record
-            for record, error, is_new in zip(records, errors, introduced, strict=True)
+        blocking = [
+            index
+            for index, (error, is_new) in enumerate(zip(errors, introduced, strict=True))
             if is_new
             or isinstance(error, ParserError | ParserSyntaxError | LexerError)
             or (isinstance(error.entry, Pad) and str(getattr(error, "message", "")).startswith("Invalid reference to "))
@@ -631,8 +789,76 @@ def validate_candidate(
             message = f"The change would introduce {len(new_records)} new ledger error(s); nothing was written."
         else:
             message = "The change would leave the ledger invalid; nothing was written."
-        raise LedgerError(message, details=_collapse_repeats(reasons))
+        raise CandidateRejected(
+            message,
+            details=_collapse_repeats([records[index] for index in blocking]),
+            locations=[locations[index] for index in blocking],
+        )
     return messages
+
+
+def _unused_pad_hint(pad: Any, entries: list[Any], errors: list[Any], filenames: dict[Path, Path]) -> str:
+    """Why Beancount found nothing for this pad to fill, as a next step.
+
+    Beancount applies a pad to the first assertion in each currency that
+    follows it on the account (or a subaccount), until the next pad there. So
+    a pad is unused because nothing follows it, because a later pad took its
+    assertions over, or because every assertion it reached already held — and
+    only that last case means the book balance already matches. An earlier
+    assertion that holds still consumes the pad, leaving a later failing one
+    unpadded; claiming "already matches" there contradicted the failure
+    printed beside it.
+    """
+    from beancount.core.data import Balance, Pad
+
+    atomic = (
+        " Add both directives atomically with bea add balance --pad-from ACCOUNT"
+        " --date YYYY-MM-DD --amount 'NUMBER CURRENCY' --account ACCOUNT."
+    )
+    position = next((index for index, entry in enumerate(entries) if entry is pad), None)
+    if pad is None or position is None:
+        return atomic
+    prefix = f"{pad.account}:"
+    reached: list[Any] = []
+    superseded_by = None
+    for entry in entries[position + 1 :]:
+        if isinstance(entry, Pad) and entry.account == pad.account:
+            superseded_by = entry
+            break
+        if isinstance(entry, Balance) and (entry.account == pad.account or entry.account.startswith(prefix)):
+            reached.append(entry)
+    if not reached:
+        if superseded_by is not None:
+            return (
+                f" The later pad at {_location(superseded_by, filenames)} takes over the assertions after it, "
+                "leaving this pad nothing to fill; keep one of the two pads."
+            )
+        return atomic
+    # Keyed by source line: the balance check replaces a failing entry with a
+    # copy carrying its difference, so identity does not survive.
+    failed = {
+        (error.entry.meta.get("filename"), error.entry.meta.get("lineno"))
+        for error in errors
+        if isinstance(error.entry, Balance) and "Balance failed" in getattr(error, "message", "")
+    }
+    first_by_currency: dict[str, Any] = {}
+    for balance in reached:
+        first = first_by_currency.setdefault(balance.amount.currency, balance)
+        if first is not balance and (balance.meta.get("filename"), balance.meta.get("lineno")) in failed:
+            return (
+                f" A pad fills only the first later assertion in each currency; the {first.date} assertion at "
+                f"{_location(first, filenames)} already holds and consumes it, so the {balance.date} assertion "
+                f"stays unpadded. Date the pad after {first.date}."
+            )
+    return " Book balance already matches the assertion; omit --pad-from and add the balance alone."
+
+
+def _location(entry: Any, filenames: dict[Path, Path]) -> str:
+    """An entry's `file:line`, naming the real file rather than its staged copy."""
+    filename = str(entry.meta.get("filename", ""))
+    for staged, original in filenames.items():
+        filename = filename.replace(str(staged), str(original))
+    return f"{filename}:{entry.meta.get('lineno')}"
 
 
 def _error_key(error: Any, filenames: dict[Path, Path]) -> tuple[str, int | None, str]:
@@ -659,6 +885,11 @@ def _error_key(error: Any, filenames: dict[Path, Path]) -> tuple[str, int | None
         message = f"Balance failed for {entry.account} on {entry.date}"
     else:
         message = getattr(error, "message", str(error))
+        # Some messages embed a path (a posting's repr with its `meta`, a
+        # duplicate include); the after-load reads staged copies, so map those
+        # back too or every such pre-existing error reads as new.
+        for staged, original in filenames.items():
+            message = message.replace(str(staged), str(original))
     return (name, error.source.get("lineno"), message)
 
 
@@ -669,7 +900,7 @@ def _destination_indent(content: str) -> str:
     draft to bean-format's aligner and keeps its rendering of the new lines.
     """
     indents: Counter[str] = Counter()
-    for line in content.splitlines():
+    for line in _lines(content):
         match = re.match(r"^(\s+)(\S+)( +).*$", line)
         if not match or "\t" in match.group(1):
             continue
@@ -677,25 +908,58 @@ def _destination_indent(content: str) -> str:
     return indents.most_common(1)[0][0] if indents else "  "
 
 
+def _lines(text: str) -> list[str]:
+    """Lines as the lexer counts them: split on `\n` alone, any `\r` folded in first.
+
+    `str.splitlines` also breaks on U+2028, U+2029 and friends, which inside
+    a string turned one written line into two (w1/136).
+    """
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    return lines[:-1] if lines[-1] == "" else lines
+
+
+def _indent_width(line: str) -> int:
+    """Columns of leading whitespace, a tab counting as a tab stop."""
+    return len(line.expandtabs()) - len(line.expandtabs().lstrip())
+
+
 def _indent_block(texts: list[str], indent: str) -> list[str]:
     """Re-indent appended entries to the destination's style without touching it.
 
     Posting lines keep a two-space gap before their amount; `appended_content`
-    aligns the amounts afterwards with the code `bea format` runs.
+    aligns the amounts afterwards with the code `bea format` runs. A line that
+    continues a multi-line string is string content and stays verbatim. A line
+    indented deeper than the entry's shallowest indented line — posting
+    metadata, which the printer nests under its posting — keeps that nesting
+    at twice the destination indent, so it still reads as the posting's.
     """
+    from bea_engine.ledger.formatting import string_continuation_lines
+
     rendered = []
     for text in texts:
+        block = text.rstrip()
+        verbatim = string_continuation_lines(block)
+        source = _lines(block)
+        depths = [
+            _indent_width(line)
+            for index, line in enumerate(source)
+            if index > 0 and index not in verbatim and line.strip() and line[0].isspace()
+        ]
+        base = min(depths, default=0)
         lines = []
-        for index, line in enumerate(text.rstrip().splitlines()):
+        for index, line in enumerate(source):
             match = None if index == 0 else re.match(r"^\s*(\S+)(  +)(\S.*)$", line)
-            if match and ":" in match.group(1) and not match.group(1).endswith(":"):
+            if index in verbatim:
+                lines.append(line)
+            elif match and ":" in match.group(1) and not match.group(1).endswith(":"):
                 lines.append(f"{indent}{match.group(1)}  {match.group(3)}")
             elif index == 0 or not line.strip() or not line[0].isspace():
                 # A continuation at column zero is content (a wrapped note
                 # comment), not structure: only re-indent indented lines.
                 lines.append(line)
             else:
-                lines.append(f"{indent}{line.strip()}")
+                nested = indent * 2 if _indent_width(line) > base else indent
+                lines.append(f"{nested}{line.strip()}")
         rendered.append("\n".join(lines))
     return rendered
 
@@ -719,17 +983,21 @@ def appended_content(original: bytes, texts: list[str]) -> str:
     text = original.decode("utf-8")
     ending = _dominant_ending(original)
     blocks = _indent_block(texts, _destination_indent(text))
-    draft = text + "".join("\n" + block + "\n" for block in blocks)
-    kept = len(text.splitlines())
-    tail = draft.splitlines()[kept:]
+    # Terminate the last line first: otherwise the separator's newline only
+    # ends it, and the first entry lands with no blank line before it (w1/100).
+    terminated = text if not text or text.endswith(("\n", "\r")) else text + "\n"
+    draft = terminated + "".join("\n" + block + "\n" for block in blocks)
+    kept = len(_lines(text))
+    tail = _lines(draft)[kept:]
     try:
-        from beancount.scripts.format import align_beancount
+        from bea_engine.ledger.formatting import align_protected
 
         # The aligner emits one line per input line, so the appended lines are
         # the tail of its output. Line endings are normalised first because its
-        # own whitespace-only safety check cannot account for a carriage return.
-        aligned = align_beancount(draft.replace("\r\n", "\n").replace("\r", "\n"))  # type: ignore[no-untyped-call]
-        tail = aligned.splitlines()[kept:]
+        # own whitespace-only safety check cannot account for a carriage return,
+        # and string content is kept out of its reach (w1/136).
+        aligned = align_protected(draft.replace("\r\n", "\n").replace("\r", "\n"))
+        tail = _lines(aligned)[kept:]
     except AssertionError:
         pass  # The aligner refused the text; alignment is cosmetic, the append is not.
     head = text if text.endswith("\n") or not text else text + ending
@@ -762,6 +1030,33 @@ def _appended_or_report(target: Path, original: bytes, texts: list[str]) -> str:
         raise LedgerError(decode_error_message(target, exc)) from exc
 
 
+#: Lexer kinds of the lines that configure a ledger rather than record into it.
+CONFIG_TOKENS = frozenset({"INCLUDE", "PLUGIN", "OPTION", "PUSHTAG", "POPTAG", "PUSHMETA", "POPMETA"})
+
+
+def require_one_entry_each(texts: list[str]) -> None:
+    """Refuse a rendered directive that reads back as anything but one directive.
+
+    Every writer renders one requested directive per text. A field that slipped
+    a line break or a second token past its own validation would print as
+    extra directives — or an option, include or plugin — that a whole-ledger
+    check happily accepts, since the injected text is itself valid. Reading
+    each text back on its own is the last line of defence: it costs one parse
+    per directive and never consults the ledger.
+    """
+    from beancount.parser import lexer, parser
+
+    for number, text in enumerate(texts, start=1):
+        entries, _, _ = parser.parse_string(text)
+        kinds = {kind for kind, *_ in lexer.lex_iter_string(text)}  # type: ignore[no-untyped-call]
+        if len(entries) != 1 or kinds & CONFIG_TOKENS:
+            raise UsageError(
+                f"Directive {number} of {len(texts)} would be written as {len(entries)} directive(s)"
+                f"{' plus ledger configuration' if kinds & CONFIG_TOKENS else ''}; a field holds a line break "
+                "or a value that is not one token. Nothing was written."
+            )
+
+
 def validate_append(
     file: Path,
     texts: list[str],
@@ -769,12 +1064,19 @@ def validate_append(
     allow_errors: bool = False,
     into: Path | None = None,
     snapshot: LedgerSnapshot | None = None,
+    one_entry_each: bool = True,
 ) -> list[str]:
-    """Validate the append without writing; returns the errors `allow_errors` tolerated."""
+    """Validate the append without writing; returns the errors `allow_errors` tolerated.
+
+    Each text is one requested directive unless `one_entry_each` is off, which
+    only raw directive text (`bea-engine append`) does: it counts its own.
+    """
+    if one_entry_each:
+        require_one_entry_each(texts)
     snapshot = snapshot or LedgerSnapshot.capture(file)
     target = destination(file, into)
-    snapshot.require_target(target)
-    with candidate_file(target, _appended_or_report(target, target.read_bytes(), texts)) as candidate:
+    original = snapshot.require_target(target)
+    with candidate_file(target, _appended_or_report(target, original, texts)) as candidate:
         warnings = validate_candidate(candidate, target, allow_errors=allow_errors, snapshot=snapshot)
     snapshot.verify()
     return warnings
@@ -787,6 +1089,86 @@ def require_writable(file: Path) -> None:
             f"Ledger file is read-only or not writable: {file}. "
             "Change its permissions explicitly before retrying; nothing was written."
         )
+
+
+#: User file flags a replacement carries over (`nodump`, `hidden`, `opaque`).
+#: `uchg`/`uappnd` would make the staged copy itself impossible to rename, and
+#: a ledger carrying them cannot be replaced anyway; system flags need root.
+_KEPT_FILE_FLAGS = 0x00000001 | 0x00000008 | 0x00008000
+
+#: copyfile(3) flags: COPYFILE_ACL | COPYFILE_XATTR.
+_COPYFILE_ACL_XATTR = (1 << 0) | (1 << 2)
+
+
+def keep_file_metadata(file: Path, candidate: Path, original_stat: os.stat_result) -> None:
+    """Give the staged replacement everything about `file` but its bytes and times.
+
+    A rename installs a new inode, so whatever the old one carried beyond
+    its mode — its group, ACL entries, extended attributes, file flags — was
+    silently dropped (w1/099): group members lost access and a deny ACL
+    disappeared. The group is required, so a group this user cannot assign
+    refuses the write (exit 3) rather than changing who may read the ledger.
+    """
+    if hasattr(os, "chown") and candidate.stat().st_gid != original_stat.st_gid:
+        try:
+            os.chown(candidate, -1, original_stat.st_gid)
+        except PermissionError as exc:
+            raise AuthError(
+                f"Cannot keep {file}'s group (gid {original_stat.st_gid}) on the rewritten file: this user "
+                "may not assign it. Nothing was written; write as a member of that group or change the "
+                "file's group explicitly."
+            ) from exc
+    # After chown, which may clear setgid.
+    candidate.chmod(stat.S_IMODE(original_stat.st_mode))
+    if sys.platform == "darwin":
+        _copy_acl_and_xattrs_darwin(file, candidate)
+    elif sys.platform == "linux":
+        _copy_xattrs_linux(file, candidate)
+    flags = getattr(original_stat, "st_flags", 0) & _KEPT_FILE_FLAGS
+    if flags and hasattr(os, "chflags"):
+        try:
+            os.chflags(candidate, os.stat(candidate).st_flags | flags)
+        except OSError as exc:
+            raise AuthError(f"Cannot keep {file}'s file flags on the rewritten file; nothing was written.") from exc
+
+
+def _copy_acl_and_xattrs_darwin(file: Path, candidate: Path) -> None:
+    import ctypes
+
+    libc = ctypes.CDLL("libc.dylib", use_errno=True)
+    copyfile = libc.copyfile
+    copyfile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint32]
+    copyfile.restype = ctypes.c_int
+    if copyfile(os.fsencode(file), os.fsencode(candidate), None, _COPYFILE_ACL_XATTR) < 0:
+        number = ctypes.get_errno()
+        raise AuthError(
+            f"Cannot keep {file}'s ACL and extended attributes on the rewritten file "
+            f"({os.strerror(number)}); nothing was written."
+        )
+
+
+def _copy_xattrs_linux(file: Path, candidate: Path) -> None:
+    """User attributes and POSIX ACLs, which Linux stores as `system.posix_acl_*` attributes."""
+    import errno
+
+    if sys.platform != "linux":
+        return
+
+    try:
+        names = os.listxattr(file)
+    except OSError as exc:
+        if exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            return
+        raise
+    for name in names:
+        if not name.startswith(("user.", "system.posix_acl_")):
+            continue
+        try:
+            os.setxattr(candidate, name, os.getxattr(file, name))
+        except OSError as exc:
+            raise AuthError(
+                f"Cannot keep {file}'s extended attribute {name} on the rewritten file; nothing was written."
+            ) from exc
 
 
 def replace_checked(file: Path, candidate: Path, original: bytes, original_stat: os.stat_result) -> None:
@@ -802,8 +1184,15 @@ def replace_checked(file: Path, candidate: Path, original: bytes, original_stat:
         raise ConflictError(
             "The ledger changed while the operation was running; nothing was written. Retry the command."
         )
-    candidate.chmod(stat.S_IMODE(original_stat.st_mode))
-    os.replace(candidate, file)
+    keep_file_metadata(file, candidate, original_stat)
+    stopping.check()
+    try:
+        os.replace(candidate, file)
+    except PermissionError as exc:
+        raise AuthError(
+            f"The filesystem refused to replace {file} (an ACL, file flag or directory permission "
+            "forbids it); nothing was written."
+        ) from exc
 
 
 def append(
@@ -814,36 +1203,60 @@ def append(
     expected: bytes | None = None,
     into: Path | None = None,
     snapshot: LedgerSnapshot | None = None,
+    one_entry_each: bool = True,
 ) -> list[str]:
     if not texts:
         return []
-    file = file.resolve()
+    if one_entry_each:
+        require_one_entry_each(texts)
+    file = Path(os.path.abspath(file))
     target = destination(file, into)
     with ExitStack() as stack:
-        for path in sorted({file, target}):
-            stack.enter_context(lock_file(path))
+        stack.enter_context(lock_files([file, target]))
         sweep_abandoned_candidates(target.parent)
         snapshot = snapshot or LedgerSnapshot.capture(file)
-        snapshot.require_target(target)
+        original = snapshot.require_target(target)
         snapshot.verify()
-        require_writable(target)
-        original_stat = target.stat()
-        original = target.read_bytes()
+        original_stat = target.stat() if target.exists() else None
+        if original_stat is not None:
+            require_writable(target)
         if expected is not None and original != expected:
             raise ConflictError("The ledger changed since the preview was prepared; nothing was written. Retry.")
         with candidate_file(target, _appended_or_report(target, original, texts)) as candidate:
             warnings = validate_candidate(candidate, target, allow_errors=allow_errors, snapshot=snapshot)
             snapshot.verify()
-            replace_checked(target, candidate, original, original_stat)
+            if original_stat is None:
+                stopping.check()
+                try:
+                    os.link(candidate, target)
+                except FileExistsError as exc:
+                    raise ConflictError(f"Already exists: {target}; nothing was overwritten.") from exc
+                except PermissionError as exc:
+                    raise AuthError(f"The filesystem refused to create {target}; nothing was written.") from exc
+            else:
+                replace_checked(target, candidate, original, original_stat)
     return warnings
+
+
+def _exact_metadata_number(number: Any) -> Any:
+    """Refuse a JSON float in typed metadata: `Decimal(0.1)` would persist its binary expansion."""
+    if isinstance(number, bool):
+        raise ValueError(f"expected a decimal string, got {number!r}")
+    if isinstance(number, float):
+        raise ValueError(
+            f"JSON float {number!r} cannot represent a decimal exactly. "
+            f"Send the number as a decimal string, such as '{number}'."
+        )
+    return number
 
 
 def metadata_for_write(meta: dict[str, Any]) -> dict[str, Any]:
     """Restore typed JSON metadata; source locations never become ledger metadata."""
-    import datetime
     from decimal import Decimal, InvalidOperation
 
     from beancount.core.amount import Amount
+
+    from bea_engine.ledger.text import parse_iso_date
 
     result = {}
     for key, value in meta.items():
@@ -853,14 +1266,19 @@ def metadata_for_write(meta: dict[str, Any]) -> dict[str, Any]:
             kind = value.get("kind")
             try:
                 if kind == "number":
-                    value = Decimal(value["value"])
+                    value = Decimal(_exact_metadata_number(value["value"]))
                 elif kind == "date":
-                    value = datetime.date.fromisoformat(value["value"])
+                    value = parse_iso_date(value["value"])
                 elif kind == "amount":
-                    value = Amount(Decimal(value["number"]), value["currency"])
+                    value = Amount(Decimal(_exact_metadata_number(value["number"])), value["currency"])
                 else:
                     raise LedgerError(f"Unsupported metadata value for {key!r}.")
-            except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            except InvalidOperation as exc:
+                # Decimal's own message is a bare exception class list.
+                raise LedgerError(
+                    f"Invalid {kind!r} metadata for {key!r}: expected a decimal string such as '1.25'."
+                ) from exc
+            except (KeyError, TypeError, ValueError) as exc:
                 raise LedgerError(f"Invalid {kind!r} metadata for {key!r}: {exc}") from exc
         elif isinstance(value, bool):
             pass

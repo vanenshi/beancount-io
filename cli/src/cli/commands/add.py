@@ -12,15 +12,15 @@ from __future__ import annotations
 
 import datetime
 import json
-import re
 import sys
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
 
 from cli import context, output
+from cli.amounts import check_decimal_notation, parse_decimal_number
 from cli.errors import UsageError
 from cli.utils import decode_error_message, parse_date
 
@@ -45,7 +45,7 @@ def _parse_amount(amount_str: str) -> tuple[Decimal, str]:
     parts = amount_str.strip().split()
     if len(parts) != 2:
         raise typer.BadParameter(f"Amount must be 'NUMBER CURRENCY', got: {amount_str!r}")
-    return _parse_number(parts[0]), parts[1]
+    return parse_decimal_number(parts[0]), parts[1]
 
 
 def _single_amount(amounts: list[str], name: str) -> str:
@@ -56,46 +56,6 @@ def _single_amount(amounts: list[str], name: str) -> str:
             "Repeat the command for another."
         )
     return amounts[0]
-
-
-def _parse_number(text: str) -> Decimal:
-    _check_decimal_notation(text)
-    try:
-        number = Decimal(text)
-    except InvalidOperation as err:
-        raise typer.BadParameter(f"Not a number: {text!r}") from err
-    if not number.is_finite():
-        raise UsageError("Amounts must be finite numbers, such as 1538.25.")
-    return number
-
-
-def _check_decimal_notation(text: str) -> None:
-    """Reject the amount spellings that never reach a useful engine answer.
-
-    Both checks run here, at the input boundary, because both cost more to
-    diagnose once the expression is inside the engine: an exponent is rejected
-    by a parser that cannot say which posting it came from, and a zero divisor
-    crashes it outright.
-    """
-    # A cost label or comment may contain an exponent-looking string. Only
-    # reject numeric tokens, leaving native arithmetic and quoted text alone.
-    unquoted = re.sub(r'"(?:[^"\\]|\\.)*"|;[^\r\n]*', "", text)
-    match = re.search(r"(?<![\w.:#^'\-])[-+]?(?:\d+(?:\.\d*)?|\.\d+)[eE][+-]?\d+(?![\w.])", unquoted)
-    if match:
-        raise UsageError(
-            f"Scientific notation {match[0]!r} is not supported in Beancount amounts. "
-            "Use decimal notation, such as '1000' instead of '1e3'."
-        )
-    # Upstream's parser segfaults on a zero divisor rather than reporting it,
-    # which takes the whole engine process down and leaves nothing to attribute
-    # to a posting. A literal zero is the case worth catching here; anything
-    # computed (`100/(2-2)`) still reaches the engine.
-    divisor = re.search(r"/\s*[-+]?(?:0+(?:\.0*)?|\.0+)(?![\d.])", unquoted)
-    if divisor:
-        raise UsageError(
-            f"Division by zero in {text.strip()!r}. Beancount evaluates amount arithmetic while parsing, "
-            "and a zero divisor crashes it outright, so bea refuses the expression instead of sending it."
-        )
 
 
 def _write(
@@ -122,7 +82,7 @@ def _write(
         argv.append("--allow-errors")
     if strict_read:
         argv.append("--strict-read")
-    return file, launch.helper_json(argv, stdin=json.dumps(request))
+    return file, launch.helper_json(argv, stdin=json.dumps(request), writes=True)
 
 
 def _already_recorded(name: str, source: dict[str, Any]) -> None:
@@ -181,7 +141,7 @@ def add_transaction(
     if any("\n" in p or "\r" in p for p in postings):
         raise UsageError("Each --posting must be one line; repeat -p for another posting.")
     for posting_text in postings:
-        _check_decimal_notation(posting_text)
+        check_decimal_notation(posting_text)
     request = {
         "date": (parse_date(date) if date else datetime.date.today()).isoformat(),
         "flag": flag,
@@ -264,7 +224,7 @@ def add_balance(
     if "\n" not in single and "\r" not in single:
         # Multi-line text is the engine's complaint to make; this only rejects
         # an exponent, which no Beancount amount accepts.
-        _check_decimal_notation(single)
+        check_decimal_notation(single)
     day = parse_date(date)
     request: dict[str, Any] = {"date": day.isoformat(), "account": account, "amount": single, "force": force}
     ctx = context.current()
@@ -372,15 +332,15 @@ def add_price(
     into: IntoOpt = None,
     force: Annotated[
         bool,
-        typer.Option("--force", help="Record another quote when the date/commodity already has one"),
+        typer.Option("--force", help="Record another quote when the ledger already has one for the date/commodity"),
     ] = False,
 ) -> None:
-    """Append a price, or report an exact existing date/commodity/amount match."""
+    """Append a price, or report an exact ledger-authored date/commodity/amount match."""
     number, price_currency = _parse_amount(_single_amount(amount, "price"))
     request = {
         "date": parse_date(date).isoformat(),
         "currency": currency,
-        "number": str(number),
+        "number": format(number, "f"),
         "amount_currency": price_currency,
         "force": force,
     }
@@ -501,10 +461,10 @@ def _parse_custom_value(raw: str) -> dict[str, Any]:
     if kind == "text":
         return {"kind": "text", "value": rest}
     if kind == "number":
-        return {"kind": "number", "value": str(_parse_number(rest))}
+        return {"kind": "number", "value": format(parse_decimal_number(rest), "f")}
     if kind == "amount":
         number, currency = _parse_amount(rest)
-        return {"kind": "amount", "number": str(number), "currency": currency}
+        return {"kind": "amount", "number": format(number, "f"), "currency": currency}
     if kind == "account":
         return {"kind": "account", "value": rest}
     if kind == "bool" and rest.lower() in {"true", "false"}:
@@ -515,13 +475,20 @@ def _parse_custom_value(raw: str) -> dict[str, Any]:
 
 
 def _load_transactions_json(from_file: Path) -> Any:
-    """Read and parse `--from`; unreadable input is a usage error, phrased like `--file`'s."""
-    if str(from_file) == "-":
-        text = sys.stdin.read()
+    """Read and parse `--from`; unreadable input is a usage error, phrased like `--file`'s.
+
+    Stdin is read as bytes and decoded exactly like a file: the text stream
+    would decode with the locale's codec (and its error handler), so the same
+    bytes could pass on one machine and fail with a raw codec error on another.
+    """
+    stdin = str(from_file) == "-"
+    name = "stdin" if stdin else str(from_file)
+    if stdin:
+        buffer = getattr(sys.stdin, "buffer", None)
+        data = buffer.read() if buffer is not None else sys.stdin.read().encode("utf-8")
     else:
         try:
-            # utf-8-sig matches CSV import: editors that emit a BOM stay valid.
-            text = from_file.read_text(encoding="utf-8-sig")
+            data = from_file.read_bytes()
         except FileNotFoundError as exc:
             raise UsageError(
                 f"No transactions file at '{from_file}' (from --from). "
@@ -533,13 +500,45 @@ def _load_transactions_json(from_file: Path) -> Any:
             ) from exc
         except OSError as exc:
             raise UsageError(f"Cannot read transactions file '{from_file}' (from --from): {exc.strerror}.") from exc
-        except UnicodeDecodeError as exc:
-            raise UsageError(decode_error_message(from_file, exc)) from exc
-    text = text.removeprefix("\ufeff")
+    utf16 = f"'{name}' (from --from) looks like UTF-16 text; re-save it as UTF-8 and retry."
     try:
-        return json.loads(text)
+        # utf-8-sig matches CSV import: editors that emit a BOM stay valid.
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        message = decode_error_message(name, exc)
+        if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+            message = f"{message} {utf16}"
+        raise UsageError(message) from exc
+    if "\x00" in text:
+        # BOM-less UTF-16 decodes as UTF-8 with a NUL beside every ASCII byte;
+        # JSON text can never hold a raw NUL.
+        raise UsageError(utf16)
+    try:
+        return json.loads(text, object_pairs_hook=_unique_keys)
     except json.JSONDecodeError as exc:
         raise UsageError(f"Invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}.") from exc
+    except RecursionError as exc:
+        raise UsageError(f"'{name}' (from --from) nests JSON too deeply; send a flat array of rows.") from exc
+    except ValueError as exc:
+        # A duplicate key, or an integer longer than Python will convert.
+        raise UsageError(f"Invalid JSON in '{name}' (from --from): {_json_value_problem(exc)}") from exc
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """A JSON object whose keys are distinct; a repeated key would silently keep only the last value."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"key {key!r} appears more than once in one object; keep one.")
+        result[key] = value
+    return result
+
+
+def _json_value_problem(exc: ValueError) -> str:
+    message = str(exc)
+    if "integer string conversion" in message:
+        return "a number has too many digits; send amounts as decimal strings such as '1538.25'."
+    return message
 
 
 @add_app.command("transactions")

@@ -1,3 +1,4 @@
+import type { IFeedService } from "@/features/gitea/feed/service/feed-service";
 import type { ILegacyEntryWorkflow } from "@/features/ledger/workflow/legacy-entry-workflow";
 import type { ILedgerEntryService } from "@/features/ledger/service/ledger-entry-service";
 import type { IAiCfoUsageService } from "@/features/feature-usage/service/ai-cfo-usage-service";
@@ -17,12 +18,14 @@ import type { Identity } from "@/server/api/identity";
 import { BadUserInputError, ForbiddenError } from "@/shared/errors";
 import { CLASS_BUDGETS } from "@/server/api/rate-limit";
 import { LEDGER_ID_PATTERN } from "./mcp-ledger-selection";
+import { parseLedgerId } from "@/shared/str";
 
 export { ledgerSelection } from "./mcp-ledger-selection";
 
 /** A credential may select a ledger per call or perform account-only work. */
 export type McpRequestContext = Omit<ToolContext, "ledgerId"> & {
   ledgerId?: string;
+  feedService: IFeedService;
   socialService: Pick<
     IUserProfileService,
     | "getUserProfile"
@@ -94,6 +97,7 @@ export function resolveMcpLedger(
       'Call `listLedgers`, then pass `ledger: "owner/name"` on this call. A credential pinned to one ledger may omit it.',
     );
   }
+  parseLedgerId(ledger);
   if (context.identity.ledgerScope && ledger !== context.identity.ledgerScope) {
     throw new ForbiddenError(
       "The selected ledger is outside this credential's ledger restriction",

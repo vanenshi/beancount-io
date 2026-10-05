@@ -13,7 +13,7 @@ use in `ledger/write.py`):
 <sha256(url)[:32]>/
   head.json              # revision, next_refresh_at, last_error
   <revision>.beancount   # exact validated bytes
-  <revision>.json        # etag, fetched_at, and the feed summary
+  <revision>.json        # etag, sha256 of the text, fetched_at, feed summary
 ```
 
 The ETag lives on the blob, not the head, exactly as hosted: a head whose
@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
+from contextlib import suppress
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal
@@ -48,6 +49,7 @@ from bea_engine.managed_prices import (
     check_feed_identity,
     feed_revision_id,
     fetch_managed_price_feed,
+    observed_instant,
     validate_managed_price_text,
 )
 from bea_engine.protocol import LedgerError
@@ -60,6 +62,9 @@ RETRY_SECONDS = 60
 
 STALE_SECONDS = 600
 """Observation age beyond which a source reads `stale` (ADR 015 section 8)."""
+
+FUTURE_SKEW_SECONDS = 300
+"""How far ahead of the clock an observation may claim to be and still read recent."""
 
 
 @dataclass(frozen=True)
@@ -93,8 +98,9 @@ class ResolvedFeed:
 
 def cache_root() -> Path:
     """Where feed revisions live — beside the write locks, under XDG cache."""
-    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache").expanduser()
-    return base / "bea" / "managed-prices"
+    from bea_engine.ledger.write import cache_dir
+
+    return cache_dir() / "managed-prices"
 
 
 def feed_dir(url: str, root: Path | None = None) -> Path:
@@ -118,6 +124,11 @@ def _read_blob(directory: Path, revision: str) -> PriceFeedBlob | None:
     try:
         text = (directory / f"{revision}.beancount").read_text(encoding="utf-8")
         raw = json.loads((directory / f"{revision}.json").read_text(encoding="utf-8"))
+        digest = raw.get("sha256")
+        if digest is not None and digest != _digest(text):
+            # The bytes are not what was validated: treat the blob as missing
+            # so the next refresh fetches in full (no ETag) and heals it.
+            return None
         feed = raw["feed"]
         return PriceFeedBlob(
             url=raw["url"],
@@ -148,12 +159,55 @@ def _read_blob(directory: Path, revision: str) -> PriceFeedBlob | None:
         return None
 
 
-def _write_text(path: Path, text: str) -> None:
-    """Write atomically, so a crash never leaves a half-written cache file."""
+def _digest(text: str) -> str:
+    return sha256(text.encode("utf-8")).hexdigest()
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Write atomically, so a crash never leaves a half-written cache file.
+
+    The temp file is unique per write: concurrent loads racing on the same
+    feed must never share (and so consume or truncate) each other's temp.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+CACHE_WRITE_PROBLEM = "price cache not writable"
+"""How every recorded cache-write failure begins, so loads can warn about it."""
+
+
+def cache_write_problem(error: OSError, path: Path) -> str:
+    """The error text recorded when the feed cache cannot be written."""
+    return f"{CACHE_WRITE_PROBLEM} ({error.strerror or error}): {path}"
+
+
+def _try_write(path: Path, text: str) -> str | None:
+    """Write atomically; on failure answer the problem instead of raising.
+
+    Lenient resolution never fails for a cache problem: a read-only or full
+    cache degrades to serving from memory, with the cause recorded.
+    """
+    try:
+        write_text_atomic(path, text)
+    except OSError as error:
+        return cache_write_problem(error, path)
+    return None
+
+
+def _persist_head(directory: Path, head: PriceFeedHead) -> PriceFeedHead:
+    """Write `head`; the head this load reports carries any write failure."""
+    problem = _try_write(directory / "head.json", json.dumps(asdict(head)))
+    if problem is None:
+        return head
+    return PriceFeedHead(revision=head.revision, next_refresh_at=head.next_refresh_at, last_error=problem)
 
 
 def freshness(
@@ -168,15 +222,12 @@ def freshness(
     """
     if blob is None:
         return "unavailable"
-    stamp = blob.feed.latest_observed_at
-    if stamp is None:
+    instant = observed_instant(blob.feed.latest_observed_at)
+    if instant is None:
         return "stale"
-    moment = stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp
-    try:
-        age = now - datetime.fromisoformat(moment).timestamp()
-    except ValueError:
-        return "stale"
-    return "recent" if age <= stale_seconds else "stale"
+    age = now - instant
+    # An observation from well past the clock is not evidence of freshness.
+    return "recent" if -FUTURE_SKEW_SECONDS <= age <= stale_seconds else "stale"
 
 
 def resolve_feed(
@@ -225,7 +276,7 @@ def resolve_feed(
     )
     if result.kind == "not-modified" and previous is not None:
         refreshed = PriceFeedHead(revision=previous.revision, next_refresh_at=at + refresh_seconds, last_error=None)
-        _write_text(directory / "head.json", json.dumps(asdict(refreshed)))
+        refreshed = _persist_head(directory, refreshed)
         resolved = ResolvedFeed(blob=previous, head=refreshed)
         _enforce_strict(url, resolved, at, stale_seconds, strict)
         return resolved
@@ -246,15 +297,17 @@ def resolve_feed(
                 feed=validation.feed,
             )
             # The blob must exist before the head points at it; the superseded
-            # blob can go while the head is written.
-            _write_text(directory / f"{revision}.beancount", result.text)
-            _write_text(
+            # blob can go while the head is written. A cache that cannot be
+            # written still serves the validated feed for this load.
+            refreshed = PriceFeedHead(revision=revision, next_refresh_at=at + refresh_seconds, last_error=None)
+            problem = _try_write(directory / f"{revision}.beancount", result.text) or _try_write(
                 directory / f"{revision}.json",
                 json.dumps(
                     {
                         "url": url,
                         "revision": revision,
                         "etag": result.etag,
+                        "sha256": _digest(result.text),
                         "fetched_at": at,
                         "feed": {
                             **asdict(validation.feed),
@@ -263,14 +316,17 @@ def resolve_feed(
                     }
                 ),
             )
-            refreshed = PriceFeedHead(revision=revision, next_refresh_at=at + refresh_seconds, last_error=None)
-            _write_text(directory / "head.json", json.dumps(asdict(refreshed)))
-            if previous is not None and previous.revision != revision:
-                (directory / f"{previous.revision}.beancount").unlink(missing_ok=True)
-                (directory / f"{previous.revision}.json").unlink(missing_ok=True)
-                # Per-ledger effective texts key off the revision; they die with it.
-                for effective in directory.glob(f"{previous.revision}.effective.*.beancount"):
-                    effective.unlink(missing_ok=True)
+            if problem is None:
+                refreshed = _persist_head(directory, refreshed)
+            else:
+                refreshed = PriceFeedHead(revision=revision, next_refresh_at=at + refresh_seconds, last_error=problem)
+            if refreshed.last_error is None and previous is not None and previous.revision != revision:
+                with suppress(OSError):
+                    (directory / f"{previous.revision}.beancount").unlink(missing_ok=True)
+                    (directory / f"{previous.revision}.json").unlink(missing_ok=True)
+                    # Per-ledger effective texts key off the revision; they die with it.
+                    for effective in directory.glob(f"{previous.revision}.effective.*.beancount"):
+                        effective.unlink(missing_ok=True)
             resolved = ResolvedFeed(blob=blob, head=refreshed)
             _enforce_strict(url, resolved, at, stale_seconds, strict)
             return resolved
@@ -285,7 +341,9 @@ def resolve_feed(
         message = f"fetch failed ({result.reason}): {result.message}"
 
     degraded = PriceFeedHead(revision=head.revision, next_refresh_at=at + retry_seconds, last_error=message)
-    _write_text(directory / "head.json", json.dumps(asdict(degraded)))
+    # The fetch failure is the error worth reporting; an unwritable cache
+    # only means the next load retries sooner.
+    _try_write(directory / "head.json", json.dumps(asdict(degraded)))
     resolved = ResolvedFeed(blob=previous, head=degraded)
     _enforce_strict(url, resolved, at, stale_seconds, strict)
     return resolved
@@ -336,5 +394,5 @@ def zero_next_refresh(url: str, root: Path | None = None) -> PriceFeedHead:
     directory = feed_dir(url, root)
     head = _read_head(directory)
     refreshed = PriceFeedHead(revision=head.revision, next_refresh_at=0.0, last_error=head.last_error)
-    _write_text(directory / "head.json", json.dumps(asdict(refreshed)))
+    write_text_atomic(directory / "head.json", json.dumps(asdict(refreshed)))
     return refreshed

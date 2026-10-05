@@ -16,6 +16,7 @@ date arithmetic, and the messages a person reads.
 from __future__ import annotations
 
 import datetime
+import os
 import re
 import unicodedata
 from decimal import Decimal, InvalidOperation
@@ -23,8 +24,9 @@ from pathlib import Path
 from typing import Any
 
 from bea_engine import protocol
+from bea_engine.amounts import parse_decimal_number
 from bea_engine.ledger import write, writer
-from bea_engine.ledger.text import parse_account, single_line
+from bea_engine.ledger.text import outside_ledger_tree, parse_account, single_line
 
 TYPES = (
     "transaction",
@@ -58,12 +60,61 @@ def answer(
         "balance": _balance,
         "price": _price,
     }
+    from pydantic import ValidationError
+
     build = builders.get(directive_type)
-    if build is not None:
-        return build(file, request, into=into, allow_errors=allow_errors, strict_read=strict_read)
-    if directive_type not in TYPES:
-        raise protocol.UsageError(f"Unknown directive type {directive_type!r}. Use one of: {', '.join(TYPES)}.")
-    return _appended(file, _simple(directive_type, request), allow_errors=allow_errors, into=into)
+    try:
+        if build is not None:
+            return build(file, request, into=into, allow_errors=allow_errors, strict_read=strict_read)
+        if directive_type not in TYPES:
+            raise protocol.UsageError(f"Unknown directive type {directive_type!r}. Use one of: {', '.join(TYPES)}.")
+        directive = _simple(directive_type, request)
+        if directive_type == "document":
+            _require_document_in_tree(file, into, directive.filename)
+        return _appended(file, directive, allow_errors=allow_errors, into=into)
+    except ValidationError as exc:
+        # A typed field the models refused — a tag, link, flag or commodity that
+        # is not one Beancount token — is bad input, refused before any write.
+        message = (
+            _HEADER_ERROR
+            if directive_type == "transaction"
+            else f"Invalid {directive_type} options. Nothing was written."
+        )
+        raise protocol.UsageError(message, details=_validation_details(exc)) from None
+
+
+def _require_document_in_tree(file: Path, into: Path | None, filename: str) -> None:
+    """Refuse a relative path that climbs out of the ledger tree, as `check` would.
+
+    Beancount resolves a document path against the directory of the file that
+    holds it, and `check` refuses one that lands outside the root ledger's
+    directory; checking only for an absolute path let `../elsewhere.pdf` write
+    a ledger the very next `check` failed.
+    """
+    root = Path(os.path.abspath(file)).parent
+    holder = root if into is None else write.destination(file, into).parent
+    if outside_ledger_tree(holder / filename, root):
+        raise protocol.UsageError(
+            f"Document path {filename!r} resolves outside the ledger directory {root.resolve()}, which "
+            "`bea check` refuses because copies of the ledger would lose it. Move the file under the "
+            "ledger directory and pass a relative --path."
+        )
+
+
+_HEADER_ERROR = (
+    "Invalid transaction header (--tag, --link, --flag, --payee, --narration, or --meta). Nothing was written."
+)
+_OPTION_NAMES = {"tags": "--tag", "links": "--link", "flag": "--flag", "currencies": "--currency", "values": "--value"}
+
+
+def _validation_details(exc: Any) -> list[str]:
+    """One `--option: reason` line per refused field."""
+    details = []
+    for error in exc.errors(include_url=False, include_input=False):
+        field = str(error["loc"][0]) if error["loc"] else ""
+        option = _OPTION_NAMES.get(field, f"--{field.replace('_', '-')}" if field else "input")
+        details.append(f"{option}: {str(error['msg']).removeprefix('Value error, ')}")
+    return details
 
 
 # --------------------------------------------------------------------------- #
@@ -73,6 +124,7 @@ def answer(
 
 def _simple(directive_type: str, request: dict[str, Any]) -> Any:
     from bea_engine.ledger.models import (
+        WRITE_INPUT,
         CloseDirective,
         CommodityDirective,
         CustomDirective,
@@ -94,11 +146,14 @@ def _simple(directive_type: str, request: dict[str, Any]) -> Any:
             raise protocol.UsageError(
                 "Every --currency value is blank after trimming; supply a currency symbol or omit -c."
             )
-        return OpenDirective(
-            date=date,
-            account=parse_account(_text(request, "account")),
-            currencies=currencies,
-            booking=booking,
+        return OpenDirective.model_validate(
+            {
+                "date": date,
+                "account": parse_account(_text(request, "account")),
+                "currencies": currencies,
+                "booking": booking,
+            },
+            context=WRITE_INPUT,
         )
     if directive_type == "close":
         return CloseDirective(date=date, account=parse_account(_text(request, "account")))
@@ -121,10 +176,13 @@ def _simple(directive_type: str, request: dict[str, Any]) -> Any:
             description=single_line(_text(request, "description")),
         )
     if directive_type == "commodity":
-        return CommodityDirective(
-            date=date,
-            currency=_text(request, "currency"),
-            meta=_parse_metadata([str(item) for item in request.get("meta") or []]),
+        return CommodityDirective.model_validate(
+            {
+                "date": date,
+                "currency": _text(request, "currency"),
+                "meta": _parse_metadata([str(item) for item in request.get("meta") or []]),
+            },
+            context=WRITE_INPUT,
         )
     if directive_type == "document":
         filename = _text(request, "filename")
@@ -133,12 +191,15 @@ def _simple(directive_type: str, request: dict[str, Any]) -> Any:
                 f"Document path {filename!r} must be relative to the destination ledger file's "
                 "directory so copies of the ledger stay portable. Pass a relative --path."
             )
-        return DocumentDirective(
-            date=date,
-            account=parse_account(_text(request, "account")),
-            filename=filename,
-            tags=list(request.get("tags") or []),
-            links=list(request.get("links") or []),
+        return DocumentDirective.model_validate(
+            {
+                "date": date,
+                "account": parse_account(_text(request, "account")),
+                "filename": filename,
+                "tags": list(request.get("tags") or []),
+                "links": list(request.get("links") or []),
+            },
+            context=WRITE_INPUT,
         )
     values = list(request.get("values") or [])
     if not values:
@@ -153,7 +214,9 @@ def _simple(directive_type: str, request: dict[str, Any]) -> Any:
             parse_account(str(value.get("value", "")))
         if isinstance(value, dict) and value.get("kind") == "text" and isinstance(value.get("value"), str):
             value["value"] = single_line(value["value"])
-    return CustomDirective.model_validate({"date": date, "type": single_line(_text(request, "type")), "values": values})
+    return CustomDirective.model_validate(
+        {"date": date, "type": single_line(_text(request, "type")), "values": values}, context=WRITE_INPUT
+    )
 
 
 def _appended(file: Path, directive: Any, *, allow_errors: bool, into: Path | None) -> dict[str, Any]:
@@ -201,7 +264,7 @@ def _balance(
         snapshot = write.LedgerSnapshot.capture(file)
         target = write.destination(file, into)
         snapshot.require_target(target)
-        entries, errors, _ = managed_load.load_file(file)
+        entries, errors, _ = managed_load.load_file(file, snapshot=snapshot)
         ledger_errors = [format_error(error, ledger_file=file) for error in errors]
         if ledger_errors and strict_read and not all("Unused Pad" in error for error in ledger_errors):
             # A staged pad is the transient error this very write resolves:
@@ -246,11 +309,26 @@ def _balance(
     try:
         warnings = write.append(file, [writer.format_entry(e) for e in entries], allow_errors=allow_errors, into=into)
     except protocol.LedgerError as exc:
-        # A zero residual makes Beancount reject the pad as unused. The atomic
-        # --pad-from path still wants the assertion; write that alone.
+        # The only failure worth a retry is a pad Beancount reports unused;
+        # anything else stands. Why it went unused decides what happens next.
         if allow_errors or not _unused_pad_only(exc):
             raise
-        loaded, _, _ = managed_load.load_file(file)
+        source_account = parse_account(str(pad_from))
+        loaded, before_errors, options = managed_load.load_file(file)
+        staged = [
+            f"{format_error(error, ledger_file=file)} "
+            f"({error.entry.date} pad {error.entry.account} {error.entry.source_account})"
+            for error in before_errors
+            if "Unused Pad" in getattr(error, "message", "") and isinstance(error.entry, Pad)
+        ]
+        if staged:
+            # A pad already waiting for its balance is the failure, not this
+            # write; retrying without the new pad only blamed the assertion.
+            raise protocol.LedgerError(
+                "The ledger has a staged pad still waiting for its balance assertion; nothing was written. "
+                "Complete that pair (add its balance without --pad-from) or remove the pad, then retry.",
+                details=staged,
+            ) from exc
         match = _balance_match(loaded, date, account, number, currency, tolerance)
         if match is not None:
             source = {"filename": match.meta.get("filename"), "lineno": match.meta.get("lineno")}
@@ -265,11 +343,37 @@ def _balance(
                 "source": source,
                 "target": str(write.destination(file, into)),
             }
+        difference = number - _book_units(loaded, account, currency, date)
+        if abs(difference) <= _balance_tolerance(entries[1], options):
+            result = _appended(file, directive, allow_errors=allow_errors, into=into)
+            warnings = list(result.get("warnings") or [])
+            warnings.append(
+                f"Book balance already matches {number} {currency}; omitted the pad from "
+                "--pad-from and wrote the assertion alone."
+            )
+            result["warnings"] = warnings
+            return result
+        # The book does not match, so the new pad went unused because an
+        # existing pad fills this assertion instead (Beancount pads every
+        # currency of the next assertion after the latest pad).
+        cover = _covering_pad(loaded, account, date)
+        if cover is None:
+            raise
+        pad_at = f"{cover.meta.get('filename')}:{cover.meta.get('lineno')}"
+        if cover.source_account != source_account:
+            raise protocol.LedgerError(
+                f"The existing pad at {pad_at} ({cover.date} from {cover.source_account}) already fills this "
+                f"assertion, so a pad from {source_account} would go unused; nothing was written.",
+                details=[
+                    f"Add the balance without --pad-from to let that pad insert {difference} {currency} "
+                    f"from {cover.source_account}, or edit that pad first."
+                ],
+            ) from exc
         result = _appended(file, directive, allow_errors=allow_errors, into=into)
         warnings = list(result.get("warnings") or [])
         warnings.append(
-            f"Book balance already matches {number} {currency}; omitted the pad from "
-            "--pad-from and wrote the assertion alone."
+            f"The existing pad at {pad_at} ({cover.date} from {cover.source_account}) fills this assertion, "
+            f"inserting {difference} {currency}; omitted the pad from --pad-from and wrote the assertion alone."
         )
         result["warnings"] = warnings
         return result
@@ -294,9 +398,8 @@ def _balance_match(
             if isinstance(entry, Balance)
             and entry.date == date
             and entry.account == account
-            and entry.amount.number == number
             and entry.amount.currency == currency
-            and entry.tolerance == tolerance
+            and _same_assertion(entry, number, tolerance)
         ),
         None,
     )
@@ -316,15 +419,72 @@ def _balance_conflict(
             and entry.date == date
             and entry.account == account
             and entry.amount.currency == currency
-            and (entry.amount.number != number or entry.tolerance != tolerance)
+            and not _same_assertion(entry, number, tolerance)
         ),
         None,
     )
 
 
+def _same_assertion(entry: Any, number: Decimal, tolerance: Decimal | None) -> bool:
+    """Whether an existing balance asserts exactly what `number`/`tolerance` would.
+
+    Without an explicit tolerance Beancount infers one from the number's
+    precision, so `10.3 USD` (within 0.05) and `10.30 USD` (within 0.005) are
+    different assertions even though the Decimals compare equal.
+    """
+    if entry.amount.number != number or entry.tolerance != tolerance:
+        return False
+    return tolerance is not None or entry.amount.number.as_tuple().exponent == number.as_tuple().exponent
+
+
 def _balance_amount(number: Decimal, currency: str, tolerance: Decimal | None) -> str:
     """A balance amount as the user typed it, tolerance included."""
     return f"{number} {currency}" if tolerance is None else f"{number} ~ {tolerance} {currency}"
+
+
+def _book_units(entries: list[Any], account: str, currency: str, date: datetime.date) -> Decimal:
+    """Units of `currency` in `account` and its children when a `date` assertion runs.
+
+    Assertions run at the start of the day, so only earlier postings count —
+    including the padding Beancount already inserted for earlier pads.
+    """
+    from beancount.core.data import Transaction
+
+    prefix = f"{account}:"
+    return sum(
+        (
+            posting.units.number
+            for entry in entries
+            if isinstance(entry, Transaction) and entry.date < date
+            for posting in entry.postings
+            if (posting.account == account or posting.account.startswith(prefix))
+            and posting.units is not None
+            and posting.units.currency == currency
+            and posting.units.number is not None
+        ),
+        Decimal(0),
+    )
+
+
+def _balance_tolerance(balance: Any, options: dict[str, Any]) -> Decimal:
+    from beancount.ops.balance import get_balance_tolerance
+
+    tolerance: Decimal = get_balance_tolerance(balance, options)  # type: ignore[no-untyped-call]
+    return tolerance
+
+
+def _covering_pad(entries: list[Any], account: str, date: datetime.date) -> Any | None:
+    """The pad Beancount would apply to an assertion on `account` at `date`: the latest before it."""
+    from beancount.core.data import Pad
+
+    return next(
+        (
+            entry
+            for entry in reversed(entries)
+            if isinstance(entry, Pad) and entry.account == account and entry.date < date
+        ),
+        None,
+    )
 
 
 def _unused_pad_only(exc: protocol.LedgerError) -> bool:
@@ -361,45 +521,56 @@ def _parse_balance_amount(text: str) -> tuple[Decimal, str, Decimal | None]:
 def _price(
     file: Path, request: dict[str, Any], *, into: Path | None, allow_errors: bool, strict_read: bool
 ) -> dict[str, Any]:
-    """Append a price, or report the existing directive that already records it.
+    """Append a price, or report the ledger-authored directive already recording it.
 
-    Recording the same quote twice is not an error and not a change, so the
-    duplicate is answered with its source location and the file is left alone.
+    Repeating a local quote is a no-op with its source location. A managed
+    quote can be pinned or overridden in the ledger without forcing a conflict.
     """
     from beancount.core.amount import Amount as BcAmount
     from beancount.core.data import Price
 
     from bea_engine import managed_load
-    from bea_engine.ledger.models import Amount, PriceDirective
+    from bea_engine.ledger.models import WRITE_INPUT, PriceDirective
+    from bea_engine.ledger.reader import entry_generated
+    from bea_engine.managed_price_cache import managed_source_for_path
     from bea_engine.query import format_error
 
     currency = _text(request, "currency")
     number = _decimal(request, "number")
     amount_currency = _text(request, "amount_currency")
-    directive = PriceDirective(
-        date=_date(request), currency=currency, amount=Amount(number=number, currency=amount_currency)
+    directive = PriceDirective.model_validate(
+        {"date": _date(request), "currency": currency, "amount": {"number": number, "currency": amount_currency}},
+        context=WRITE_INPUT,
     )
     snapshot = write.LedgerSnapshot.capture(file)
     target = write.destination(file, into)
     snapshot.require_target(target)
-    entries, errors, _ = managed_load.load_file(file)
+    entries, errors, _ = managed_load.load_file(file, snapshot=snapshot)
     ledger_errors = [format_error(error, ledger_file=file) for error in errors]
     if ledger_errors and strict_read:
         raise protocol.LedgerError(
             f"Ledger has {len(ledger_errors)} error(s). Pass --allow-errors to report anyway.", details=ledger_errors
         )
-    match = next(
-        (
-            entry
-            for entry in entries
-            if isinstance(entry, Price)
-            and entry.date == directive.date
-            and entry.currency == currency
-            and entry.amount.number == number
-            and entry.amount.currency == amount_currency
-        ),
-        None,
-    )
+    local_prices: list[Price] = []
+    managed_sources: set[str] = set()
+    pair = (currency, amount_currency)
+    shadowed_pairs = {pair, (amount_currency, currency)}
+    for entry in entries:
+        if not isinstance(entry, Price) or entry.date != directive.date:
+            continue
+        entry_pair = (entry.currency, entry.amount.currency)
+        if entry_pair not in shadowed_pairs:
+            continue
+        filename = entry.meta.get("filename")
+        managed_source = managed_source_for_path(Path(filename)) if isinstance(filename, str) and filename else None
+        if managed_source is not None:
+            managed_sources.add(managed_source)
+        elif entry_pair == pair and not entry_generated(entry, "price"):
+            # A plugin-made price (implicit_prices) borrows its transaction's
+            # location; it is no ledger-authored quote to match or conflict with.
+            local_prices.append(entry)
+
+    match = next((entry for entry in local_prices if entry.amount.number == number), None)
     if match is not None:
         snapshot.verify()
         source = {"filename": match.meta.get("filename"), "lineno": match.meta.get("lineno")}
@@ -412,18 +583,7 @@ def _price(
             "ledger_errors": ledger_errors,
             "target": str(target),
         }
-    conflict = next(
-        (
-            entry
-            for entry in entries
-            if isinstance(entry, Price)
-            and entry.date == directive.date
-            and entry.currency == currency
-            and entry.amount.currency == amount_currency
-            and entry.amount.number != number
-        ),
-        None,
-    )
+    conflict = next((entry for entry in local_prices if entry.amount.number != number), None)
     if conflict is not None and not request.get("force"):
         where = conflict.meta.get("filename"), conflict.meta.get("lineno")
         raise protocol.UsageError(
@@ -434,6 +594,7 @@ def _price(
 
     entry = Price({}, directive.date, currency, BcAmount(number, amount_currency))
     warnings = write.append(file, [writer.format_entry(entry)], allow_errors=allow_errors, into=into, snapshot=snapshot)
+    warnings.extend(f"Ledger price shadows the managed quote from {source}." for source in sorted(managed_sources))
     return {
         "written": 1,
         "directive": directive.model_dump(mode="json"),
@@ -460,7 +621,7 @@ def _transaction(
     from beancount.parser.grammar import ParserError
 
     from bea_engine import managed_load
-    from bea_engine.ledger.models import TransactionHeader
+    from bea_engine.ledger.models import WRITE_INPUT, TransactionHeader
     from bea_engine.ledger.reader import metadata_to_json
 
     postings: list[str] = [str(posting) for posting in request.get("postings") or []]
@@ -470,15 +631,18 @@ def _transaction(
         if parts and len(parts[0]) == 1:
             parts = parts[1:]
         parse_account(parts[0] if parts else "")
-    header = TransactionHeader(
-        date=_date(request),
-        flag=str(request.get("flag") or "*"),
-        payee=request.get("payee"),
-        narration=request.get("narration"),
-        postings=[],
-        tags=list(request.get("tags") or []),
-        links=list(request.get("links") or []),
-        meta=_parse_metadata([str(item) for item in request.get("meta") or []]),
+    header = TransactionHeader.model_validate(
+        {
+            "date": _date(request),
+            "flag": str(request.get("flag") or "*"),
+            "payee": request.get("payee"),
+            "narration": request.get("narration"),
+            "postings": [],
+            "tags": list(request.get("tags") or []),
+            "links": list(request.get("links") or []),
+            "meta": _parse_metadata([str(item) for item in request.get("meta") or []]),
+        },
+        context=WRITE_INPUT,
     )
     header_text = writer.format_transaction(header)
     text = header_text + "".join(f"  {item.strip()}\n" for item in postings)
@@ -493,10 +657,7 @@ def _transaction(
             location = f"--posting {posting_number}" if 0 < posting_number <= len(postings) else "Transaction options"
             details.append(f"{location}: {error.message}")
         if details and all(detail.startswith("Transaction options:") for detail in details):
-            message = (
-                "Invalid transaction header (--tag, --link, --flag, --payee, --narration, or --meta). "
-                "Nothing was written."
-            )
+            message = _HEADER_ERROR
         else:
             message = (
                 "Invalid transaction options; use postings such as 'Assets:Checking -30 USD'. Nothing was written."
@@ -547,13 +708,24 @@ def _transaction(
         raise protocol.UsageError(f"{_ZERO_NET_INFERRED} Nothing was written.")
     entry = entry._replace(postings=normalized, meta=write.metadata_for_write(entry.meta))
     rendered = writer.format_entry(entry)
+    totals = [(posting.meta or {}).get(writer.TOTAL_PRICE_META) for posting in entry.postings]
     # The `@@` stash served the render; the JSON answer must not carry it.
     # Normalized posting metas hold nothing else, so they go back to empty.
     entry = entry._replace(postings=[posting._replace(meta={}) for posting in entry.postings])
+    # Encode the answer before the write, never after: the envelope is built
+    # once this function returns, and a value it could not encode used to fail
+    # with the directive already appended, so every retry appended another copy.
+    directive = protocol.jsonable(entry._replace(meta=metadata_to_json(entry.meta)))
+    # A `@@` total is reported as the bulk schema's `price_total`, not as the
+    # divided unit price, so feeding the answer back writes the same `@@`.
+    for posting, total in zip(directive["postings"], totals, strict=True):
+        posting["price_total"] = None if total is None else protocol.jsonable(total)
+        if total is not None:
+            posting["price"] = None
     warnings = write.append(file, [rendered], allow_errors=allow_errors, into=into, snapshot=snapshot)
     return {
         "written": 1,
-        "directive": entry._replace(meta=metadata_to_json(entry.meta)),
+        "directive": directive,
         "entry": rendered,
         "warnings": warnings,
         "target": str(write.destination(file, into)),
@@ -738,7 +910,9 @@ def _parse_metadata(items: list[str]) -> dict[str, Any]:
                 f"Invalid --meta key {key!r}; Beancount rejected it ({errors[0].message}).",
                 details=[str(error.message) for error in errors],
             )
-        elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        elif re.fullmatch(r"[0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2}", raw):
+            # Beancount's date grammar: a slash or unpadded spelling of an
+            # impossible day used to fall through and be stored as text.
             raise protocol.UsageError(
                 f"Invalid --meta date for {key!r}: {raw!r} is not a valid calendar date. "
                 "Use YYYY-MM-DD (for example 2020-01-15). Nothing was written."
@@ -753,13 +927,73 @@ def _parse_metadata(items: list[str]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
+_TAGGED_META_KEYS = {
+    "number": {"kind", "value"},
+    "date": {"kind", "value"},
+    "amount": {"kind", "number", "currency"},
+}
+
+_META_VALUE_HELP = (
+    'use text, a boolean, a number, or a tagged object such as {"kind":"number","value":"1.25"}, '
+    '{"kind":"date","value":"2026-08-03"} or {"kind":"amount","number":"5.25","currency":"USD"}.'
+)
+
+
+def _bulk_meta_problems(location: str, meta: dict[str, Any]) -> list[str]:
+    """Each bulk metadata value Beancount cannot write as asked, as `location.key: reason`.
+
+    Write input only — listings convert loaded metadata without this check.
+    Reserved source-location keys used to be dropped silently, and a value the
+    printer cannot render (an array) escaped per-row handling, aborting the
+    whole batch with no row number even under `--partial`.
+    """
+    problems = []
+    for key, value in meta.items():
+        path = f"{location}.{key}"
+        if key in {"filename", "lineno"}:
+            problems.append(
+                f"{path}: Metadata key {key!r} is reserved for Beancount source location; choose another key."
+            )
+            continue
+        if isinstance(value, dict):
+            kind = value.get("kind")
+            expected = _TAGGED_META_KEYS.get(kind) if isinstance(kind, str) else None
+            if expected is None:
+                problems.append(f"{path}: Unsupported metadata value; {_META_VALUE_HELP}")
+                continue
+            if set(value) != expected:
+                keys = ", ".join(sorted(expected))
+                problems.append(f"{path}: A {kind!r} metadata object takes exactly the keys {keys}.")
+                continue
+            number = value.get("value" if kind == "number" else "number")
+            if kind != "date" and isinstance(number, str):
+                # Amounts' spelling rule: `Decimal()` alone reads `1_000`, `1e3`
+                # and non-ASCII digits that no other write path accepts.
+                try:
+                    parse_decimal_number(number)
+                except ValueError:
+                    problems.append(
+                        f"{path}: Invalid {kind!r} metadata for {key!r}: expected a decimal string with "
+                        f"ASCII digits and no exponent or underscores, such as '1.25'; got {number!r}."
+                    )
+                    continue
+        elif value is not None and not isinstance(value, str | bool | int | float):
+            problems.append(f"{path}: Unsupported metadata value of type {type(value).__name__}; {_META_VALUE_HELP}")
+            continue
+        try:
+            write.metadata_for_write({key: value})
+        except protocol.LedgerError as exc:
+            problems.append(f"{path}: {exc}")
+    return problems
+
+
 def _transactions(
     file: Path, request: dict[str, Any], *, into: Path | None, allow_errors: bool, strict_read: bool
 ) -> dict[str, Any]:
     del strict_read
     from pydantic import ValidationError
 
-    from bea_engine.ledger.models import TransactionDirective
+    from bea_engine.ledger.models import WRITE_INPUT, TransactionDirective
 
     rows = list(request.get("rows") or [])
     partial = bool(request.get("partial"))
@@ -769,12 +1003,33 @@ def _transactions(
     rejected_rows: list[int] = []
     for index, item in enumerate(rows):
         try:
-            valid.append((index, TransactionDirective.model_validate(item)))
+            directive = TransactionDirective.model_validate(item, context=WRITE_INPUT)
         except ValidationError as exc:
             for error in exc.errors(include_url=False, include_input=False):
                 location = ".".join(str(part) for part in error["loc"]) or "transaction"
                 rejected.append(f"Row {index + 1}, {location}: {error['msg']}")
             rejected_rows.append(index)
+            continue
+        # Typed metadata is only converted when rendered; check it here so a
+        # bad value (such as a JSON float) is refused per row, not mid-batch.
+        meta_errors: list[str] = []
+        for location, meta in [
+            ("meta", directive.meta),
+            *((f"postings.{n}.meta", p.meta) for n, p in enumerate(directive.postings)),
+        ]:
+            meta_errors.extend(f"Row {index + 1}, {problem}" for problem in _bulk_meta_problems(location, meta))
+        if not meta_errors:
+            # Every later step renders the row; a failure there would abort
+            # the whole batch and ignore --partial, so it is judged here.
+            try:
+                writer.format_transaction(directive)
+            except (protocol.LedgerError, ValueError, TypeError) as exc:
+                meta_errors.append(f"Row {index + 1}: {exc}")
+        if meta_errors:
+            rejected.extend(meta_errors)
+            rejected_rows.append(index)
+        else:
+            valid.append((index, directive))
 
     if rejected:
         rejected.append(
@@ -794,37 +1049,34 @@ def _transactions(
     valid = kept
 
     if rejected and not partial:
-        raise protocol.LedgerError(
-            f"{len(rejected_rows)} of {len(rows)} row(s) failed validation; nothing was written. "
+        # `--partial` only helps when some row passed; with none, the advice
+        # would cost a round trip that writes nothing.
+        remedy = (
             f"Fix them, or pass --partial to try appending schema-valid rows "
-            f"(ledger validation may still reject some of the {len(valid)}).",
+            f"(ledger validation may still reject some of the {len(valid)})."
+            if valid
+            else "Fix them and retry."
+        )
+        raise protocol.LedgerError(
+            f"{len(rejected_rows)} of {len(rows)} row(s) failed validation; nothing was written. {remedy}",
             details=rejected,
             result={"written": 0, "written_rows": [], "rejected_rows": rejected_rows},
         )
 
     # Validate the entire batch first: an earlier sale may depend on a buy that
     # appears later in the input. Only partial recovery needs sequential trials.
+    batch_texts = [writer.format_transaction(d) for _, d in valid]
     try:
-        write.validate_append(
-            file, [writer.format_transaction(d) for _, d in valid], allow_errors=allow_errors, into=into
-        )
+        write.validate_append(file, batch_texts, allow_errors=allow_errors, into=into)
     except protocol.LedgerError as batch_error:
         if not partial:
-            recoverable: list[int] = []
-            probe_texts: list[str] = []
-            for index, directive in valid:
-                try:
-                    text = writer.format_transaction(directive)
-                    write.validate_append(file, [*probe_texts, text], allow_errors=allow_errors, into=into)
-                except protocol.LedgerError:
-                    continue
-                else:
-                    recoverable.append(index)
-                    probe_texts.append(text)
             message = str(batch_error)
+            recoverable = _recoverable_rows(file, valid, batch_texts, batch_error, allow_errors=allow_errors, into=into)
             if recoverable:
                 noun = "row" if len(recoverable) == 1 else "rows"
                 message = f"{message} Pass --partial to append the {len(recoverable)} valid {noun}."
+            elif recoverable is None and len(valid) > 1:
+                message = f"{message} Pass --partial to append the rows that validate."
             raise protocol.LedgerError(
                 message,
                 details=list(batch_error.details),
@@ -866,6 +1118,69 @@ def _transactions(
             },
         )
     return {"written": len(valid), "rejected": [], "warnings": warnings, "target": target}
+
+
+def _recoverable_rows(
+    file: Path,
+    valid: list[tuple[int, Any]],
+    texts: list[str],
+    batch_error: protocol.LedgerError,
+    *,
+    allow_errors: bool,
+    into: Path | None,
+) -> list[int] | None:
+    """The rows `--partial` could append, from the refused batch's own errors.
+
+    Probing row by row cost a full ledger load per row — over a minute for a
+    dozen rows on a large ledger — just to word a hint. Instead the batch
+    error's line numbers are mapped back to the appended rows, and the rest
+    are confirmed with one more load. None means the errors could not be
+    attributed to rows (or the rest still fail), so no count is promised.
+    """
+    rows = _rows_with_errors(file, texts, batch_error, into=into)
+    if rows is None:
+        return None
+    kept = [(valid[number][0], text) for number, text in enumerate(texts) if number not in rows]
+    if not kept:
+        return []
+    try:
+        write.validate_append(file, [text for _, text in kept], allow_errors=allow_errors, into=into)
+    except protocol.LedgerError:
+        return None
+    return [index for index, _ in kept]
+
+
+def _rows_with_errors(
+    file: Path, texts: list[str], batch_error: protocol.LedgerError, *, into: Path | None
+) -> set[int] | None:
+    """Positions in `texts` whose appended lines carry an error, or None when one cannot be placed."""
+    locations = getattr(batch_error, "locations", None)
+    if not locations:
+        return None
+    target = write.destination(file, into)
+    try:
+        original = target.read_bytes() if target.exists() else b""
+        content = write.appended_content(original, texts)
+    except (OSError, UnicodeDecodeError):
+        return None
+    # Blocks are appended one after another, each after one separating line;
+    # walking back from the end gives every block's line span.
+    spans: list[tuple[int, int]] = []
+    end = content.count("\n")
+    for text in reversed(texts):
+        size = text.rstrip().count("\n") + 1  # the lexer's line count: `\n` only (w1/136)
+        spans.append((end - size + 1, end))
+        end -= size + 1
+    spans.reverse()
+    rows: set[int] = set()
+    for source, lineno in locations:
+        if lineno is None or Path(source).resolve() != target:
+            return None
+        hits = [number for number, (first, last) in enumerate(spans) if first <= lineno <= last]
+        if not hits:
+            return None
+        rows.add(hits[0])
+    return rows
 
 
 # --------------------------------------------------------------------------- #

@@ -29,22 +29,26 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sys
 import time
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.request import OpenerDirector
 
 from bea_engine.managed_price_cache import (
+    CACHE_WRITE_PROBLEM,
     PriceFeedBlob,
     cache_root,
+    cache_write_problem,
     feed_dir,
     freshness,
     resolve_feed,
+    write_text_atomic,
 )
 from bea_engine.managed_prices import (
     DEFAULT_ORIGINS,
@@ -55,6 +59,9 @@ from bea_engine.managed_prices import (
     parse_managed_price_url,
 )
 
+if TYPE_CHECKING:
+    from bea_engine.ledger.write import LedgerSnapshot
+
 ORIGINS_ENV = "MANAGED_PRICE_ORIGINS"
 """Comma-separated origin allowlist, mirroring the hosted variable; empty disables."""
 
@@ -64,13 +71,18 @@ OFFLINE_ENV = "MANAGED_PRICE_OFFLINE"
 STRICT_ENV = "MANAGED_PRICE_STRICT"
 """Set to fail the load on a stale or unavailable managed source."""
 
+# Beancount spells a date `YYYY-M-D` or `YYYY/M/D` (mixed separators, one or
+# two digit month and day); feed dates are always ISO, so normalise before
+# comparing.
 _LEDGER_PRICE_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2})[ \t]+price[ \t]+([A-Z][A-Z0-9'._-]*)[ \t]+\S+[ \t]+([A-Z][A-Z0-9'._-]*)",
+    r"^([0-9]{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})[ \t]+price[ \t]+([A-Z][A-Z0-9'._-]*)[ \t]+\S+[ \t]+"
+    r"([A-Z][A-Z0-9'._-]*)",
     re.MULTILINE,
 )
 _METADATA_LINE_RE = re.compile(r"^[ \t]+[a-z][A-Za-z0-9_-]*\s*:")
 _SHADOWED_LINE = "; shadowed by a ledger-authored price for the same date"
 _ALREADY_INCLUDED_LINE = "; managed price feed already included from another file"
+_NO_CACHED_REVISION = "no cached revision"
 
 
 @dataclass(frozen=True)
@@ -102,6 +114,7 @@ class ManagedSource:
     shadowed_count: int
     effective_dates: tuple[str, ...]
     effective_path: str | None = None
+    effective_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -124,7 +137,12 @@ def collect_ledger_price_pairs(*texts: str) -> set[tuple[str, str, str]]:
     pairs: set[tuple[str, str, str]] = set()
     for text in texts:
         for match in _LEDGER_PRICE_RE.finditer(text):
-            pairs.add((match.group(1), match.group(2), match.group(3)))
+            year, month, day, base, quote = match.groups()
+            try:
+                when = date(int(year), int(month), int(day))
+            except ValueError:
+                continue  # Beancount rejects it too; nothing to shadow.
+            pairs.add((when.isoformat(), base, quote))
     return pairs
 
 
@@ -187,6 +205,14 @@ def _iso(moment: float | None) -> str | None:
     return datetime.fromtimestamp(moment, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _holds(path: Path, text: str) -> bool:
+    """Whether `path` already holds exactly `text` (unreadable reads as no)."""
+    try:
+        return path.read_text(encoding="utf-8") == text
+    except (OSError, ValueError):
+        return False
+
+
 def _remap(value: str, staged: dict[str, str]) -> str:
     return staged.get(value, value)
 
@@ -200,18 +226,50 @@ def load_with_sources(
     root: Path | None = None,
     now: float | None = None,
     opener: OpenerDirector | None = None,
+    snapshot: LedgerSnapshot | None = None,
 ) -> LoadedLedger:
     """Load `entry` with managed price includes resolved, plus per-source status.
 
     Flags default from the `MANAGED_PRICE_*` environment; explicit arguments
     win. Without a managed include this is a plain Beancount load. Strict
     mode raises naming any stale or unavailable source; offline mode never
-    fetches.
+    fetches. A write snapshot may supply an absent included destination as an
+    empty staged file, so reads and validation never need to create it.
     """
+    from bea_engine import stopping
+
+    # Beancount's parser swallows the exception a signal handler raises, so a
+    # termination signal during the load exits at once instead (w1/074).
+    with stopping.loading():
+        return _load_with_sources(
+            entry,
+            offline=offline,
+            strict=strict,
+            origins=origins,
+            root=root,
+            now=now,
+            opener=opener,
+            snapshot=snapshot,
+        )
+
+
+def _load_with_sources(
+    entry: Path,
+    *,
+    offline: bool | None,
+    strict: bool | None,
+    origins: tuple[str, ...] | None,
+    root: Path | None,
+    now: float | None,
+    opener: OpenerDirector | None,
+    snapshot: LedgerSnapshot | None,
+) -> LoadedLedger:
     from beancount import loader
     from beancount.loader import LoadError
 
-    from bea_engine.ledger.write import LedgerSnapshot, candidate_file
+    from bea_engine.ledger.write import LedgerSnapshot, candidate_file, is_candidate_file
+
+    _record_plugin_configs(loader)
 
     at = time.time() if now is None else now
     want_offline = _env_flag(OFFLINE_ENV) if offline is None else offline
@@ -221,10 +279,10 @@ def load_with_sources(
         allowed_origins = DEFAULT_ORIGINS
     cache = root or cache_root()
 
-    snapshot = LedgerSnapshot.capture(entry.resolve())
+    snapshot = snapshot or LedgerSnapshot.capture(entry)
     managed = _collect_managed(snapshot, allowed_origins)
-    if not managed:
-        entries, errors, options = loader.load_file(str(entry))
+    if not managed and all(state is not None for state in snapshot.stats.values()):
+        entries, errors, options = _load_fresh(entry, snapshot)
         return LoadedLedger(list(entries), list(errors), dict(options), ())
 
     budget = ManagedPriceBudget(limit=MAX_URLS_PER_LOAD)
@@ -245,13 +303,9 @@ def load_with_sources(
     texts = [content.decode("utf-8", errors="replace") for content in snapshot.contents.values()]
     pairs = collect_ledger_price_pairs(*texts) if blobs else set()
     ledger_key = sha256(str(entry.resolve()).encode("utf-8")).hexdigest()[:16]
-    effective: dict[str, tuple[PriceFeedBlob, EffectiveFeed, Path]] = {}
-    for url, blob in blobs.items():
-        precedence = apply_ledger_price_precedence(blob.text, blob.feed.prices, pairs)
-        path = feed_dir(url, cache) / f"{blob.revision}.effective.{ledger_key}.beancount"
-        if not path.is_file() or path.read_text(encoding="utf-8") != precedence.text:
-            path.write_text(precedence.text, encoding="utf-8")
-        effective[url] = (blob, precedence, path)
+    # A staged write candidate is a fresh random file every time; caching its
+    # effective text would leave one more full feed copy per write or preview.
+    ephemeral = want_offline or is_candidate_file(entry)
 
     primary: set[tuple[str, int]] = set()
     for source in pending:
@@ -259,7 +313,36 @@ def load_with_sources(
             first = source.includes[0]
             primary.add((first.file, first.line))
 
+    cache_problems: dict[str, str] = {}
     with ExitStack() as stack:
+        # Each feed's effective text is cached per (revision, ledger) so export
+        # reads what the load parsed. Offline loads write nothing to the cache
+        # (ADR 015 section 8), staged write candidates are not ledgers worth a
+        # cache entry, and an unwritable cache degrades, so each of these stages
+        # the text beside the ledger for this load only; its entries still
+        # carry the cache path, like every other feed entry.
+        effective: dict[str, tuple[PriceFeedBlob, EffectiveFeed, Path]] = {}
+        staged_feeds: dict[str, str] = {}
+        for url, blob in blobs.items():
+            precedence = apply_ledger_price_precedence(blob.text, blob.feed.prices, pairs)
+            path = feed_dir(url, cache) / f"{blob.revision}.effective.{ledger_key}.beancount"
+            if not _holds(path, precedence.text):
+                problem: str | None = None
+                if not ephemeral:
+                    try:
+                        # Atomic: a concurrent load may be parsing this very file.
+                        write_text_atomic(path, precedence.text)
+                    except OSError as error:
+                        problem = cache_write_problem(error, path)
+                if ephemeral or problem is not None:
+                    if problem is not None:
+                        cache_problems[url] = problem
+                    stand_in = stack.enter_context(candidate_file(snapshot.root, precedence.text))
+                    staged_feeds[str(stand_in)] = str(path)
+                    effective[url] = (blob, precedence, stand_in)
+                    continue
+            effective[url] = (blob, precedence, path)
+
         staged = {path: stack.enter_context(candidate_file(path, "")) for path in snapshot.contents}
         unavailable: list[Any] = []
         for path, original in snapshot.contents.items():
@@ -278,9 +361,16 @@ def load_with_sources(
             staged[path].write_bytes(content)
         entries, errors, options = loader.load_file(str(staged[snapshot.root]))
         back = {str(staged_path): str(original) for original, staged_path in staged.items()}
+        back.update(staged_feeds)
         entries = [_remap_entry(entry, back) for entry in entries]
         errors = [_remap_error(error, back) for error in errors]
     errors.extend(unavailable)
+
+    for url, result in resolved.items():
+        if result.head.last_error and result.head.last_error.startswith(CACHE_WRITE_PROBLEM):
+            cache_problems.setdefault(url, result.head.last_error)
+    for problem in sorted(set(cache_problems.values())):
+        print(f"warning: {problem}; managed prices still load, but nothing was cached.", file=sys.stderr)
 
     sources: list[ManagedSource] = []
     for source in pending:
@@ -301,12 +391,18 @@ def load_with_sources(
                 etag=serving.etag if serving else None,
                 observed_at=serving.feed.latest_observed_at if serving else None,
                 fetched_at=_iso(serving.fetched_at) if serving else None,
-                next_refresh_at=_iso(result.head.next_refresh_at),
+                # A zero window is the "never fetched / refresh now" sentinel,
+                # not a moment: report no scheduled refresh rather than 1970.
+                next_refresh_at=_iso(result.head.next_refresh_at) if result.head.next_refresh_at > 0 else None,
                 freshness=freshness(serving, at),
-                error=result.head.last_error,
+                # The same cause the load's unavailable-include error names.
+                error=result.head.last_error
+                or cache_problems.get(source.url)
+                or (None if serving else _NO_CACHED_REVISION),
                 shadowed_count=applied.shadowed_count if applied else 0,
                 effective_dates=applied.effective_dates if applied else (),
-                effective_path=str(feed_path) if feed_path else None,
+                effective_path=_remap(str(feed_path), staged_feeds) if feed_path else None,
+                effective_text=applied.text if applied else None,
             )
         )
     remapped_options = dict(options)
@@ -315,6 +411,74 @@ def load_with_sources(
     if isinstance(remapped_options.get("include"), list):
         remapped_options["include"] = [_remap(str(item), back) for item in remapped_options["include"]]
     return LoadedLedger(entries, errors, remapped_options, tuple(sources))
+
+
+#: Source-meta key naming the config of the `plugin` directive whose run or
+#: import failed. The loader reports every plugin failure against `<load>:0`
+#: by name alone, so two directives naming one plugin with different configs
+#: could not be told apart (w1/101).
+PLUGIN_CONFIG_KEY = "__bea_plugin_config__"
+
+
+def _record_plugin_configs(loader: Any) -> None:
+    """Have the loader's plugin errors carry the failing directive's config.
+
+    The loader builds those errors inside `run_transformations`, where the
+    config is the `plugin_config` local. For the duration of that call only,
+    `loader.LoadError` is a subclass that copies the local from the
+    constructing frame into the error's source meta. Swapping it back
+    afterwards keeps every pickle — Beancount's load cache — resolving the
+    plain `LoadError`, so upstream tools can still read the cache.
+    """
+    if getattr(loader.run_transformations, "_bea_records_plugin_config", False):
+        return
+    base = loader.LoadError
+    original = loader.run_transformations
+
+    class _PluginAwareLoadError(base):  # type: ignore[misc,valid-type]
+        def __new__(cls, source: Any, message: str, entry: Any = None) -> Any:
+            caller = sys._getframe(1)
+            if caller.f_code is original.__code__ and "plugin_config" in caller.f_locals:
+                source = {**source, PLUGIN_CONFIG_KEY: caller.f_locals["plugin_config"]}
+            return super().__new__(cls, source, message, entry)
+
+        def __reduce__(self) -> Any:
+            return (base, tuple(self))
+
+    def run_transformations(*args: Any, **kwargs: Any) -> Any:
+        loader.LoadError = _PluginAwareLoadError
+        try:
+            return original(*args, **kwargs)
+        finally:
+            loader.LoadError = base
+
+    run_transformations._bea_records_plugin_config = True  # type: ignore[attr-defined]
+    loader.run_transformations = run_transformations
+
+
+def _load_fresh(entry: Path, snapshot: LedgerSnapshot) -> tuple[Any, Any, Any]:
+    """`loader.load_file`, refusing a pickle-cache hit that misses files now on disk.
+
+    Beancount's cache keys on the mtime and size of the files the cached load
+    read, so a file that newly matches an include glob, or a missing include
+    that now exists, never invalidates it (w1/083). The snapshot has already
+    expanded every include on disk; when it holds a file the cached load never
+    read, the cache is stale — drop it and load again.
+    """
+    from beancount import loader
+
+    from bea_engine.ledger.write import pickle_cache_of
+
+    cache = pickle_cache_of(entry)
+    cached = cache.exists()
+    entries, errors, options = loader.load_file(str(entry))
+    if cached:
+        read = {os.path.normpath(name) for name in options.get("include") or ()}
+        on_disk = {os.path.normpath(path) for path in snapshot.contents}
+        if not on_disk <= read:
+            cache.unlink(missing_ok=True)
+            entries, errors, options = loader.load_file(str(entry))
+    return entries, errors, options
 
 
 @dataclass
@@ -396,13 +560,14 @@ def _rewrite_includes(
             else:
                 content = _swap_line(content, span.line, f"{_ALREADY_INCLUDED_LINE}\n".encode())
             continue
-        cause = result.head.last_error if result is not None else "no cached revision"
+        cause = ((result.head.last_error if result is not None else None) or _NO_CACHED_REVISION).rstrip()
         comment = f"; managed price source unavailable: {span.target} ({cause})\n".encode()
         content = _swap_line(content, span.line, comment)
         unavailable.append(
             load_error(
                 {"filename": str(path), "lineno": span.line},
-                f'managed price source unavailable: include "{span.target}" in {path}:{span.line}: {cause}. '
+                f'managed price source unavailable: include "{span.target}" in {path}:{span.line}: '
+                f"{cause.rstrip('.')}. "
                 "Run bea price status to inspect the source.",
             )
         )
@@ -476,6 +641,7 @@ def load_file(
     root: Path | None = None,
     now: float | None = None,
     opener: OpenerDirector | None = None,
+    snapshot: LedgerSnapshot | None = None,
 ) -> tuple[list[Any], list[Any], dict[str, Any]]:
     """Drop-in `loader.load_file` with managed includes resolved.
 
@@ -483,7 +649,14 @@ def load_file(
     returns them alongside.
     """
     loaded = load_with_sources(
-        Path(entry), offline=offline, strict=strict, origins=origins, root=root, now=now, opener=opener
+        Path(entry),
+        offline=offline,
+        strict=strict,
+        origins=origins,
+        root=root,
+        now=now,
+        opener=opener,
+        snapshot=snapshot,
     )
     if loaded.sources:
         loaded.options["bea_managed_price_sources"] = [source_json(source) for source in loaded.sources]
@@ -498,6 +671,7 @@ class PortableExport:
     files: tuple[str, ...]
     sources: tuple[ManagedSource, ...]
     errors: list[Any]
+    overwritten: tuple[str, ...] = ()
 
 
 def export_portable(
@@ -505,6 +679,7 @@ def export_portable(
     output: Path | None = None,
     *,
     allow_errors: bool = False,
+    force: bool = False,
     offline: bool | None = None,
     strict: bool | None = None,
     origins: tuple[str, ...] | None = None,
@@ -535,7 +710,7 @@ def export_portable(
             "Retry, or pass --allow-errors to export with its marker only."
         )
     target = (output or entry.parent / f"{entry.stem}-export").expanduser()
-    snapshot = LedgerSnapshot.capture(entry.resolve())
+    snapshot = LedgerSnapshot.capture(entry)
     # `resolve()` for a destination that does not exist yet, too: `absolute()`
     # leaves `..` in place, so `books/not-created/..` compared unequal to
     # `books` and slipped past the guard below — then `mkdir(parents=True)`
@@ -562,6 +737,10 @@ def export_portable(
     # pointing outside the snapshot.
     home = snapshot.root.parent.resolve()
     for path in snapshot.contents:
+        if path == snapshot.root:
+            # The root keeps its own name even when it is a link elsewhere.
+            destinations[path] = target / path.name
+            continue
         try:
             destinations[path] = target / path.resolve().relative_to(home)
         except ValueError:
@@ -586,12 +765,12 @@ def export_portable(
     # already one of the ledger's own files — through a symlink, or a hard
     # link no path comparison can see — would be written straight through
     # into the books, so identity is compared, not spelling.
-    attachments = _export_attachments(loaded, snapshot.contents, destinations, target, home)
-    planned = [*destinations.values(), *feed_files.values(), *attachments.values()]
+    attachments = _export_attachments(loaded, snapshot, destinations, target, home)
+    planned = [*destinations.values(), *feed_files.values(), *attachments]
     for dest in planned:
         if not dest.exists():
             continue
-        for ledger_file in [*snapshot.contents, *attachments]:
+        for ledger_file in [*snapshot.contents, *attachments.values()]:
             if os.path.samefile(dest, ledger_file):
                 raise UsageError(
                     f"Cannot export: {dest} is the source file {ledger_file} (a link to it), "
@@ -602,13 +781,25 @@ def export_portable(
     for dest in planned:
         if not dest.resolve().is_relative_to(resolved_target):
             raise UsageError(f"Cannot export: {dest} would land outside {target}. Nothing was written.")
+    # A file already at a planned destination is a file the export was never
+    # given: the directory the user picked may be somebody else's ledger, and
+    # replacing it reported success. Re-exporting into a previous snapshot is
+    # the deliberate case, so `--force` is the way past it.
+    existing = [dest for dest in planned if dest.exists() or dest.is_symlink()]
+    if existing and not force:
+        first = min(existing, key=lambda dest: str(dest))
+        more = f" ({len(existing)} files in all)" if len(existing) > 1 else ""
+        raise UsageError(
+            f"Cannot export into {target}: it already holds {first}, which the export would overwrite{more}. "
+            "Choose an empty or dedicated directory, or pass --force to overwrite. Nothing was written."
+        )
     written: list[str] = []
     for path, original in snapshot.contents.items():
         dest = destinations[path]
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(_rewrite_export_includes(original, path, snapshot.patterns, destinations, by_target))
         written.append(str(dest))
-    for document, dest in attachments.items():
+    for dest, document in attachments.items():
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(document, dest)
         written.append(str(dest))
@@ -619,13 +810,17 @@ def export_portable(
         dest.write_text(_export_feed_text(source, at), encoding="utf-8")
         written.append(str(dest))
     return PortableExport(
-        output=target, files=tuple(sorted(written)), sources=loaded.sources, errors=list(loaded.errors)
+        output=target,
+        files=tuple(sorted(written)),
+        sources=loaded.sources,
+        errors=list(loaded.errors),
+        overwritten=tuple(sorted(str(dest) for dest in existing)),
     )
 
 
 def _export_attachments(
     loaded: LoadedLedger,
-    contents: dict[Path, bytes],
+    snapshot: LedgerSnapshot,
     destinations: dict[Path, Path],
     target: Path,
     home: Path,
@@ -645,32 +840,51 @@ def _export_attachments(
 
     from bea_engine.protocol import UsageError
 
+    contents = snapshot.contents
     ledger_files = {path.resolve(): path for path in contents}
     unsupported: list[str] = []
     for option_dir in loaded.options.get("documents") or []:
         if os.path.isabs(option_dir):
             unsupported.append(f'option "documents" "{option_dir}" (absolute)')
+    # Keyed by destination, valued by the file to copy. The destination keeps
+    # the path exactly as the directive spells it: a symlink (`alias.pdf ->
+    # receipt.pdf`, or a symlinked folder `linked/`) used to be resolved
+    # first, so the export copied `receipt.pdf` while the copied ledger still
+    # named `alias.pdf`, and two aliases of one receipt collapsed into a
+    # single copy that neither name reached. The resolved file still decides
+    # containment and what bytes travel; the copy is a plain file.
     attachments: dict[Path, Path] = {}
     for entry in loaded.entries:
         if not isinstance(entry, Document):
             continue
         document = Path(entry.filename).resolve()
         try:
-            dest = target / document.relative_to(home)
+            canonical = target / document.relative_to(home)
         except ValueError:
             unsupported.append(f"{document} (outside {home})")
             continue
-        ledger = ledger_files.get(Path(entry.meta.get("filename", "")).resolve())
+        named_by = str(entry.meta.get("filename", ""))
+        ledger = ledger_files.get(Path(named_by).resolve()) if named_by else None
+        if ledger is None:
+            attachments[canonical] = document
+            continue
         line = int(entry.meta.get("lineno") or 0)
-        if ledger is not None and line > 0:
-            lines = contents[ledger].decode("utf-8", "replace").splitlines()
-            text = lines[line - 1] if line <= len(lines) else ""
-            quoted = text.split('"')[1] if text.count('"') >= 2 else ""
-            moved = os.path.relpath(dest, destinations[ledger].parent) != os.path.relpath(document, ledger.parent)
-            if os.path.isabs(quoted) or moved:
-                unsupported.append(f"{document} (named by {ledger.name}:{line})")
-                continue
-        attachments[document] = dest
+        lines = contents[ledger].decode("utf-8", "replace").split("\n")
+        text = lines[line - 1] if 0 < line <= len(lines) else ""
+        quoted = text.split('"')[1] if text.count('"') >= 2 else ""
+        # Beancount joins a relative name onto its file's directory and
+        # normalizes lexically, both here and when checking the export, so
+        # the same relative spelling from the copied ledger is what must exist.
+        spelled = os.path.relpath(os.path.normpath(entry.filename), os.path.dirname(os.path.abspath(named_by)))
+        dest = Path(os.path.normpath(destinations[ledger].parent / spelled))
+        try:
+            relocated = ledger != snapshot.root and destinations[ledger] != target / ledger.resolve().relative_to(home)
+        except ValueError:
+            relocated = True
+        if os.path.isabs(quoted) or relocated or not dest.is_relative_to(target):
+            unsupported.append(f"{document} (named by {ledger.name}:{line})")
+            continue
+        attachments[dest] = document
     if unsupported:
         raise UsageError(
             "Cannot export: these document attachments would not travel with the export: "
@@ -735,9 +949,9 @@ def _export_feed_text(source: ManagedSource, at: float) -> str:
     if source.revision is None:
         day = datetime.fromtimestamp(at, UTC).strftime("%Y-%m-%d")
         marker = f'{day} custom "bea-managed-source" "{source.alias}" "{source.url}" "none" "unknown" "unknown" 0\n'
-        cause = source.error or "no cached revision"
+        cause = source.error or _NO_CACHED_REVISION
         return f"; bea-managed-error: {cause}\n{marker}"
-    effective = Path(source.effective_path).read_text(encoding="utf-8") if source.effective_path else ""
+    effective = source.effective_text or ""
     day = max(source.effective_dates) if source.effective_dates else _iso_day(source.fetched_at, at)
     marker = (
         f'{day} custom "bea-managed-source" "{source.alias}" "{source.url}" '

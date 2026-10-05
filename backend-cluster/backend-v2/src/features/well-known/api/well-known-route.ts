@@ -126,4 +126,17 @@ export function setWellKnownRoutes(router: Router, config: AppConfig): void {
     ctx.set("Cache-Control", "public, max-age=3600");
     ctx.body = assetLinks(fingerprints);
   });
+
+  // Domain proof the official MCP Registry verifies a publish against.
+  // Unset → 404, so a self-host never vouches for Beancount.io's key.
+  router.get("/.well-known/mcp-registry-auth", (ctx) => {
+    const proof = config.mcpRegistry.authProof;
+    if (!proof) {
+      ctx.status = 404;
+      return;
+    }
+    ctx.type = "text/plain";
+    ctx.set("Cache-Control", "public, max-age=3600");
+    ctx.body = `${proof}\n`;
+  });
 }

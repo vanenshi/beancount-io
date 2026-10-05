@@ -346,9 +346,22 @@ class _FeedHandler(BaseHTTPRequestHandler):
         for key, value in route.get("headers", {}).items():
             self.send_header(key, value)
         body = route.get("body", b"")
-        self.send_header("Content-Length", str(len(body)))
+        # `short_by` declares more bytes than it sends, then closes: an early EOF.
+        self.send_header("Content-Length", str(len(body) + route.get("short_by", 0)))
         self.end_headers()
+        if "drip" in route:
+            # One byte per `drip` seconds: every socket read succeeds quickly.
+            try:
+                for index in range(len(body)):
+                    self.wfile.write(body[index : index + 1])
+                    self.wfile.flush()
+                    time.sleep(route["drip"])
+            except OSError:
+                pass
+            return
         self.wfile.write(body)
+        if route.get("short_by"):
+            self.close_connection = True
 
 
 @pytest.fixture
@@ -422,6 +435,18 @@ class TestManagedPriceFetch:
 
         assert isinstance(result, FetchFailed)
         assert result.reason == "timeout"
+
+    def test_dripping_body_times_out_within_the_whole_exchange_budget(self, feed_server: str) -> None:
+        """w1/078: the budget covers the whole exchange, not each socket read."""
+        _FeedHandler.routes["/prices/DRIP"] = {"body": FEED.encode("utf-8"), "drip": 0.05}
+        started = time.monotonic()
+
+        result = fetch_managed_price_feed(f"{feed_server}/prices/DRIP", timeout_seconds=1)
+
+        assert time.monotonic() - started < 3
+        assert isinstance(result, FetchFailed)
+        assert result.reason == "timeout"
+        assert result.message == "timed out after 1 seconds"
 
     def test_non_utf8_body_is_refused(self, feed_server: str) -> None:
         result = fetch_managed_price_feed(f"{feed_server}/prices/BINARY")
@@ -1264,7 +1289,7 @@ class TestManagedLoadCommands:
         )
 
         assert result.returncode == 0, result.stderr
-        assert "30 USD" in result.stdout
+        assert "30.00 USD" in result.stdout
         assert "Partial valuation" not in result.stdout
 
     def test_import_applies_beside_a_managed_include(self, feed_server: str, tmp_path: Path) -> None:
@@ -1446,6 +1471,26 @@ class TestPriceStatus:
         assert "r1" in result.stdout
         assert _FeedHandler.hits == []
 
+    def test_offline_never_fetched_source_has_no_epoch_refresh_and_names_the_cause(
+        self, feed_server: str, tmp_path: Path
+    ) -> None:
+        """w1/070: an empty cache reports no 1970 refresh and the banner's cause."""
+        ledger = _write_managed_ledger(tmp_path, feed_server)
+
+        human = _run_bea(tmp_path, feed_server, "--offline", "--file", str(ledger), "price", "status")
+        machine = _run_bea(tmp_path, feed_server, "--offline", "--json", "--file", str(ledger), "price", "status")
+
+        assert human.returncode == 0, human.stderr
+        assert "no cached revision" in human.stderr
+        assert "1970" not in human.stdout
+        assert "no cached revision" in human.stdout
+        assert machine.returncode == 0, machine.stderr
+        (source,) = json.loads(machine.stdout)["data"]["sources"]
+        assert source["freshness"] == "unavailable"
+        assert source["next_refresh_at"] is None
+        assert source["error"] == "no cached revision"
+        assert _FeedHandler.hits == []
+
     def test_strict_flag_fails_naming_a_stale_source(self, feed_server: str, tmp_path: Path) -> None:
         body = _feed_text(_stamp(time.time() - 660)).encode("utf-8")
         _FeedHandler.routes["/prices/BTC-USD"] = {"body": body}
@@ -1461,6 +1506,107 @@ class TestPriceStatus:
 
         assert len(loaded.errors) == 1
         assert "bea price status" in loaded.errors[0].message
+
+
+class TestManagedPriceFailureText:
+    def _record_provider_failure(self, url: str, cache: Path) -> str:
+        from email.message import Message
+        from unittest.mock import Mock
+        from urllib.error import HTTPError
+
+        opener = Mock()
+        opener.open.side_effect = HTTPError(url, 503, "Unavailable", Message(), None)
+        resolved = resolve_feed(url, "BTC-USD", root=cache, opener=opener)
+        assert resolved.blob is None
+        assert resolved.head.last_error == (
+            "fetch failed (provider): HTTP 503: price service unavailable. Retry later; cached prices remain usable."
+        )
+        return resolved.head.last_error
+
+    @pytest.mark.parametrize("command", [("check",), ("price", "status")], ids=["check", "status"])
+    @pytest.mark.parametrize("prior_failure", [False, True], ids=["empty-cache", "recorded-error"])
+    def test_offline_cli_reports_a_readable_cause_without_changing_files(
+        self, feed_server: str, tmp_path: Path, command: tuple[str, ...], prior_failure: bool
+    ) -> None:
+        ledger = _write_managed_ledger(tmp_path, feed_server)
+        original = ledger.read_bytes()
+        url = f"{feed_server}/prices/BTC-USD"
+        cache = tmp_path / "cache" / "bea" / "managed-prices"
+        cause = self._record_provider_failure(url, cache) if prior_failure else "no cached revision"
+        cached = {path: path.read_bytes() for path in cache.rglob("*") if path.is_file()}
+
+        result = _run_bea(tmp_path, feed_server, "--offline", "--file", str(ledger), *command)
+
+        assert result.returncode == (1 if command == ("check",) else 0), result.stderr
+        assert f"{cause.rstrip('.')}. Run bea price status to inspect the source." in result.stderr
+        assert url in result.stderr
+        assert "None" not in result.stderr
+        assert ledger.read_bytes() == original
+        assert {path: path.read_bytes() for path in cache.rglob("*") if path.is_file()} == cached
+        assert _FeedHandler.hits == []
+
+    @pytest.mark.parametrize("prior_failure", [False, True], ids=["empty-cache", "recorded-error"])
+    def test_offline_temporary_comment_preserves_the_cause_and_customer_ledger(
+        self, feed_server: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prior_failure: bool
+    ) -> None:
+        from beancount import loader
+
+        ledger = _write_managed_ledger(tmp_path, feed_server)
+        original = ledger.read_bytes()
+        url = f"{feed_server}/prices/BTC-USD"
+        cache = tmp_path / "cache"
+        cause = self._record_provider_failure(url, cache) if prior_failure else "no cached revision"
+        staged_contents: list[bytes] = []
+        load_file = loader.load_file
+
+        def inspect_load(filename: str, *args: Any, **kwargs: Any) -> Any:
+            assert Path(filename) != ledger
+            staged_contents.append(Path(filename).read_bytes())
+            return load_file(filename, *args, **kwargs)
+
+        monkeypatch.setattr(loader, "load_file", inspect_load)
+
+        loaded = load_with_sources(ledger, origins=(feed_server,), root=cache, offline=True, strict=False)
+
+        expected = original.replace(
+            f'include "{url}"\n'.encode(),
+            f"; managed price source unavailable: {url} ({cause})\n".encode(),
+        )
+        assert staged_contents == [expected]
+        assert ledger.read_bytes() == original
+        assert len(loaded.errors) == 1
+        assert loaded.errors[0].source == {"filename": str(ledger), "lineno": 2}
+        assert cause in loaded.errors[0].message
+        assert _FeedHandler.hits == []
+
+    def test_signed_out_non_strict_error_has_one_full_stop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from email.message import Message
+        from unittest.mock import Mock
+        from urllib.error import HTTPError
+
+        monkeypatch.delenv("BEA_MANAGED_PRICE_TOKEN", raising=False)
+        monkeypatch.delenv("BEA_MANAGED_PRICE_AUTH_ERROR", raising=False)
+        origin = "https://beancount.io"
+        url = f"{origin}/prices/BTC-USD"
+        ledger = _write_managed_ledger(tmp_path, origin)
+        original = ledger.read_bytes()
+        opener = Mock()
+        opener.open.side_effect = HTTPError(url, 401, "Unauthorized", Message(), None)
+
+        loaded = load_with_sources(
+            ledger, origins=(origin,), root=tmp_path / "cache", offline=False, strict=False, opener=opener
+        )
+
+        assert len(loaded.errors) == 1
+        message = loaded.errors[0].message
+        assert "Not logged in." in message
+        assert "BEA_TOKEN. Run bea price status to inspect the source." in message
+        assert "BEA_TOKEN.." not in message
+        assert url in message
+        assert ledger.read_bytes() == original
+        opener.open.assert_called_once()
 
 
 class TestPriceExport:
@@ -1490,8 +1636,9 @@ class TestPriceExport:
         text = feed.read_text()
         assert f'custom "bea-managed-source" "BTC-USD" "{feed_server}/prices/BTC-USD" "r1"' in text
         assert "2026-09-10 price BTC 112000.00 USD" in text
-        # Re-exporting is deterministic: the same bytes, not a growing tree.
-        again = _run_bea(tmp_path, feed_server, "--file", str(ledger), "price", "export")
+        # Re-exporting is deterministic: the same bytes, not a growing tree. It
+        # takes `--force`, since the snapshot the last run wrote is still there.
+        again = _run_bea(tmp_path, feed_server, "--file", str(ledger), "price", "export", "--force")
         assert again.returncode == 0, again.stderr
         assert feed.read_text() == text
 
@@ -1524,7 +1671,7 @@ class TestPriceExport:
         )
 
         assert result.returncode == 0, result.stderr
-        assert "30 USD" in result.stdout
+        assert "30.00 USD" in result.stdout
 
     def test_export_refuses_unavailable_naming_the_source(self, feed_server: str, tmp_path: Path) -> None:
         ledger = tmp_path / "main.bean"
@@ -2013,3 +2160,509 @@ def test_body_read_failure_preserves_cached_feed(tmp_path: Path, failure: OSErro
     assert failed.blob is not None and failed.blob.text == first.blob.text
     assert failed.head.revision == "r1"
     assert f"fetch failed ({reason})" in (failed.head.last_error or "")
+
+
+# --------------------------------------------------------------------------- #
+# Feed cache robustness (w1/076 onward)
+# --------------------------------------------------------------------------- #
+
+
+def _lapsed_resolve_rounds(url: str, root: str, rounds: int) -> list[str]:
+    """Child-process body: resolve `rounds` times with the window lapsed."""
+    failures: list[str] = []
+    for _ in range(rounds):
+        head = feed_dir(url, Path(root)) / "head.json"
+        try:
+            data = json.loads(head.read_text())
+            data["next_refresh_at"] = 0
+            head.write_text(json.dumps(data))
+        except (OSError, ValueError):
+            pass
+        try:
+            resolved = resolve_feed(url, "BTC-USD", root=Path(root))
+        except OSError as error:
+            failures.append(repr(error))
+            continue
+        if resolved.blob is None:
+            failures.append(f"no blob: {resolved.head.last_error}")
+    return failures
+
+
+class TestConcurrentCacheWrites:
+    """w1/076: racing loads share nothing but the cache's atomic renames."""
+
+    def test_a_write_never_consumes_another_writers_temp_file(self, tmp_path: Path) -> None:
+        from bea_engine.managed_price_cache import write_text_atomic
+
+        target = tmp_path / "head.json"
+        other_writer = tmp_path / ".head.json.tmp"
+        other_writer.write_text("another process's half-finished write")
+
+        write_text_atomic(target, '{"revision": "r1"}')
+
+        assert target.read_text() == '{"revision": "r1"}'
+        assert other_writer.read_text() == "another process's half-finished write"
+        assert sorted(path.name for path in tmp_path.iterdir()) == [".head.json.tmp", "head.json"]
+
+    def test_parallel_lapsed_refreshes_all_succeed(self, feed_server: str, tmp_path: Path) -> None:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+
+        url = f"{feed_server}/prices/BTC-USD"
+        root = tmp_path / "cache"
+        assert resolve_feed(url, "BTC-USD", root=root).blob is not None
+
+        with ProcessPoolExecutor(8, mp_context=multiprocessing.get_context("spawn")) as pool:
+            outcomes = list(pool.map(_lapsed_resolve_rounds, [url] * 8, [str(root)] * 8, [15] * 8))
+
+        assert [failure for failures in outcomes for failure in failures] == []
+        assert not list(feed_dir(url, root).glob("*.tmp"))
+
+
+class TestFeedIntegrity:
+    """w1/077: a short body never becomes a revision, and a bad blob heals."""
+
+    @staticmethod
+    def _route(body: str, etag: str, short_by: int = 0) -> dict[str, Any]:
+        return {
+            "body": body.encode("utf-8"),
+            "headers": {"ETag": etag},
+            "etag": etag,
+            "etag_match": True,
+            "short_by": short_by,
+        }
+
+    def test_body_shorter_than_content_length_is_a_network_failure(self, feed_server: str) -> None:
+        _FeedHandler.routes["/prices/BTC-USD"]["short_by"] = 100
+
+        result = fetch_managed_price_feed(f"{feed_server}/prices/BTC-USD")
+
+        assert isinstance(result, FetchFailed)
+        assert result.reason == "network"
+        assert "ended early" in result.message
+
+    def test_truncated_refresh_keeps_last_good_and_is_not_pinned(self, feed_server: str, tmp_path: Path) -> None:
+        now = time.time()
+        root = tmp_path / "cache"
+        good = _resolve(feed_server, root, now=now)
+        assert good.blob is not None
+        full = _feed_text(_stamp(now), _stamp(now + 1), revision="t3")
+        _FeedHandler.routes["/prices/BTC-USD"] = self._route(full[: full.index("2026-09-11")], '"t3"', short_by=100)
+
+        truncated = _resolve(feed_server, root, now=now + 301)
+
+        assert truncated.blob is not None and truncated.blob.text == FEED
+        assert truncated.head.revision == "r1"
+        assert "ended early" in (truncated.head.last_error or "")
+        _FeedHandler.routes["/prices/BTC-USD"] = self._route(full, '"t3"')
+
+        healed = _resolve(feed_server, root, now=now + 400)
+
+        assert healed.blob is not None and healed.blob.text == full
+        assert healed.head.revision == "t3"
+
+    def test_corrupted_blob_is_refetched_without_an_etag(self, feed_server: str, tmp_path: Path) -> None:
+        now = time.time()
+        root = tmp_path / "cache"
+        assert _resolve(feed_server, root, now=now).blob is not None
+        blob = feed_dir(f"{feed_server}/prices/BTC-USD", root) / "r1.beancount"
+        blob.write_text(FEED[: FEED.index("113500") + 3])
+        _FeedHandler.seen_headers.clear()
+
+        healed = _resolve(feed_server, root, now=now + 301)
+
+        assert "if-none-match" not in _FeedHandler.seen_headers["/prices/BTC-USD"]
+        assert healed.blob is not None and healed.blob.text == FEED
+        assert blob.read_text() == FEED
+
+
+def _tree(root: Path) -> dict[str, bytes]:
+    return {str(path.relative_to(root)): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+@pytest.fixture
+def read_only() -> Any:
+    """chmod directories read-only for one test, restoring them afterwards."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    locked: list[Path] = []
+
+    def lock(directory: Path) -> None:
+        directory.chmod(0o555)
+        locked.append(directory)
+
+    yield lock
+    for directory in locked:
+        directory.chmod(0o755)
+
+
+class TestOfflineAndReadOnlyCache:
+    """w1/079: --offline writes nothing, and an unwritable cache degrades."""
+
+    def _seed(self, feed_server: str, tmp_path: Path, extra: str = "") -> tuple[Path, Path]:
+        ledger = tmp_path / "main.bean"
+        ledger.write_text(_managed_ledger(feed_server) + extra)
+        assert _load(feed_server, tmp_path, ledger.read_text()).errors == []
+        directory = feed_dir(f"{feed_server}/prices/BTC-USD", tmp_path / "cache")
+        for effective in directory.glob("*.effective.*"):
+            effective.unlink()
+        return ledger, directory
+
+    def test_offline_load_leaves_the_cache_byte_identical(self, feed_server: str, tmp_path: Path) -> None:
+        ledger, _ = self._seed(feed_server, tmp_path)
+        before = _tree(tmp_path / "cache")
+
+        plain = _load(feed_server, tmp_path, ledger.read_text(), offline=True)
+        shadowing = _load(feed_server, tmp_path, ledger.read_text() + "2026-09-10 price BTC 1 USD\n", offline=True)
+
+        assert _tree(tmp_path / "cache") == before
+        assert plain.errors == [] and shadowing.errors == []
+        assert _price_numbers(plain) == ["112000.00", "113500.50"]
+        assert _price_numbers(shadowing) == ["1", "113500.50"]
+        assert all(
+            "effective" in str(entry.meta["filename"]) and str(tmp_path / "cache") in str(entry.meta["filename"])
+            for entry in plain.entries
+            if type(entry).__name__ == "Price"
+        )
+        assert not list(tmp_path.glob(".bea-*.tmp"))
+
+    def test_offline_load_from_a_read_only_cache(self, feed_server: str, tmp_path: Path, read_only: Any) -> None:
+        ledger, directory = self._seed(feed_server, tmp_path)
+        read_only(directory)
+
+        loaded = _load(feed_server, tmp_path, ledger.read_text(), offline=True)
+
+        assert loaded.errors == []
+        assert _price_numbers(loaded) == ["112000.00", "113500.50"]
+        assert loaded.sources[0].error is None
+
+    def test_lapsed_window_with_a_read_only_cache_degrades_with_a_warning(
+        self, feed_server: str, tmp_path: Path, read_only: Any, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ledger, directory = self._seed(feed_server, tmp_path)
+        read_only(directory)
+
+        loaded = _load(feed_server, tmp_path, ledger.read_text(), now=time.time() + 301)
+
+        assert loaded.errors == []
+        assert _price_numbers(loaded) == ["112000.00", "113500.50"]
+        assert (loaded.sources[0].error or "").startswith("price cache not writable (Permission denied)")
+        assert "warning: price cache not writable" in capsys.readouterr().err
+
+    def test_offline_export_reads_the_text_the_load_parsed(self, feed_server: str, tmp_path: Path) -> None:
+        from bea_engine.managed_load import export_portable
+
+        ledger, _ = self._seed(feed_server, tmp_path)
+        origins = (f"http://127.0.0.1:{feed_server.rsplit(':', 1)[1]}",)
+
+        exported = export_portable(ledger, tmp_path / "out", offline=True, origins=origins, root=tmp_path / "cache")
+
+        assert "113500.50" in (tmp_path / "out" / "prices" / "BTC-USD.beancount").read_text()
+        assert exported.errors == []
+
+    def test_cli_commands_exit_zero_on_a_read_only_cache(
+        self, feed_server: str, tmp_path: Path, read_only: Any
+    ) -> None:
+        ledger = _write_managed_ledger(tmp_path, feed_server)
+        assert _run_bea(tmp_path, feed_server, "--file", str(ledger), "check").returncode == 0
+        directory = next((tmp_path / "cache" / "bea" / "managed-prices").iterdir())
+        head = directory / "head.json"
+        head.write_text(json.dumps({**json.loads(head.read_text()), "next_refresh_at": 0}))
+        for effective in directory.glob("*.effective.*"):
+            effective.unlink()
+        read_only(directory)
+
+        offline = _run_bea(tmp_path, feed_server, "--offline", "--file", str(ledger), "check")
+        online = _run_bea(tmp_path, feed_server, "--file", str(ledger), "check")
+        refresh = _run_bea(tmp_path, feed_server, "--file", str(ledger), "price", "refresh")
+
+        assert offline.returncode == 0, offline.stderr
+        assert online.returncode == 0, online.stderr
+        assert "Errno" not in offline.stderr + online.stderr + refresh.stderr
+        assert "price cache not writable" in online.stderr
+        assert refresh.returncode == 1
+        assert "Cannot refresh" in refresh.stderr
+
+
+class TestEffectiveFeedCacheGrowth:
+    """w1/080: write validation never adds an effective feed copy to the cache."""
+
+    def test_staged_candidate_load_writes_no_effective_file(self, feed_server: str, tmp_path: Path) -> None:
+        from bea_engine.ledger.write import candidate_file
+
+        ledger = tmp_path / "main.bean"
+        ledger.write_text(_managed_ledger(feed_server))
+        assert _load(feed_server, tmp_path, ledger.read_text()).errors == []
+        directory = feed_dir(f"{feed_server}/prices/BTC-USD", tmp_path / "cache")
+        before = _tree(directory)
+        origins = (f"http://127.0.0.1:{feed_server.rsplit(':', 1)[1]}",)
+
+        with candidate_file(ledger, ledger.read_text() + "2026-09-10 price BTC 1 USD\n") as candidate:
+            loaded = load_with_sources(candidate, origins=origins, root=tmp_path / "cache")
+
+        assert loaded.errors == []
+        assert _price_numbers(loaded) == ["1", "113500.50"]
+        assert _tree(directory) == before
+        assert not list(tmp_path.glob(".bea-*"))
+
+    def test_repeated_writes_leave_one_effective_file(self, feed_server: str, tmp_path: Path) -> None:
+        ledger = _write_managed_ledger(tmp_path, feed_server)
+        assert _run_bea(tmp_path, feed_server, "--file", str(ledger), "check").returncode == 0
+
+        for day in (1, 2, 3):
+            note = _run_bea(
+                tmp_path,
+                feed_server,
+                "--file",
+                str(ledger),
+                "add",
+                "note",
+                "--account",
+                "Assets:Broker",
+                "--comment",
+                f"note {day}",
+                "--date",
+                f"2026-01-0{day}",
+            )
+            assert note.returncode == 0, note.stderr
+            price = _run_bea(
+                tmp_path,
+                feed_server,
+                "--file",
+                str(ledger),
+                "add",
+                "price",
+                "-c",
+                "BTC",
+                "--amount",
+                f"5000{day} USD",
+                "--date",
+                f"2026-02-0{day}",
+            )
+            assert price.returncode == 0, price.stderr
+
+        assert len(list((tmp_path / "cache").rglob("*.effective.*"))) == 1
+
+
+class TestFeedGrammarMatchesBeancount:
+    """w1/081: the validator accepts only what Beancount's lexer can parse."""
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "2026-09-12\u00a0price BTC 1 USD",
+            "2026-09-12 price\u2003BTC 1 USD",
+            "2026-09-12\fprice BTC 1 USD",
+            "2026-09-12 price BTC 1 USD\u00a0",
+            "2026-09-12 price BTC \u0661 USD",
+            "\u00a0",
+        ],
+        ids=["nbsp", "em-space", "form-feed", "trailing-nbsp", "arabic-digit", "nbsp-only-line"],
+    )
+    def test_whitespace_or_digits_beancount_rejects_are_invalid(self, line: str) -> None:
+        validation = validate_managed_price_text(FEED + line + "\n")
+
+        assert isinstance(validation, InvalidFeed)
+        assert validation.line == 12
+
+    @pytest.mark.parametrize(
+        "meta",
+        ['  observed-at :"2026-09-12T00:00:00Z"', '  observed-at:\u00a0"2026-09-12T00:00:00Z"'],
+        ids=["space-before-colon", "nbsp-value"],
+    )
+    def test_metadata_beancount_rejects_is_invalid(self, meta: str) -> None:
+        validation = validate_managed_price_text(f"2026-09-12 price BTC 1 USD\n{meta}\n")
+
+        assert isinstance(validation, InvalidFeed)
+        assert validation.line == 2
+
+    def test_tabs_and_crlf_remain_valid(self) -> None:
+        validation = validate_managed_price_text('2026-09-12\tprice\tBTC\t1\tUSD\t; c\r\n\tobserved-at:\t"x"\r\n')
+
+        assert isinstance(validation, ValidFeed)
+        assert validation.feed.prices[0].observed_at == "x"
+
+    def test_line_numbers_count_newlines_only(self) -> None:
+        validation = validate_managed_price_text("; note\u2028continued\n2026-09-12 price BTC 1 USD\n")
+
+        assert isinstance(validation, ValidFeed)
+        assert validation.feed.prices[0].line == 2
+
+    def test_unparseable_refresh_keeps_the_last_good_revision(self, feed_server: str, tmp_path: Path) -> None:
+        now = time.time()
+        root = tmp_path / "cache"
+        good = _resolve(feed_server, root, now=now)
+        assert good.blob is not None
+        _FeedHandler.routes["/prices/BTC-USD"] = {
+            "body": (FEED + "2026-09-12\u00a0price BTC 1 USD\n").encode("utf-8"),
+            "headers": {"ETag": '"n"'},
+        }
+
+        resolved = _resolve(feed_server, root, now=now + 301)
+
+        assert resolved.blob is not None and resolved.blob.revision == "r1"
+        assert (resolved.head.last_error or "").startswith("invalid feed at line 12")
+        assert (feed_dir(f"{feed_server}/prices/BTC-USD", root) / "r1.beancount").read_text() == FEED
+
+
+class TestRelativeXdgHomes:
+    """w1/082: a relative XDG base directory is ignored, as the spec requires."""
+
+    def test_relative_values_fall_back_to_the_home_defaults(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bea_engine.ledger.write import cache_dir as engine_cache_dir
+        from bea_engine.managed_price_cache import cache_root
+        from cli import config
+
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.delenv("BEA_CONFIG_DIR", raising=False)
+        for variable in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"):
+            monkeypatch.setenv(variable, "relative")
+
+        assert config.config_dir() == tmp_path / "home" / ".config" / "bea"
+        assert config.cache_dir() == tmp_path / "home" / ".cache" / "bea"
+        assert config.data_dir() == tmp_path / "home" / ".local" / "share" / "bea"
+        assert engine_cache_dir() == tmp_path / "home" / ".cache" / "bea"
+        assert cache_root() == tmp_path / "home" / ".cache" / "bea" / "managed-prices"
+
+    def test_absolute_values_still_win(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from bea_engine.managed_price_cache import cache_root
+        from cli import config
+
+        monkeypatch.delenv("BEA_CONFIG_DIR", raising=False)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+        assert config.config_dir() == tmp_path / "config" / "bea"
+        assert cache_root() == tmp_path / "cache" / "bea" / "managed-prices"
+
+    def test_check_with_a_relative_cache_home_from_another_directory(self, feed_server: str, tmp_path: Path) -> None:
+        books = tmp_path / "books"
+        books.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        ledger = _write_managed_ledger(books, feed_server)
+        env = {**_cli_env(tmp_path, feed_server), "XDG_CACHE_HOME": "relcache", "HOME": str(tmp_path / "home")}
+
+        result = subprocess.run(
+            [sys.executable, "-m", "cli.main", "--file", str(ledger), "check"],
+            env=env,
+            cwd=elsewhere,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert not (elsewhere / "relcache").exists()
+        assert list((tmp_path / "home" / ".cache" / "bea" / "managed-prices").rglob("*.effective.*"))
+
+
+def _mix_feed(*stamps: str) -> str:
+    lines = ["; alias: BTC-USD"]
+    for index, stamp in enumerate(stamps):
+        lines += [f"2026-10-0{index + 1} price BTC {index + 2} USD", f'  observed-at: "{stamp}"']
+    return "\n".join(lines) + "\n"
+
+
+def _blob_for(text: str) -> PriceFeedBlob:
+    validation = validate_managed_price_text(text)
+    assert isinstance(validation, ValidFeed)
+    return PriceFeedBlob(url="u", revision="r", etag=None, text=text, fetched_at=0.0, feed=validation.feed)
+
+
+@pytest.fixture
+def time_zone(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Switch the process time zone for one test, restoring it afterwards."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is POSIX-only")
+
+    def switch(zone: str) -> None:
+        monkeypatch.setenv("TZ", zone)
+        time.tzset()
+
+    yield switch
+    monkeypatch.undo()
+    time.tzset()
+
+
+class TestObservedAtInstants:
+    """w1/133: observed-at compares as instants, and naive stamps read as UTC."""
+
+    def test_latest_is_chosen_by_instant_not_text(self) -> None:
+        now = time.time()
+        earlier_far_east = time.strftime("%Y-%m-%dT%H:%M:%S+14:00", time.gmtime(now - 13 * 3600 + 14 * 3600))
+        recent = _stamp(now - 60)
+
+        blob = _blob_for(_mix_feed(earlier_far_east, recent))
+
+        assert blob.feed.latest_observed_at == recent
+        assert freshness(blob, now) == "recent"
+
+    @pytest.mark.parametrize("zone", ["UTC", "Etc/GMT+12", "Pacific/Kiritimati", "Asia/Kathmandu"])
+    def test_naive_stamp_ages_the_same_in_every_time_zone(self, zone: str, time_zone: Any) -> None:
+        now = time.time()
+        time_zone(zone)
+
+        recent = _blob_for(_mix_feed(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))))
+        old = _blob_for(_mix_feed(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 3600))))
+        day = _blob_for(_mix_feed(time.strftime("%Y-%m-%d", time.gmtime(now - 2 * 86400))))
+
+        assert freshness(recent, now) == "recent"
+        assert freshness(old, now) == "stale"
+        assert freshness(day, now) == "stale"
+
+    def test_far_future_observation_is_not_recent(self) -> None:
+        now = time.time()
+
+        assert freshness(_blob_for(_mix_feed(_stamp(now + 60))), now) == "recent"
+        assert freshness(_blob_for(_mix_feed(_stamp(now + 3600))), now) == "stale"
+
+    def test_strict_resolve_accepts_a_mixed_offset_feed(self, feed_server: str, tmp_path: Path) -> None:
+        now = time.time()
+        earlier_far_east = time.strftime("%Y-%m-%dT%H:%M:%S+14:00", time.gmtime(now - 13 * 3600 + 14 * 3600))
+        _FeedHandler.routes["/prices/BTC-USD"] = {"body": _mix_feed(earlier_far_east, _stamp(now - 60)).encode()}
+
+        resolved = _resolve(feed_server, tmp_path / "cache", now=now, strict=True)
+
+        assert resolved.blob is not None
+        assert resolved.blob.feed.latest_observed_at == _stamp(now - 60)
+
+
+class TestLedgerPriceDateSpellings:
+    """w1/163: a ledger price wins however Beancount lets it spell the date."""
+
+    def test_collect_normalises_slash_and_unpadded_dates(self) -> None:
+        text = "2026/01/02 price X 5 USD\n2026-1-3 price X 6 USD\n2026/1-4 price X 7 USD\n2026/02/30 price X 8 USD\n"
+
+        assert collect_ledger_price_pairs(text) == {
+            ("2026-01-02", "X", "USD"),
+            ("2026-01-03", "X", "USD"),
+            ("2026-01-04", "X", "USD"),
+        }
+
+    @pytest.mark.parametrize("spelling", ["2026-09-10", "2026/09/10", "2026-9-10", "2026/9/10"])
+    def test_each_spelling_shadows_the_feed_point(self, spelling: str, feed_server: str, tmp_path: Path) -> None:
+        loaded = _load(feed_server, tmp_path, _managed_ledger(feed_server) + f"{spelling} price BTC 5 USD\n")
+
+        assert loaded.errors == []
+        assert _price_numbers(loaded) == ["113500.50", "5"]
+        assert loaded.sources[0].shadowed_count == 1
+        assert loaded.sources[0].effective_dates == ("2026-09-11",)
+
+    def test_getprice_returns_the_slash_dated_ledger_price(self, feed_server: str, tmp_path: Path) -> None:
+        ledger = _write_managed_ledger(tmp_path, feed_server, "2026/09/10 price BTC 5 USD\n")
+
+        result = _run_bea(
+            tmp_path,
+            feed_server,
+            "--json",
+            "--file",
+            str(ledger),
+            "query",
+            "SELECT getprice('BTC', 'USD', 2026-09-10) AS p FROM #prices LIMIT 1",
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "5" in result.stdout and "112000" not in result.stdout

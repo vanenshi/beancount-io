@@ -1,3 +1,4 @@
+import { assertTempAssetKey } from "@/features/s3/temp-asset-key";
 import type { IFavaClientFactory } from "@/foundation/clients/fava-client-factory";
 import type { IAssetStorageService } from "@/features/s3/service/asset-storage-service";
 import type { IAiCfoUsageService } from "@/features/feature-usage/service/ai-cfo-usage-service";
@@ -17,6 +18,7 @@ import { extractTransactionsFromFile } from "../utils/extract-transactions-from-
 import { extractReceiptFromFile } from "../utils/extract-receipt-from-file";
 import { recommendAccounts } from "../utils/recommend-accounts";
 import { categorizeTransactions } from "../utils/categorize-transactions";
+import { modelProxyError } from "../utils/model-proxy-error";
 import { parseLedgerId } from "@/shared/str";
 import { DirectiveType } from "@/foundation/fava";
 import {
@@ -70,16 +72,19 @@ export interface ILLMService {
     identity: Identity,
     s3ObjectKey: string,
     fileFormat: string,
+    platform?: "web" | "mobile",
   ): Promise<ParseFileResult>;
   parseReceipt(
     identity: Identity,
     s3ObjectKey: string,
     ledgerId: string,
+    platform?: "web" | "mobile",
   ): Promise<ParseReceiptResult>;
   suggestCategories(
     identity: Identity,
     ledgerId: string,
     transactions: TransactionToCategorizeDomain[],
+    platform?: "web" | "mobile",
   ): Promise<CategorySuggestionResult[]>;
   invokeOpenAI(
     identity: Identity,
@@ -127,18 +132,12 @@ export class LLMService implements ILLMService {
     }
   }
 
-  async parseFile(
-    identity: Identity,
-    s3ObjectKey: string,
-    fileFormat: string,
-  ): Promise<ParseFileResult> {
-    const { userId } = identity;
-    await this.authorization.authorizeOrThrow({
-      principal: identity,
-      action: AUTHORIZATION_ACTIONS.ASSISTED_FILE_PARSE,
-      resource: [userResource(userId), tempAssetResource(s3ObjectKey)],
-    });
-    this.assertLlmConfigured();
+  private async assertAssistedQuotaAvailable(
+    userId: string,
+    platform: "web" | "mobile",
+  ): Promise<void> {
+    if (platform === "mobile") return;
+
     const usageCheck = await this.aiCfoUsageService.check(userId);
     if (!usageCheck.allowed) {
       throw new ResourceLimitReachedError(
@@ -147,6 +146,23 @@ export class LLMService implements ILLMService {
         usageCheck.currentCount,
       );
     }
+  }
+
+  async parseFile(
+    identity: Identity,
+    s3ObjectKey: string,
+    fileFormat: string,
+    platform: "web" | "mobile" = "web",
+  ): Promise<ParseFileResult> {
+    const { userId } = identity;
+    assertTempAssetKey(s3ObjectKey, "objectKey");
+    await this.authorization.authorizeOrThrow({
+      principal: identity,
+      action: AUTHORIZATION_ACTIONS.ASSISTED_FILE_PARSE,
+      resource: [userResource(userId), tempAssetResource(s3ObjectKey)],
+    });
+    this.assertLlmConfigured();
+    await this.assertAssistedQuotaAvailable(userId, platform);
 
     const { contentType } =
       await this.assetStorage.getObjectMetadata(s3ObjectKey);
@@ -179,22 +195,17 @@ export class LLMService implements ILLMService {
     identity: Identity,
     s3ObjectKey: string,
     ledgerId: string,
+    platform: "web" | "mobile" = "web",
   ): Promise<ParseReceiptResult> {
     const { userId } = identity;
+    assertTempAssetKey(s3ObjectKey, "objectKey");
     await this.authorization.authorizeOrThrow({
       principal: identity,
       action: AUTHORIZATION_ACTIONS.ASSISTED_RECEIPT_PARSE,
       resource: [tempAssetResource(s3ObjectKey), ledgerResource(ledgerId)],
     });
     this.assertLlmConfigured();
-    const usageCheck = await this.aiCfoUsageService.check(userId);
-    if (!usageCheck.allowed) {
-      throw new ResourceLimitReachedError(
-        "AI CFO Token",
-        usageCheck.maxAllowed,
-        usageCheck.currentCount,
-      );
-    }
+    await this.assertAssistedQuotaAvailable(userId, platform);
 
     const { ledgerOwner, ledgerName } = parseLedgerId(ledgerId);
     const { contentType } =
@@ -256,6 +267,7 @@ export class LLMService implements ILLMService {
     identity: Identity,
     ledgerId: string,
     transactions: TransactionToCategorizeDomain[],
+    platform: "web" | "mobile" = "web",
   ): Promise<CategorySuggestionResult[]> {
     const { userId } = identity;
     await this.authorization.authorizeOrThrow({
@@ -263,14 +275,7 @@ export class LLMService implements ILLMService {
       action: AUTHORIZATION_ACTIONS.ASSISTED_CATEGORIES_SUGGEST,
       resource: ledgerResource(ledgerId),
     });
-    const usageCheck = await this.aiCfoUsageService.check(userId);
-    if (!usageCheck.allowed) {
-      throw new ResourceLimitReachedError(
-        "AI CFO Token",
-        usageCheck.maxAllowed,
-        usageCheck.currentCount,
-      );
-    }
+    await this.assertAssistedQuotaAvailable(userId, platform);
 
     this.assertLlmConfigured();
 
@@ -354,10 +359,15 @@ export class LLMService implements ILLMService {
     identity: Identity,
     request: Readonly<Record<string, unknown>>,
   ): Promise<unknown> {
+    const boundedRequest =
+      request.max_tokens === undefined &&
+      request.max_completion_tokens === undefined
+        ? { ...request, max_completion_tokens: 1500 }
+        : request;
     const response = await this.invokeModelProxy(
       identity,
       `https://api.blockeden.xyz/openai/${this.config.blockeden.accessKey}/v1/chat/completions`,
-      request,
+      boundedRequest,
     );
     const usage = (response as { usage?: { total_tokens?: number } }).usage;
     await this.recordProxyUsage(identity.userId, usage?.total_tokens ?? 0);
@@ -389,7 +399,11 @@ export class LLMService implements ILLMService {
     });
     if (!upstream.ok) {
       const text = await upstream.text();
-      throw new InternalServerError(text, undefined, upstream.status);
+      throw modelProxyError(
+        upstream.status,
+        text,
+        upstream.headers.get("retry-after"),
+      );
     }
     return upstream.json();
   }

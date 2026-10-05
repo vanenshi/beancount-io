@@ -62,7 +62,11 @@ import {
   LedgerTemplate,
 } from "./ledger-workflow.types";
 import { createLedger as createLedgerOperation } from "@/features/ledger/operations/create-ledger";
-import { BadUserInputError, InternalServerError } from "@/shared/errors";
+import {
+  BadUserInputError,
+  InternalServerError,
+  NotFoundError,
+} from "@/shared/errors";
 import { operationNotAllowedFromCause } from "@/features/ledger/utils/operation-not-allowed-from-cause";
 import { filterNullish } from "@/shared/tools";
 import { processBatch } from "@/shared/batch-processor";
@@ -80,13 +84,22 @@ import { decodeFileContent } from "@/shared/file-content";
 
 const workflowLogger = logger.child({ module: "ledger-workflow" });
 
+// The ledger service relays Gitea's repository lists, and Gitea serves them in
+// pages of at most API.MAX_RESPONSE_ITEMS (50): a larger `limit` is clamped
+// without a word, and an omitted one falls back to DEFAULT_PAGING_NUM (30). A
+// read that must not lose ledgers pages through at this size (w2/m34).
+const CATALOG_PAGE_SIZE = 50;
+// A runaway guard for an upstream that never returns a short page, not a
+// product limit: 10,000 ledgers.
+const MAX_CATALOG_PAGES = 200;
 // Each miss is a real git clone + beancount parse (see beancount-ledger-v2's
 // load-cached-ledger-file-map.ts), so directive-count fan-out stays deliberately narrow.
-const OWNED_LEDGERS_PAGE_SIZE = 50;
 const DIRECTIVE_COUNT_CONCURRENCY = 3;
 
 function includeTargetOf(line: string): string | null {
-  const match = line.match(/^\s*include\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(;.*)?$/);
+  const match = line.match(
+    /^\s*include\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(;.*)?$/,
+  );
   return match?.[1] ?? match?.[2] ?? match?.[3] ?? null;
 }
 
@@ -94,14 +107,19 @@ function matchesIncludeLine(line: string, oldPath: string): boolean {
   return includeTargetOf(line) === oldPath;
 }
 
-function rewriteIncludeLine(line: string, oldPath: string, newPath: string): string {
+function rewriteIncludeLine(
+  line: string,
+  oldPath: string,
+  newPath: string,
+): string {
   const match = line.match(
     /^(\s*include\s+)(?:"([^"]+)"|'([^']+)'|(\S+))(\s*(;.*)?)$/,
   );
   if (!match) return line;
   const target = match[2] ?? match[3] ?? match[4];
   if (target !== oldPath) return line;
-  const quote = match[2] !== undefined ? '"' : match[3] !== undefined ? "'" : "";
+  const quote =
+    match[2] !== undefined ? '"' : match[3] !== undefined ? "'" : "";
   return `${match[1]}${quote}${newPath}${quote}${match[5] ?? ""}`;
 }
 
@@ -143,6 +161,7 @@ export interface ILedgerWorkflow {
   createLedger(params: {
     identity: Identity;
     input: CreateLedgerCommand;
+    platform?: "web" | "mobile";
   }): Promise<LedgerData>;
   updateLedger(params: {
     identity: Identity;
@@ -250,6 +269,78 @@ const restrictToPin = <L extends { fullName: string }>(
   identity.ledgerScope
     ? ledgers.filter((ledger) => ledger.fullName === identity.ledgerScope)
     : ledgers;
+
+/** One ledger-service catalog call. */
+type CatalogPageReader = (query: ListLedgersParams) => Promise<LedgerData[]>;
+
+/** Ledgers `[offset, offset + count)` of a catalog. */
+interface CatalogWindow {
+  offset: number;
+  count: number;
+}
+
+/**
+ * The window a caller's `page`/`limit` asks for when one upstream call cannot
+ * serve it: no paging at all means the whole catalog, and a `limit` above
+ * CATALOG_PAGE_SIZE spans several upstream pages. `null` means one call with
+ * the caller's own arguments, so page-only and small-page reads keep exactly
+ * the ledger service's semantics.
+ */
+function catalogWindow({
+  page,
+  limit,
+}: ListLedgersParams): CatalogWindow | null {
+  if (page == null && limit == null) return { offset: 0, count: Infinity };
+  if (limit == null || limit <= CATALOG_PAGE_SIZE) return null;
+  // The ledger service parseInt()s both values, and Gitea reads a page below 1
+  // as page 1.
+  const count = Math.trunc(limit);
+  const offset = (Math.max(1, Math.trunc(page ?? 1)) - 1) * count;
+  // GraphQL and the owned-ledgers query accept any number. Past 2^53 page
+  // arithmetic is inexact, and the ledger service would read the exponent form
+  // `1e+21` as page 1, so such a request keeps the single call it always made.
+  return Number.isSafeInteger(offset) ? { offset, count } : null;
+}
+
+/** A page shorter than CATALOG_PAGE_SIZE is the end of the catalog. */
+async function readCatalogWindow(
+  readPage: CatalogPageReader,
+  { offset, count }: CatalogWindow,
+): Promise<LedgerData[]> {
+  const firstPage = Math.floor(offset / CATALOG_PAGE_SIZE) + 1;
+  const skip = offset % CATALOG_PAGE_SIZE;
+  const end = skip + count;
+  const ledgers: LedgerData[] = [];
+  for (let read = 0; ledgers.length < end; read++) {
+    if (read === MAX_CATALOG_PAGES) {
+      workflowLogger.warn(
+        "Catalog read hit the page cap and may be truncated",
+        {
+          firstPage,
+          ledgers: ledgers.length,
+        },
+      );
+      break;
+    }
+    const batch = await readPage({
+      page: firstPage + read,
+      limit: CATALOG_PAGE_SIZE,
+    });
+    ledgers.push(...batch);
+    if (batch.length < CATALOG_PAGE_SIZE) break;
+  }
+  return ledgers.slice(skip, end);
+}
+
+function readCatalog(
+  readPage: CatalogPageReader,
+  args: ListLedgersParams,
+): Promise<LedgerData[]> {
+  const window = catalogWindow(args);
+  return window
+    ? readCatalogWindow(readPage, window)
+    : readPage({ page: args.page, limit: args.limit });
+}
 
 export class LedgerWorkflow implements ILedgerWorkflow {
   constructor(
@@ -387,9 +478,11 @@ export class LedgerWorkflow implements ILedgerWorkflow {
   async createLedger({
     identity,
     input,
+    platform = "web",
   }: {
     identity: Identity;
     input: CreateLedgerCommand;
+    platform?: "web" | "mobile";
   }): Promise<LedgerData> {
     await this.authorization.authorizeOrThrow({
       principal: identity,
@@ -423,6 +516,7 @@ export class LedgerWorkflow implements ILedgerWorkflow {
         config: this.config,
         ledgerCreate,
         userId,
+        platform,
       });
     });
   }
@@ -715,17 +809,21 @@ export class LedgerWorkflow implements ILedgerWorkflow {
         path: input.oldPath,
       }),
       "read ledger file for rename",
-      (cause) => operationNotAllowedFromCause("read ledger file for rename", cause),
+      (cause) =>
+        operationNotAllowedFromCause("read ledger file for rename", cause),
     );
     if (!oldFile) {
-      throw new BadUserInputError(`${input.oldPath}: file not found`);
+      // NOT_FOUND, as a missing file is on every read and edit path; it was
+      // BAD_USER_INPUT here alone (w5/051).
+      throw new NotFoundError("File", input.oldPath);
     }
     const existingTarget = await unwrapFavaResponse(
       favaApiClient.ledgers.getLedgerFile(ledgerOwner, ledgerName, {
         path: input.newPath,
       }),
       "read ledger file for rename",
-      (cause) => operationNotAllowedFromCause("read ledger file for rename", cause),
+      (cause) =>
+        operationNotAllowedFromCause("read ledger file for rename", cause),
     );
     if (existingTarget) {
       throw new BadUserInputError(
@@ -769,7 +867,8 @@ export class LedgerWorkflow implements ILedgerWorkflow {
           files: candidates,
         }),
         "read ledger files for rename",
-        (cause) => operationNotAllowedFromCause("read ledger files for rename", cause),
+        (cause) =>
+          operationNotAllowedFromCause("read ledger files for rename", cause),
       );
       includingFiles = (contents ?? [])
         .map((file) => ({
@@ -974,14 +1073,15 @@ export class LedgerWorkflow implements ILedgerWorkflow {
     const userId = identity.userId;
     const { favaApiClient } =
       await this.favaClientFactory.getApiContext(userId);
-    const data = await unwrapFavaResponse(
-      favaApiClient.ledgers.listLedgers({ page: args.page, limit: args.limit }),
-      "list ledgers",
-    );
-
-    return data.map((ledger) =>
-      mapToLedger(ledger as FavaLedgerPublic, this.config.gitea),
-    );
+    return readCatalog(async (query) => {
+      const data = await unwrapFavaResponse(
+        favaApiClient.ledgers.listLedgers(query),
+        "list ledgers",
+      );
+      return data.map((ledger) =>
+        mapToLedger(ledger as FavaLedgerPublic, this.config.gitea),
+      );
+    }, args);
   }
 
   async listUserOwnedLedgers({
@@ -999,7 +1099,7 @@ export class LedgerWorkflow implements ILedgerWorkflow {
     const userId = identity.userId;
     const { favaApiClient, favaUser } =
       await this.favaClientFactory.getApiContext(userId);
-    const ledgers = await this.listUserOwnedLedgersPage(
+    const ledgers = await this.listUserOwnedLedgersCatalog(
       favaApiClient,
       favaUser.username,
       args,
@@ -1007,22 +1107,20 @@ export class LedgerWorkflow implements ILedgerWorkflow {
     return restrictToPin(identity, ledgers);
   }
 
-  private async listUserOwnedLedgersPage(
+  private listUserOwnedLedgersCatalog(
     favaApiClient: FavaApiClient,
     username: string,
     args: ListLedgersParams,
   ): Promise<LedgerData[]> {
-    const data = await unwrapFavaResponse(
-      favaApiClient.ledgers.listUserLedgers(username, {
-        page: args.page,
-        limit: args.limit,
-      }),
-      "list ledgers",
-    );
-
-    return data.map((ledger) =>
-      mapToLedger(ledger as FavaLedgerPublic, this.config.gitea),
-    );
+    return readCatalog(async (query) => {
+      const data = await unwrapFavaResponse(
+        favaApiClient.ledgers.listUserLedgers(username, query),
+        "list ledgers",
+      );
+      return data.map((ledger) =>
+        mapToLedger(ledger as FavaLedgerPublic, this.config.gitea),
+      );
+    }, args);
   }
 
   async listUserOwnedLedgersWithDirectiveCounts({
@@ -1038,18 +1136,11 @@ export class LedgerWorkflow implements ILedgerWorkflow {
     });
     const { favaApiClient, favaUser } =
       await this.favaClientFactory.getApiContext(userId);
-    const ledgers: LedgerData[] = [];
-    let page = 1;
-    for (;;) {
-      const pageResult = await this.listUserOwnedLedgersPage(
-        favaApiClient,
-        favaUser.username,
-        { page, limit: OWNED_LEDGERS_PAGE_SIZE },
-      );
-      ledgers.push(...pageResult);
-      if (pageResult.length < OWNED_LEDGERS_PAGE_SIZE) break;
-      page += 1;
-    }
+    const ledgers = await this.listUserOwnedLedgersCatalog(
+      favaApiClient,
+      favaUser.username,
+      {},
+    );
 
     // Empty ledgers have nothing to parse — skip the Fava call entirely.
     const nonEmptyLedgers = ledgers.filter((ledger) => !ledger.empty);

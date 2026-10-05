@@ -20,6 +20,7 @@ import {
   validateScreenshotManifest,
   withoutPlayReviewEntries,
   validateStoreStagingReceipt,
+  validateStoreMetadata,
   writeStoreStagingReceipt,
 } from "../store-metadata";
 
@@ -84,6 +85,39 @@ describe("App Store locale manifests", () => {
 });
 
 describe("App Store keyword and release-note quality", () => {
+  it("rejects other mobile platforms and marketplaces in Apple release notes", () => {
+    for (const note of [
+      "On Android, the splash logo is back.",
+      "ANDROID startup is faster.",
+      "Android上的启动画面已修复。",
+      "修复安卓启动画面。",
+      "新增鴻蒙支援。",
+      "Available on Google Play.",
+      "Available on Google Play Store.",
+      "Download from the Amazon Appstore.",
+      "Now on HarmonyOS and AppGallery.",
+    ]) {
+      expect(releaseNoteErrors(note)).toEqual([
+        "whatsNew must describe Apple-platform changes only; remove other mobile platforms or marketplaces",
+      ]);
+    }
+  });
+
+  it("accepts user-facing fixes and blank templates", () => {
+    for (const note of [
+      "Transfers now show the amount moved. Larger text stays readable.",
+      "转账金额显示更准确，大字号下的交易记录更清晰。",
+      "Investment prices stay visible when you return to the app.",
+    ]) {
+      expect(releaseNoteErrors(note)).toEqual([]);
+    }
+    expect(releaseNoteErrors("", false)).toEqual([]);
+  });
+
+  it("validates every current Apple localization through the metadata gate", () => {
+    expect(validateStoreMetadata(root)).toEqual([]);
+  });
+
   it("rejects malformed, duplicate, over-limit, and indexed phrases", () => {
     expect(
       keywordValidationErrors(
@@ -337,6 +371,38 @@ describe("remote release gate", () => {
           reviewDirectory: screenshotReviewDirectory,
         }),
       ).toEqual([]);
+      for (const phase of ["metadata", "screenshots"] as const) {
+        const reviewDirectory =
+          phase === "metadata"
+            ? metadataReviewDirectory
+            : screenshotReviewDirectory;
+        expect(
+          validateReleaseGate({
+            phase,
+            version: "1.20260824.45",
+            state: "DEVELOPER_REJECTED",
+            confirmedVersion: "1.20260824.45",
+            reviewDirectory,
+          }),
+        ).toEqual([]);
+        for (const state of [
+          "READY_FOR_REVIEW",
+          "WAITING_FOR_REVIEW",
+          "IN_REVIEW",
+          "READY_FOR_SALE",
+          "",
+        ]) {
+          expect(
+            validateReleaseGate({
+              phase,
+              version: "1.20260824.45",
+              state,
+              confirmedVersion: "1.20260824.45",
+              reviewDirectory,
+            }).length,
+          ).toBe(1);
+        }
+      }
       expect(
         validateReleaseGate({
           phase: "screenshots",
@@ -372,6 +438,11 @@ describe("remote release gate", () => {
       inputDigest: storeInputDigest(root, version),
     };
     expect(validateStoreStagingReceipt(root, version, receipt)).toEqual([]);
+    receipt.verifiedState = "DEVELOPER_REJECTED";
+    expect(validateStoreStagingReceipt(root, version, receipt)).toEqual([]);
+    receipt.verifiedState = "IN_REVIEW";
+    expect(validateStoreStagingReceipt(root, version, receipt).length).toBe(1);
+    receipt.verifiedState = "DEVELOPER_REJECTED";
     receipt.inputDigest = "sha256:stale";
     expect(
       validateStoreStagingReceipt(root, version, receipt).length > 0,

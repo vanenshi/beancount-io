@@ -1,4 +1,4 @@
-"""Everything the CLI prints, in exactly two shapes: a table for people, an envelope for machines.
+"""Everything the CLI prints: readable values for people, envelopes for machines.
 
 In JSON mode data goes to stdout and nothing else does, so a caller can pipe
 stdout straight into `jq`; failures go to stderr as one error object with the
@@ -14,6 +14,7 @@ import json
 import re
 import sys
 import unicodedata
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, NoReturn
@@ -22,8 +23,8 @@ import typer
 
 from cli import context
 from cli.config import package_version
-from cli.errors import LedgerError, UsageError, to_bea_error
-from cli.utils import atomic_write, single_line
+from cli.errors import BeaError, LedgerError, UsageError, to_bea_error
+from cli.utils import atomic_write, inert_text, single_line
 
 
 def _json_mode() -> bool:
@@ -39,7 +40,7 @@ _pending_warnings: list[str] = []
 def flush_warnings() -> None:
     """Print deferred loader warnings; called on the way out of a successful command."""
     for line in _pending_warnings:
-        print(line, file=sys.stderr)
+        print(inert_text(line), file=sys.stderr)
     _pending_warnings.clear()
 
 
@@ -52,7 +53,7 @@ def success(message: str | None = None) -> None:
 def note(message: str) -> None:
     """Progress and advice, on stderr so it never contaminates piped stdout."""
     if not _json_mode():
-        print(message, file=sys.stderr)
+        print(inert_text(message), file=sys.stderr)
 
 
 def error(exc: BaseException | str) -> NoReturn:
@@ -87,13 +88,40 @@ def error(exc: BaseException | str) -> NoReturn:
             payload["traceback"] = trace
         print(json.dumps({"error": payload}), file=sys.stderr)
     else:
-        print(f"Error: {err}", file=sys.stderr)
-        for detail in err.details:
-            print(f"  {detail}", file=sys.stderr)
-        if trace:
-            print(trace, file=sys.stderr, end="")
+        _print_failure(err, trace)
 
     raise typer.Exit(exit_code)
+
+
+def failure(exc: BaseException | str) -> None:
+    """Report a failure that costs one step, not the run — `ask`'s per-turn errors.
+
+    An interactive session has to outlive a failed turn: the same words `error`
+    would have printed, on the same stream, without the `typer.Exit` that would
+    take the conversation with it. Text only, because the surfaces that recover
+    this way have no JSON mode.
+    """
+    err = to_bea_error(exc)
+    trace = None
+    if context.current().debug and isinstance(exc, BaseException):
+        import traceback
+
+        trace = err.traceback or "".join(traceback.format_exception(exc))
+    _print_failure(err, trace)
+
+
+def _print_failure(err: BeaError, trace: str | None) -> None:
+    """The one text rendering of an error, shared by the fatal and recoverable paths.
+
+    Messages quote ledger-controlled text — a document name, an include path —
+    so they are made inert before they reach the terminal (w1/134); JSON keeps
+    the exact values.
+    """
+    print(f"Error: {inert_text(str(err))}", file=sys.stderr)
+    for detail in err.details:
+        print(f"  {inert_text(detail)}", file=sys.stderr)
+    if trace:
+        print(inert_text(trace), file=sys.stderr, end="")
 
 
 def display_width(text: str) -> int:
@@ -113,9 +141,21 @@ def display_width(text: str) -> int:
     return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
 
 
-def _pad(text: str, width: int) -> str:
+def pad(text: str, width: int) -> str:
     """`str.ljust` measured in columns rather than code points."""
     return text + " " * max(0, width - display_width(text))
+
+
+def truncate(text: str, width: int) -> str:
+    """`text` cut to at most `width` columns, ending in `...` when it was cut."""
+    if display_width(text) <= width:
+        return text
+    kept = ""
+    for char in text:
+        if display_width(kept + char) > width - 3:
+            break
+        kept += char
+    return f"{kept}..."
 
 
 def table(headers: list[str], rows: list[list[str]]) -> None:
@@ -129,17 +169,52 @@ def table(headers: list[str], rows: list[list[str]]) -> None:
         for i, cell in enumerate(row):
             widths[i] = max(widths[i], display_width(cell))
     sep = "  "
-    typer.echo(sep.join(_pad(h, widths[i]) for i, h in enumerate(headers)))
+    typer.echo(sep.join(pad(h, widths[i]) for i, h in enumerate(headers)))
     typer.echo(sep.join("-" * widths[i] for i in range(len(headers))))
     for row in rows:
-        typer.echo(sep.join(_pad(cell, widths[i]) for i, cell in enumerate(row)))
+        typer.echo(sep.join(pad(cell, widths[i]) for i, cell in enumerate(row)))
+
+
+def fields(values: Mapping[str, object], *, indent: int = 0) -> None:
+    """Render object fields with yes/no booleans and indented nested objects."""
+    if _json_mode():
+        return
+    for key, value in values.items():
+        label = f"{' ' * indent}{single_line(key)}:"
+        if isinstance(value, Mapping):
+            typer.echo(label)
+            fields(value, indent=indent + 2)
+            continue
+        if isinstance(value, bool):
+            text = "yes" if value else "no"
+        elif value is None:
+            text = ""
+        elif isinstance(value, list):
+            text = json.dumps(value, ensure_ascii=False)
+        else:
+            text = single_line(str(value))
+        typer.echo(f"{label} {text}")
 
 
 def file_target(path: Path) -> dict[str, Any]:
     return {"file": str(path.resolve())}
 
 
-_INCLUDE_DIRECTIVE = re.compile(r'^\s*include\s+"([^"]+)"', re.MULTILINE)
+# Spelled the way Beancount's lexer reads it: the keyword may touch its string
+# (`include"x"`), and the string may carry backslash escapes (w1/159).
+_INCLUDE_DIRECTIVE = re.compile(r'^\s*include\s*"((?:[^"\\]|\\.)+)"', re.MULTILINE | re.DOTALL)
+_STRING_ESCAPE = re.compile(r"\\(.)", re.DOTALL)
+_ESCAPED = {"n": "\n", "t": "\t", "r": "\r", "f": "\f", "b": "\b"}
+
+
+def _unescape(raw: str) -> str:
+    """A quoted string's value, as the lexer unescapes it.
+
+    `\\n`, `\\t`, `\\r`, `\\f` and `\\b` are control characters; a backslash
+    before anything else yields that character, so `"d\\ata.bean"` and
+    `"data\\.bean"` both name `data.bean`.
+    """
+    return _STRING_ESCAPE.sub(lambda match: _ESCAPED.get(match.group(1), match.group(1)), raw)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -171,8 +246,12 @@ def _glob_files(pattern: str) -> list[Path]:
     return [path for path in sorted(Path(p) for p in glob.glob(pattern, recursive=True)) if path.is_file()]
 
 
-def _walk_closure(root: Path) -> tuple[list[Path], list[MissingInclude]]:
-    """The root plus every reachable file, with the includes that resolve nowhere.
+def walk_closure(*roots: Path) -> tuple[list[Path], list[MissingInclude]]:
+    """The roots plus every reachable file, with the includes that resolve nowhere.
+
+    Several roots share one walk, so a file reachable from many of them is
+    read once: walking each root separately is quadratic on a long include
+    chain (w1/087).
 
     Read textually on purpose: this runs before the ledger is loaded (it is
     what keeps a `-o` from truncating the file the load is about to read, and
@@ -182,7 +261,7 @@ def _walk_closure(root: Path) -> tuple[list[Path], list[MissingInclude]]:
     members: list[Path] = []
     missing: list[MissingInclude] = []
     seen: set[Path] = set()
-    stack = [root]
+    stack = list(reversed(roots))
     while stack:
         current = stack.pop()
         try:
@@ -199,7 +278,7 @@ def _walk_closure(root: Path) -> tuple[list[Path], list[MissingInclude]]:
             continue
         for match in _INCLUDE_DIRECTIVE.finditer(text):
             raw = match.group(1)
-            matches = _include_matches(current, raw)
+            matches = _include_matches(current, _unescape(raw))
             if matches:
                 stack.extend(matches)
             else:
@@ -209,13 +288,13 @@ def _walk_closure(root: Path) -> tuple[list[Path], list[MissingInclude]]:
 
 def ledger_closure(root: Path) -> list[Path]:
     """The root ledger plus every file its `include` chain can reach."""
-    members, _ = _walk_closure(root)
+    members, _ = walk_closure(root)
     return members
 
 
 def missing_includes(root: Path) -> list[MissingInclude]:
     """The `include` strings in the root's reachable graph that match no file."""
-    _, missing = _walk_closure(root)
+    _, missing = walk_closure(root)
     return missing
 
 
@@ -256,6 +335,99 @@ def refuse_input_alias(destination: Path, source: Path) -> None:
     if _same_file(destination, source):
         raise UsageError(
             f"--output {destination} would overwrite the file it reads ({source}); choose a different destination."
+        )
+
+
+_LEDGER_SUFFIXES = (".bean", ".beancount")
+
+
+def forwarded_option(args: Sequence[str], short: str, long: str, *, flags: str = "") -> str | None:
+    """The value a forwarded option carries, in every spelling its parser accepts.
+
+    A native command takes its arguments as one passthrough list, so an option
+    `bea` must inspect before forwarding has to be found the way the downstream
+    parser finds it: `-o X`, `-oX`, `--output X`, `--output=X`. Assuming one
+    shape is how an aliasing `-omain.bean` slips past a guard. Anything after
+    `--` is a positional argument, not an option. The last spelling wins, which
+    is what the parser downstream does too.
+
+    `flags` names the downstream's boolean short flags, which its parser lets
+    cluster in front of a value option: with `flags="q"`, `-qo X` and `-qoX`
+    carry the destination exactly as `-o X` does (w1/141).
+    """
+    value: str | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg in (short, long):
+            if index + 1 < len(args):
+                value = args[index + 1]
+                index += 2
+                continue
+        elif arg.startswith(f"{long}="):
+            value = arg.split("=", 1)[1]
+        elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
+            cluster = arg[1:]
+            start = 0
+            while start < len(cluster) and cluster[start] in flags:
+                start += 1
+            if cluster[start : start + 1] == short[1:]:
+                if start + 1 < len(cluster):
+                    value = cluster[start + 1 :]
+                elif index + 1 < len(args):
+                    value = args[index + 1]
+                    index += 2
+                    continue
+        index += 1
+    return value or None
+
+
+def guard_forwarded_output(
+    args: Sequence[str],
+    ledgers: Sequence[Path],
+    *,
+    refuse_existing_ledger_file: bool = False,
+    force: bool = False,
+    flags: str = "",
+) -> None:
+    """Apply the output-destination rule to a `-o/--output` that is about to be forwarded.
+
+    One rule for every command that writes where it was told: a destination
+    that is a ledger under read — root or any include, through symlinks and
+    hard links — is refused, and a command that names a ledger file it was
+    never given refuses to replace it without `--force`. Called before the
+    native writer is launched, so a refusal leaves the destination
+    byte-identical.
+    """
+    value = forwarded_option(args, "-o", "--output", flags=flags)
+    if value is None:
+        return
+    guard_output_destination(
+        Path(value).expanduser(), ledgers, refuse_existing_ledger_file=refuse_existing_ledger_file, force=force
+    )
+
+
+def guard_output_destination(
+    destination: Path,
+    ledgers: Sequence[Path],
+    *,
+    refuse_existing_ledger_file: bool = False,
+    force: bool = False,
+) -> None:
+    """`guard_forwarded_output` for a destination the caller already parsed."""
+    for ledger in ledgers:
+        refuse_ledger_alias(destination, ledger)
+    if (
+        refuse_existing_ledger_file
+        and not force
+        and destination.suffix.lower() in _LEDGER_SUFFIXES
+        and (destination.exists() or destination.is_symlink())
+    ):
+        raise UsageError(
+            f"Already exists: {destination}. Pass --force to overwrite it; "
+            "without it, an existing ledger file is never replaced."
         )
 
 
@@ -306,7 +478,35 @@ def emit(
     if destination is None:
         print(serialized, end="")
     else:
-        atomic_write(destination, serialized)
+        atomic_write(destination, serialized, export=True)
+
+
+def _cost_spec_jsonable(cost: Any) -> dict[str, Any]:
+    """A parsed cost constraint, reported field by field.
+
+    A CostSpec is not an Amount: it carries a per-unit number, a total number,
+    and a `MISSING` sentinel — a class, which `json.dumps` cannot encode — in
+    any field the caller left open. Encoding it by the Amount shape crashed on
+    `{}`/`{EUR}` (the sentinel currency reached the encoder) and reported
+    `number: 0` for a total-only cost `{{250 USD}}`, which no longer describes
+    the same lot when it is fed back in. Every field is reported explicitly:
+    unspecified parts are null, and the total keeps its own key.
+
+    The engine's `bea_engine.protocol._jsonable` holds the same walk; the two
+    must agree, or `bea add --json` would change shape depending on which side
+    built the envelope.
+    """
+    total = cost.number_total if isinstance(cost.number_total, Decimal) else None
+    per = cost.number_per if isinstance(cost.number_per, Decimal) else None
+    if total is not None and per is not None and not per:
+        per = None
+    return {
+        "number": jsonable(per),
+        "number_total": jsonable(total),
+        "currency": cost.currency if isinstance(cost.currency, str) else None,
+        "date": jsonable(cost.date),
+        "label": cost.label if isinstance(cost.label, str) else None,
+    }
 
 
 def jsonable(value: Any) -> Any:
@@ -324,10 +524,13 @@ def jsonable(value: Any) -> Any:
         return {str(k): jsonable(v) for k, v in value.items()}
     if type(value) is list:
         return [jsonable(v) for v in value]
+    # Fixed-point, never exponent notation: `str(Decimal("0.00000001"))` is
+    # `1E-8`, which bea's own amount inputs refuse, so the output could not be
+    # fed back in.
     if isinstance(value, Decimal):
-        return str(value)
+        return format(value, "f")
     if isinstance(value, float):
-        return str(Decimal(repr(value)))
+        return format(Decimal(repr(value)), "f")
     if isinstance(value, datetime.date | datetime.datetime):
         return value.isoformat()
     if isinstance(value, Path):
@@ -337,13 +540,10 @@ def jsonable(value: Any) -> Any:
     # Named shapes before structural ones: beancount's Amount and Position are
     # tuples, and rendering them as bare arrays would drop the field names a
     # consumer needs.
+    if hasattr(value, "number_per") and hasattr(value, "number_total"):
+        return _cost_spec_jsonable(value)
     number = getattr(value, "number", None)
     currency = getattr(value, "currency", None)
-    if number is None and currency is not None:
-        # Beancount CostSpec uses number_per / number_total, not number.
-        number = getattr(value, "number_per", None)
-        if number is None:
-            number = getattr(value, "number_total", None)
     if number is not None and currency is not None:
         amount = {"number": jsonable(number), "currency": jsonable(currency)}
         if hasattr(value, "date") and hasattr(value, "label"):
@@ -400,7 +600,7 @@ def render_ledger_errors(
         _pending_warnings.extend(formatted)
         return
     for line in formatted:
-        print(line, file=sys.stderr)
+        print(inert_text(line), file=sys.stderr)
 
 
 def format_ledger_error(err: Any) -> str:

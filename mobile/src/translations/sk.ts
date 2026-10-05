@@ -58,6 +58,7 @@ export const sk: Translations = {
   openInBrowser: "Otvoriť v prehliadači",
   shareLink: "Zdieľať odkaz",
   copyLink: "Kopírovať odkaz",
+  drawerCurrentLedger: "Aktuálna účtovná kniha",
   drawerNew: "Nová",
   drawerLedgerActions: "Akcie pre {{name}}",
   drawerPrivateLinkHint:
@@ -417,7 +418,7 @@ export const sk: Translations = {
   receiptRevealHint:
     "Zatiaľ nič nie je uložené — podrobnosti skontrolujte na ďalšej obrazovke.",
   total: "Spolu",
-  receiptQuotaExhausted: "Kvóta AI je vyčerpaná. Prejdite na vyšší plán.",
+  receiptQuotaExhausted: "Kvóta AI je vyčerpaná.",
   receiptParseFailed: "Účtenku sa nepodarilo prečítať. Skúste to znova.",
   receiptUploadFailed: "Nahrávanie zlyhalo. Skúste to znova.",
   receiptCameraPermission:
@@ -547,7 +548,7 @@ export const sk: Translations = {
     "Prezrel som tvoju knihu, ale minuli sa mi kroky skôr, než som odpovedal. Konkrétnejšia otázka zvyčajne pomôže.",
   agentQuotaTitle: "Mesačný limit AI je vyčerpaný",
   agentQuotaBody:
-    "Vyčerpal si limit AI na tento mesiac. Obnoví sa budúci mesiac, alebo si môžeš plán vylepšiť.",
+    "Vyčerpal si limit AI na tento mesiac. Obnoví sa budúci mesiac.",
   agentApprovalTitle: "Schváľ to na webe",
   agentApprovalBody:
     "Túto zmenu treba skontrolovať skôr, než sa dotkne tvojej knihy, a aplikácia zatiaľ nevie zobraziť celý rozdiel. Otvor túto knihu na beancount.io a schváľ ju.",
@@ -577,7 +578,7 @@ export const sk: Translations = {
   createLedgerTemplateSampleHint:
     "Ukážkové transakcie na preskúmanie aplikácie.",
   createLedgerTierLimit:
-    "Dosiahli ste limit kníh vo svojom pláne. Inovujte alebo archivujte knihu, aby ste mohli vytvoriť ďalšiu.",
+    "Bol dosiahnutý limit kníh. Ďalšiu knihu nie je možné vytvoriť.",
   createLedgerGenericError: "Knihu sa nepodarilo vytvoriť. Skúste to znova.",
   createLedgerDrawerRow: "Nová kniha",
   createLedgerEmptyTitle: "Zatiaľ žiadne knihy",
@@ -607,4 +608,7 @@ export const sk: Translations = {
   breakdownRowShare: "{{amount}}, {{percent}} % z celku",
   budgetChartSummary:
     "Rozpočet verzus skutočnosť za {{span}}. Skutočnosť {{actual}} z rozpočtu {{budget}} za {{count}} období, {{over}} nad cieľom.",
+  feedSourceLedger: "Kniha",
+  feedSourceBlog: "Blog",
+  feedSourceRelease: "Vydanie",
 };

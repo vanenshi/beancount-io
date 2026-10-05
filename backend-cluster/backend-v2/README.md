@@ -224,6 +224,22 @@ Unset either variable and its route returns 404, so a self-host without a
 store build does not advertise Beancount.io's apps. Beancount.io production
 uses `APP_LINKS_APPLE_TEAM_ID=PTLM7BZQMM`.
 
+### MCP Registry domain proof
+
+Optional. `MCP_REGISTRY_AUTH_PROOF` holds the public half of the key that
+signs Beancount.io's publishes to the official MCP Registry
+(`registry.modelcontextprotocol.io`), as the whole record
+`v=MCPv1; k=ed25519; p=<base64 public key>` (`k=ecdsap384` for a P-384 key).
+When set, this server answers `GET /.well-known/mcp-registry-auth` with it,
+which is how the registry verifies that a publish under `io.beancount/*` comes
+from whoever controls this domain. A value that is not that exact record fails
+startup.
+
+Unset → 404. Leave it unset on a self-host: serving Beancount.io's key on your
+domain would let Beancount.io publish under your domain's registry namespace.
+The listing itself is `server.json` at this package's root; the
+[MCP guide](./docs/mcp.md) describes how it is published.
+
 The static `beancount-mobile` client is public (no
 secret), accepts only authorization code plus refresh grants, requires S256
 PKCE, and registers only `io.beancount.ios:/oauth/callback` and
@@ -461,6 +477,40 @@ or null template). Starter includes options and account scaffolding, with no
 transactions or opening balances. Choose **SAMPLE** for a populated demonstration
 ledger. Template changes apply only to newly created ledgers; existing books are
 not rewritten.
+
+### OpenAI-compatible model proxy
+
+`POST /api-gateway/ai/openai/chat/completions` accepts either
+`max_completion_tokens` or the legacy `max_tokens` as a positive integer and
+forwards the supplied field unchanged. Supplying both is a bad request. When
+neither is present, the proxy sends `max_completion_tokens: 1500` instead of
+relying on an uncapped provider default. An explicit cap replaces this default;
+it remains subject to the selected model's limits.
+
+The route requires an authenticated credential with write capability and checks
+the caller's monthly AI allowance before contacting the model. Successful calls
+record the provider's reported total token usage. This wire-compatible endpoint
+retains its documented GraphQL and MCP transport exceptions.
+
+A recognized provider quota refusal returns HTTP 429 with
+`error.code: "RATE_LIMITED"` and `error.metadata.quotaScope: "shared_service"`. This limit
+belongs to the deployment's shared model capacity; the caller's monthly AI
+allowance is tracked separately. When the provider supplies a valid future
+reset, `blockedUntil` contains its UTC ISO timestamp and the message includes
+it. Optional `retryAfter` is a positive integer number of seconds, taken from
+the provider's numeric field, integer `Retry-After` header, or reset timestamp
+(in that order). Failed requests do not record token usage.
+
+Provider quota documents are recognized through bounded `error`/`message`
+envelopes. Other provider failures retain their HTTP status with a generic
+product error; provider messages, links, and credentials are never copied into
+that error. Shared capacity is not currently reported by the monthly usage API.
+
+### Public ledger sitemap
+
+The anonymous `GET /api-gateway/sitemap.xml` endpoint lists public ledger pages.
+Its [sitemap operations guide](./docs/sitemap.md) documents complete pagination,
+cache and failure behavior, canonical URLs, and post-deployment verification.
 
 ## Connecting an MCP client
 

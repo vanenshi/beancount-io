@@ -1,13 +1,14 @@
 """The hosted-API seam: build clients from settings and credentials, and turn
 transport responses into the documented error categories.
 
-Commands never touch httpx or parse a `V1Error`; they call an operation module
-from the generated client and hand the `Response` to `unwrap`.
+Commands never touch httpx or parse a `V1Error`; `call` guards the generated
+operation's parser and `unwrap` handles its resulting `Response`.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any, cast
 
 import httpx
@@ -93,6 +94,71 @@ def authenticated_client() -> AuthenticatedClient:
     return bearer_client(require_credentials().token)
 
 
+def call[T](
+    operation: Callable[..., Response[T]],
+    /,
+    *args: Any,
+    client: AuthenticatedClient,
+    **kwargs: Any,
+) -> Response[T]:
+    """Keep HTTP context when a generated parser rejects a response body.
+
+    Parsing happens inside `sync_detailed`, before `unwrap` can see a Response.
+    A temporary response hook captures status/headers without exposing the body
+    or converting errors raised before an HTTP response into server failures.
+
+    Generated operations take their path parameters positionally, and each is
+    refused here if it is a dot segment: `quote` leaves `.` and `..` intact and
+    httpx then resolves them, so the request would leave the operation's path
+    for another endpoint. Commands validate their arguments first; this is
+    the backstop for every path parameter, present and future.
+    """
+    from cli.errors import BeaError, UsageError, request_id_from
+
+    for arg in args:
+        if isinstance(arg, str) and arg in {".", ".."}:
+            raise UsageError(
+                f"'{arg}' cannot be a path segment; refusing to send a request that would leave its endpoint."
+            )
+
+    response: httpx.Response | None = None
+
+    def capture(received: httpx.Response) -> None:
+        nonlocal response
+        response = received
+
+    hooks = client.get_httpx_client().event_hooks["response"]
+    hooks.append(capture)
+    try:
+        result = operation(*args, client=client, **kwargs)
+        if response is not None and response.is_success and isinstance(result.parsed, list):
+            # Generated array parsers iterate JSON directly: {} and "" would
+            # otherwise silently become [], falsely claiming an empty page.
+            if not isinstance(response.json(), list):
+                raise ValueError("Expected a JSON array")
+        return result
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
+        if response is None:
+            raise
+        if not response.is_success:
+            # A documented error status whose JSON body lacks the `{ok, error}`
+            # envelope (a gateway's `{"message": ...}`, `[]`, a bare string)
+            # makes `V1Error.from_dict` raise; keep the status mapping anyway.
+            from cli.errors import error_from_status
+
+            raise error_from_status(
+                response.status_code,
+                _error_message(None, response.content),
+                request_id=request_id_from(response.headers),
+            ) from exc
+        raise BeaError(
+            f"Unexpected server response (HTTP {response.status_code}).",
+            request_id=request_id_from(response.headers),
+        ) from exc
+    finally:
+        hooks.remove(capture)
+
+
 def unwrap[T](response: Response[T | V1Error]) -> T:
     """The success payload, or the documented error category — nothing else."""
     result = unwrap_or_none(response)
@@ -125,10 +191,12 @@ def _error_message(parsed: object, content: bytes) -> str | None:
     (a proxy's 502, an HTML error page). Read the raw body as best effort
     rather than reducing everything to "HTTP <status>".
     """
+    from cli.errors import server_message
+
     if isinstance(parsed, V1Error):
-        return parsed.error.message
+        return server_message(parsed.error.message)
     try:
-        message = json.loads(content).get("error", {}).get("message")
-    except Exception:
+        body = json.loads(content)
+    except (ValueError, RecursionError):
         return None
-    return str(message) if message else None
+    return server_message(body)

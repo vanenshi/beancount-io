@@ -7,9 +7,19 @@ from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal, NoReturn
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    ValidationInfo,
+    model_validator,
+)
 
-from bea_engine.amounts import require_decimal_notation, split_total_price
+from bea_engine.amounts import require_plain_decimal, split_total_price
+from bea_engine.ledger.text import parse_iso_date, require_commodity, require_flag, require_tag_or_link
 
 
 def _strip_sigil(sigil: str) -> Callable[[Any], Any]:
@@ -26,8 +36,28 @@ def _strip_sigil(sigil: str) -> Callable[[Any], Any]:
     return strip
 
 
-Tag = Annotated[str, BeforeValidator(_strip_sigil("#"))]
-Link = Annotated[str, BeforeValidator(_strip_sigil("^"))]
+#: Validation context for a directive built from a write request — `bea add`,
+#: a bulk row. Only then are the single-token fields held to Beancount's
+#: grammar; a row read back from a ledger is never refused for what a plugin
+#: put in it, so one odd generated entry cannot fail a whole listing.
+WRITE_INPUT: dict[str, bool] = {"write_input": True}
+
+
+def _on_write(check: Callable[[str], str]) -> Callable[[Any, ValidationInfo], Any]:
+    def validate(value: Any, info: ValidationInfo) -> Any:
+        context = info.context
+        return check(value) if isinstance(context, dict) and context.get("write_input") else value
+
+    return validate
+
+
+# Each is written as one bare token, so a write must supply exactly one: a
+# value such as `a ^b` or one with a line break would otherwise print as extra
+# tags, links or whole directives the caller never asked for.
+Tag = Annotated[str, BeforeValidator(_strip_sigil("#")), AfterValidator(_on_write(require_tag_or_link))]
+Link = Annotated[str, BeforeValidator(_strip_sigil("^")), AfterValidator(_on_write(require_tag_or_link))]
+Commodity = Annotated[str, AfterValidator(_on_write(require_commodity))]
+Flag = Annotated[str, AfterValidator(_on_write(require_flag))]
 
 
 def _require_calendar_date(value: Any) -> Any:
@@ -38,6 +68,10 @@ def _require_calendar_date(value: Any) -> Any:
         return value
     if isinstance(value, bool) or isinstance(value, int | float):
         raise ValueError("date must be a string in YYYY-MM-DD form, not a number.")
+    if isinstance(value, str):
+        # Strictly `YYYY-MM-DD`: Pydantic would read "1769904000" as a Unix
+        # timestamp. Loaded rows arrive as date objects and never reach here.
+        return parse_iso_date(value)
     return value
 
 
@@ -48,20 +82,38 @@ LedgerDate = Annotated[datetime.date, BeforeValidator(_require_calendar_date)]
 # exponent notation for a tiny number. Preserve all digits and trailing zeros.
 AmountNumber = Annotated[
     Decimal,
-    BeforeValidator(require_decimal_notation),
+    BeforeValidator(require_plain_decimal),
     PlainSerializer(lambda number: format(number, "f"), return_type=str, when_used="json"),
 ]
 
 
 class Amount(BaseModel):
+    # Unknown keys are refused, not dropped: a misspelled key inside a nested
+    # object would otherwise leave a valid but different amount or lot.
+    model_config = ConfigDict(extra="forbid")
     number: AmountNumber
-    currency: str
+    currency: Commodity
 
 
 class Cost(BaseModel):
-    number: AmountNumber
-    currency: str
-    date: datetime.date | None = None
+    """A lot's cost constraint: any of a per-unit number, a total, a currency.
+
+    Every field is optional because Beancount's own cost syntax is: `{}` selects
+    a lot without constraining it, `{EUR}` constrains only the commodity, and
+    `{{250.00 USD}}` states a total with no per-unit figure. A required number
+    and currency meant the answer `bea add transaction` gives for such a posting
+    could not be fed back in, though `USAGE.md` promises that round trip.
+
+    Because every field is optional, an unknown key must be refused: dropping
+    a misspelled `number_per` left the valid selector `{USD}`, and booking then
+    sold whichever lot it chose.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    number: AmountNumber | None = None
+    number_total: AmountNumber | None = None
+    currency: Commodity | None = None
+    date: LedgerDate | None = None
     label: str | None = None
 
 
@@ -72,7 +124,7 @@ class Posting(BaseModel):
     cost: Cost | None = None
     price: Amount | None = None
     price_total: Amount | None = None
-    flag: str | None = None
+    flag: Flag | None = None
     meta: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -102,6 +154,8 @@ class Posting(BaseModel):
                     f"Could not parse amount {amount!r} as 'NUMBER CURRENCY': {number!r} is not a number. "
                     f"{_FRAGMENT_HELP}"
                 ) from None
+            # A number Decimal reads but the flag path refuses (`1e3`, `1_000`,
+            # `٤٥`) is refused by `units.number`'s spelling rule, at that path.
             value["units"] = {"number": number, "currency": currency}
             return value
         value |= _posting_fragment(amount)
@@ -148,8 +202,9 @@ def _posting_fragment(amount: str) -> dict[str, Any]:
     if cost is not None:
         if cost.number_total is not None and cost.number_total is not MISSING:
             raise ValueError(
-                f"amount {amount!r} uses a total cost '{{{{...}}}}', which bulk input cannot express. "
-                "Split the lot into a per-unit cost '{...}', or use `add transaction` for a total cost."
+                f"amount {amount!r} uses a total cost '{{{{...}}}}', which the amount shorthand cannot express. "
+                'Split the lot into a per-unit cost \'{...}\', or use "units" with a structured "cost" '
+                'carrying "number_total" and "currency".'
             )
         if cost.number_per is MISSING or cost.currency is MISSING:
             refuse("incomplete cost")
@@ -182,11 +237,14 @@ class TransactionHeader(BaseModel):
     posting lines as text, so it has to build one before any posting exists.
     It still needs validation: this is where a tag or link written with its
     sigil loses it, so that formatting does not write it a second time.
+
+    Reads use it too: Beancount accepts a transaction with no postings, so a
+    loaded one must list rather than fail `TransactionDirective`'s input rule.
     """
 
     model_config = ConfigDict(extra="forbid")
     date: LedgerDate
-    flag: str = "*"
+    flag: Flag = "*"
     payee: str | None = None
     narration: str | None = None
     postings: list[Posting] = Field(default_factory=list)
@@ -212,7 +270,7 @@ class OpenDirective(BaseModel):
     model_config = ConfigDict(extra="forbid")
     date: LedgerDate
     account: str
-    currencies: list[str] = Field(default_factory=list)
+    currencies: list[Commodity] = Field(default_factory=list)
     booking: str | None = None
     meta: dict[str, Any] = Field(default_factory=dict)
     generated: bool = Field(default=False, exclude=True)
@@ -231,7 +289,7 @@ class BalanceDirective(BaseModel):
     date: LedgerDate
     account: str
     amount: Amount
-    tolerance: Decimal | None = None
+    tolerance: AmountNumber | None = None
     meta: dict[str, Any] = Field(default_factory=dict)
     generated: bool = Field(default=False, exclude=True)
 
@@ -266,7 +324,7 @@ class EventDirective(BaseModel):
 class PriceDirective(BaseModel):
     model_config = ConfigDict(extra="forbid")
     date: LedgerDate
-    currency: str
+    currency: Commodity
     amount: Amount
     meta: dict[str, Any] = Field(default_factory=dict)
     generated: bool = Field(default=False, exclude=True)
@@ -275,7 +333,7 @@ class PriceDirective(BaseModel):
 class CommodityDirective(BaseModel):
     model_config = ConfigDict(extra="forbid")
     date: LedgerDate
-    currency: str
+    currency: Commodity
     meta: dict[str, Any] = Field(default_factory=dict)
     generated: bool = Field(default=False, exclude=True)
 
@@ -298,13 +356,13 @@ class CustomDirectiveValueText(BaseModel):
 
 class CustomDirectiveValueNumber(BaseModel):
     kind: Literal["number"]
-    value: Decimal
+    value: AmountNumber
 
 
 class CustomDirectiveValueAmount(BaseModel):
     kind: Literal["amount"]
-    number: Decimal
-    currency: str
+    number: AmountNumber
+    currency: Commodity
 
 
 class CustomDirectiveValueAccount(BaseModel):

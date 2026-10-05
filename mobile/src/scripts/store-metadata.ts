@@ -307,6 +307,17 @@ export function releaseNoteErrors(
   if (/\[add your changes here\]|what's new in version|\bTODO\b/i.test(value)) {
     errors.push("whatsNew still contains a scaffold placeholder");
   }
+  // Apple-only metadata (2.3.10). Do not reuse this check for Play notes.
+  // Avoid word boundaries: platform names can touch Chinese text directly.
+  if (
+    /android|安卓|google\s*play|amazon\s*appstore|harmony\s*os|鸿蒙|鴻蒙|app\s*gallery|galaxy\s*store/i.test(
+      value.normalize("NFKC"),
+    )
+  ) {
+    errors.push(
+      "whatsNew must describe Apple-platform changes only; remove other mobile platforms or marketplaces",
+    );
+  }
   return errors;
 }
 
@@ -755,6 +766,12 @@ export function screenshotIdentityErrors(
   return errors;
 }
 
+// A withdrawn submission can be edited and resubmitted with a replacement build.
+// READY_FOR_REVIEW and active review states remain locked.
+export function isEditableStoreState(state: string): boolean {
+  return state === "PREPARE_FOR_SUBMISSION" || state === "DEVELOPER_REJECTED";
+}
+
 export function validateReleaseGate(input: ReleaseGateInput): string[] {
   const errors: string[] = [];
   if (input.confirmedVersion !== input.version) {
@@ -762,9 +779,9 @@ export function validateReleaseGate(input: ReleaseGateInput): string[] {
       `confirmation must exactly match target version ${input.version}`,
     );
   }
-  if (input.state !== "PREPARE_FOR_SUBMISSION") {
+  if (!isEditableStoreState(input.state)) {
     errors.push(
-      `target version must be PREPARE_FOR_SUBMISSION, found ${input.state || "missing"}`,
+      `target version must be PREPARE_FOR_SUBMISSION or DEVELOPER_REJECTED, found ${input.state || "missing"}`,
     );
   }
   const requiredFiles =
@@ -826,7 +843,7 @@ export function validateStoreStagingReceipt(
     errors.push("store staging receipt appId is wrong");
   if (receipt.version !== version)
     errors.push("store staging receipt version is stale");
-  if (receipt.verifiedState !== "PREPARE_FOR_SUBMISSION") {
+  if (!isEditableStoreState(receipt.verifiedState)) {
     errors.push(
       "store staging receipt was not captured while the version was editable",
     );

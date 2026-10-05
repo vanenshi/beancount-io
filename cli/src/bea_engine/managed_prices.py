@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import os
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from hashlib import sha256
+from http.client import IncompleteRead
 from typing import BinaryIO, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -50,14 +53,19 @@ _USER_AGENT = "bea managed-prices"
 
 _PRICES_PATH_RE = re.compile(r"^/prices/([A-Za-z0-9._-]{1,64})$")
 _URL_TARGET_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
-_COMMENT_RE = re.compile(r"^\s*;")
+# The feed grammar is a strict subset of what Beancount's lexer accepts:
+# separators are spaces and tabs only (no Unicode whitespace, form feed, or
+# vertical tab), digits are ASCII, and a metadata key carries its colon.
+# Anything looser validates a body that then fails to parse in the ledger.
+_BLANK_RE = re.compile(r"^[ \t]*$")
+_COMMENT_RE = re.compile(r"^[ \t]*;")
 _HEADER_RE = re.compile(r"^;\s*([a-z][a-z0-9_-]*)\s*:\s*(.+?)\s*$")
 _PRICE_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2})\s+price\s+([A-Z][A-Z0-9'._-]*)\s+([0-9]+(?:\.[0-9]+)?)\s+"
-    r"([A-Z][A-Z0-9'._-]*)\s*(?:;.*)?$"
+    r"^([0-9]{4}-[0-9]{2}-[0-9]{2})[ \t]+price[ \t]+([A-Z][A-Z0-9'._-]*)[ \t]+([0-9]+(?:\.[0-9]+)?)[ \t]+"
+    r"([A-Z][A-Z0-9'._-]*)[ \t]*(?:;.*)?$"
 )
-_METADATA_RE = re.compile(r"^[ \t]+([a-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$")
-_METADATA_VALUE_RE = re.compile(r'^(?:"[^"\\]*"|TRUE|FALSE|\d{4}-\d{2}-\d{2}|-?[0-9]+(?:\.[0-9]+)?)$')
+_METADATA_RE = re.compile(r"^[ \t]+([a-z][A-Za-z0-9_-]*):[ \t]*(.*?)[ \t]*$")
+_METADATA_VALUE_RE = re.compile(r'^(?:"[^"\\]*"|TRUE|FALSE|[0-9]{4}-[0-9]{2}-[0-9]{2}|-?[0-9]+(?:\.[0-9]+)?)$')
 _METADATA_KEYS = frozenset({"price-source", "price-kind", "observed-at", "provisional"})
 _HEADER_KEYS = frozenset({"alias", "commodity", "quote", "source", "revision"})
 _MAX_COMMODITY_LENGTH = 24
@@ -193,12 +201,23 @@ class _RefuseRedirect(HTTPRedirectHandler):
         return None
 
 
-def _read_capped(fp: BinaryIO, limit: int) -> bytes | None:
-    """Read `fp` up to `limit` bytes; None when the body would exceed it."""
+def _read_capped(fp: BinaryIO, limit: int, deadline: float | None = None) -> bytes | None:
+    """Read `fp` up to `limit` bytes; None when the body would exceed it.
+
+    With a `deadline` (a `time.monotonic()` instant) the whole body must
+    arrive by then or `TimeoutError` is raised: the socket timeout bounds a
+    single read, so a server dripping bytes would otherwise stall the load
+    for as long as it likes. `read1` returns whatever one receive delivered,
+    which lets the loop check the clock between trickles; a plain `read`
+    would block until the declared length arrived.
+    """
+    read: Callable[[int], bytes] = getattr(fp, "read1", fp.read) if hasattr(type(fp), "read1") else fp.read
     chunks: list[bytes] = []
     total = 0
     while True:
-        chunk = fp.read(_CHUNK_BYTES)
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError("the response body did not arrive in time")
+        chunk = read(_CHUNK_BYTES)
         if not chunk:
             return b"".join(chunks)
         total += len(chunk)
@@ -262,6 +281,7 @@ def fetch_managed_price_feed(
     if etag:
         request.add_header("If-None-Match", etag)
     dial = opener or build_opener(_RefuseRedirect)
+    deadline = time.monotonic() + timeout_seconds
     try:
         response = dial.open(request, timeout=timeout_seconds)
     except HTTPError as error:
@@ -306,13 +326,22 @@ def fetch_managed_price_feed(
     # redirect handler turns 3xx into that error instead of following it.
     try:
         with response:
-            body = _read_capped(response, max_body_bytes)
+            body = _read_capped(response, max_body_bytes, deadline)
     except TimeoutError:
         return FetchFailed(reason="timeout", message=f"timed out after {timeout_seconds} seconds")
-    except OSError:
+    except (OSError, IncompleteRead):
         return FetchFailed(reason="network", message="Could not read the price response")
     if body is None:
         return FetchFailed(reason="too-large", message=f"body exceeds {max_body_bytes} bytes")
+    # A connection that closes early reads as a short body, not an error, so
+    # compare with the declared length: a truncated feed is a failed fetch,
+    # never a new revision the next 304 would pin.
+    declared = (response.headers.get("Content-Length") or "").strip()
+    if declared.isdigit() and len(body) < int(declared):
+        return FetchFailed(
+            reason="network",
+            message=f"response ended early ({len(body)} of {int(declared)} bytes)",
+        )
     try:
         text = body.decode("utf-8")
     except UnicodeDecodeError:
@@ -369,6 +398,23 @@ def _iso_date(text: str) -> bool:
     return True
 
 
+def observed_instant(stamp: str | None) -> float | None:
+    """An `observed-at` stamp as a POSIX instant, or None when unparseable.
+
+    A stamp without an offset, or a bare date, reads as UTC: the same feed
+    must age the same way whatever the machine's time zone is.
+    """
+    if stamp is None:
+        return None
+    try:
+        moment = datetime.fromisoformat(stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.timestamp()
+
+
 def _unquote(value: str) -> str:
     if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
         return value[1:-1]
@@ -387,9 +433,12 @@ def validate_managed_price_text(text: str) -> ValidFeed | InvalidFeed:
     headers: dict[str, str] = {}
     prices: list[PricePoint] = []
     current: PricePoint | None = None
-    for index, line in enumerate(text.splitlines()):
+    # Lines split the way Beancount and the precedence pass count them: on
+    # "\n" only, so a stray U+2028 or form feed never shifts a line number.
+    for index, raw in enumerate(text.split("\n")):
         line_number = index + 1
-        if not line.strip():
+        line = raw.removesuffix("\r")
+        if _BLANK_RE.match(line):
             continue
         if _COMMENT_RE.match(line):
             header = _HEADER_RE.match(line)
@@ -451,20 +500,14 @@ def validate_managed_price_text(text: str) -> ValidFeed | InvalidFeed:
     header_quote = headers.get("quote")
     if header_quote is not None and header_quote != quote:
         return InvalidFeed(reason=f"header quote {header_quote} does not match price directives ({quote})", line=None)
+    # Latest by instant, like the hosted parser: comparing the text would rank
+    # `10:09+14:00` after `20:08Z` although it happened thirteen hours sooner.
     latest: str | None = None
-    latest_key = ""
+    latest_instant = float("-inf")
     for point in prices:
-        if point.observed_at is None:
-            continue
-        stamp = point.observed_at
-        if stamp.endswith("Z"):
-            stamp = stamp[:-1] + "+00:00"
-        try:
-            key = datetime.fromisoformat(stamp).isoformat()
-        except ValueError:
-            continue
-        if key > latest_key:
-            latest_key = key
+        instant = observed_instant(point.observed_at)
+        if instant is not None and instant > latest_instant:
+            latest_instant = instant
             latest = point.observed_at
     return ValidFeed(
         feed=FeedSummary(

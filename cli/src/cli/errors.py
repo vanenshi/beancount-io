@@ -17,6 +17,8 @@ category name, so a caller can branch on either and get the same answer.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from typing import Any
 
 EXIT_VALIDATION = 1
@@ -111,6 +113,32 @@ def request_id_from(headers: Any) -> str | None:
     return None
 
 
+def server_message(body: object) -> str | None:
+    """Read a sentence from nested API/SDK envelopes without printing raw JSON.
+
+    Gateways can put an encoded error envelope inside another error's message.
+    Bound the unwrapping; unsupported, malformed, or deeper bodies leave the
+    caller's HTTP-status fallback intact.
+    """
+    for _ in range(8):
+        if isinstance(body, Mapping):
+            message = body.get("message")
+            body = message if isinstance(message, str) and message.strip() else body.get("error")
+        elif isinstance(body, str):
+            sentence = body.strip()
+            if not sentence:
+                return None
+            try:
+                body = json.loads(sentence)
+            except ValueError:
+                return None if sentence.startswith("{") else sentence
+            except RecursionError:
+                return None
+        else:
+            return None
+    return None
+
+
 def error_from_status(status: int, message: str | None, *, request_id: str | None = None) -> BeaError:
     """Map a v1 HTTP status to the documented category, keeping the server's words.
 
@@ -118,8 +146,13 @@ def error_from_status(status: int, message: str | None, *, request_id: str | Non
     person reads the server's own message rather than a paraphrase.
     """
     detail = message or f"HTTP {status}"
-    if status in (401, 403):
+    if status == 401:
         return AuthError(f"Not authorized ({detail}). {_auth_remedy()}", request_id=request_id)
+    if status == 403:
+        return AuthError(
+            f"Not authorized ({detail}). Check that your account and credential have permission for this action.",
+            request_id=request_id,
+        )
     if status == 409:
         return ConflictError(detail, request_id=request_id)
     if status == 400:

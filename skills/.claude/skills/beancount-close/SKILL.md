@@ -31,7 +31,7 @@ Seven phases: **Scope → Reconcile → Assert → Recurring → Flags → Repor
 
 ### 1. Scope
 
-Resolve the period (user's words or last complete month — state it). Find the ledger (same discovery as sibling skills). Enumerate **active accounts**: any Assets/Liabilities account with postings in the period or a nonzero balance. Run `bea --file "$ledger" --json --no-input check` first — a ledger that starts red must be fixed (surface the errors) before a close can mean anything.
+Resolve the period (user's words or last complete month — state it). Find the ledger (same discovery as sibling skills). Enumerate **active accounts**: any Assets/Liabilities account with postings in the period or a nonzero balance at period end (bounded by `date < <period-end+1>`, so later entries don't count). Run `bea --file "$ledger" --json --no-input check` first — a ledger that starts red must be fixed (surface the errors) before a close can mean anything.
 
 ### 2. Reconcile
 
@@ -43,7 +43,7 @@ After reconciliation, every reconciled account has a period-end `balance` assert
 
 ### 4. Recurring completeness
 
-Detect expected-but-missing entries: payees appearing in **each of the prior 2–3 months** (steady amount ⇒ subscription-like) but absent this period (query per `close-checklist.md`). Each gap is a **finding** ("NETFLIX appeared Apr+May, absent in June — charge missing, subscription cancelled, or card changed?") — the user answers; if a real entry is missing, it arrives via `beancount-import`/manual entry, **never fabricated** by this skill.
+Detect expected-but-missing entries: merchants (payee, or narration when the payee is empty) appearing in **each of the prior 2–3 months** (steady amount ⇒ subscription-like) but absent this period (query per `close-checklist.md`). Each gap is a **finding** ("NETFLIX appeared Apr+May, absent in June — charge missing, subscription cancelled, or card changed?") — the user answers; if a real entry is missing, it arrives via `beancount-import`/manual entry, **never fabricated** by this skill.
 
 ### 5. Flags
 

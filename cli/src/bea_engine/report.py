@@ -13,7 +13,7 @@ from __future__ import annotations
 import dataclasses
 import re
 import unicodedata
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -25,6 +25,27 @@ from bea_engine.query import format_error
 
 KINDS = ("overview", "income-statement", "balance-sheet", "trial-balance")
 INTERVALS = ("monthly", "quarterly", "yearly", "weekly", "daily")
+CONVERSIONS = ("units", "at_cost", "at_value")
+
+
+def _valid_conversion(value: str) -> bool:
+    """Use the ledger's currency grammar without accepting trailing text."""
+    if value in CONVERSIONS:
+        return True
+    if not value.isascii():
+        return False
+    from beancount.parser.lexer import lex_iter_string
+
+    lex: Callable[[str], Iterator[tuple[str, int, bytes, object]]] = lex_iter_string
+    # Single-letter symbols are CAPITAL tokens in Beancount's currency grammar;
+    # terminate the line so the lexer can distinguish them at end of input.
+    tokens = list(lex(value + "\n"))
+    return (
+        len(tokens) == 2
+        and tokens[0][0] in {"CURRENCY", "CAPITAL"}
+        and tokens[0][2] == value.encode("utf-8")
+        and tokens[1][0] == "EOL"
+    )
 
 
 def answer(
@@ -39,6 +60,15 @@ def answer(
     allow_errors: bool = False,
 ) -> dict[str, Any]:
     """Compute one report or a filtered balance tree and return its JSON-ready payload."""
+    if conversion is not None and not _valid_conversion(conversion):
+        suggestion = conversion.strip().lower().replace("-", "_")
+        if suggestion not in CONVERSIONS:
+            suggestion = conversion.strip().upper()
+        hint = f" Did you mean {suggestion!r}?" if _valid_conversion(suggestion) else ""
+        raise protocol.UsageError(
+            f"Invalid --conversion {conversion!r}. Use units, at_cost, at_value, "
+            f"or an uppercase Beancount currency such as USD.{hint}"
+        )
     if kind == "balances":
         return _balances(file, accounts or [], conversion=conversion, time=time, allow_errors=allow_errors)
     if kind not in KINDS:
@@ -87,7 +117,12 @@ def _balances(
     # holding must not make a USD checking balance fail.
     metadata = (
         _metadata(filtered, resolved_conversion, ledger_errors)
-        | {"account_filter": " ".join(accounts) if accounts else None}
+        # `_metadata` judges emptiness by a report `--account`, which balance
+        # never sets; here the filter is the substring terms.
+        | {
+            "account_filter": " ".join(accounts) if accounts else None,
+            "account_filter_empty": bool(accounts) and all(tree is None for tree in pruned.values()),
+        }
         | _valuation(
             resolved_conversion,
             (
@@ -133,7 +168,7 @@ def _overview(
     liabilities = trees[1].balance_children if trees[1] is not None else empty
     income = trees[2].balance_children if trees[2] is not None else empty
     expenses = trees[3].balance_children if trees[3] is not None else empty
-    worth = _summary(_sum(assets, liabilities), conversion, incomplete=bool(valuation["missing_prices"]))
+    worth = _headline(_sum(assets, liabilities), conversion)
     return metadata | {
         "display_precision": _display_precision(filtered),
         "totals": {
@@ -170,7 +205,7 @@ def _income_statement(
     metadata = _metadata(filtered, conversion, ledger_errors, interval) | valuation
     empty = type(data.income_hierarchy.balance_children)()
     kept = [tree.balance_children if tree is not None else empty for tree in trees]
-    net = _summary(-_sum(*kept), conversion, incomplete=bool(valuation["missing_prices"]))
+    net = _headline(-_sum(*kept), conversion)
     periods: list[dict[str, Any]] = [
         {
             "date": profit.date,
@@ -250,16 +285,17 @@ def _balance_sheet(
     empty = type(data.assets_hierarchy.balance_children)()
     assets = trees[0].balance_children if trees[0] is not None else empty
     liabilities = trees[1].balance_children if trees[1] is not None else empty
-    worth = _summary(_sum(assets, liabilities), conversion, incomplete=incomplete)
+    worth = _headline(_sum(assets, liabilities), conversion)
     reconciled = not incomplete and not filtered.ledger.load_errors and conversion != "units" and not filtered.account
     return metadata | {
         "display_precision": _display_precision(filtered),
         "assets": _tree_json(trees[0]) if trees[0] is not None else None,
         "liabilities": _tree_json(trees[1]) if trees[1] is not None else None,
         "equity": _tree_json(trees[2]) if trees[2] is not None else None,
-        "current_earnings": earnings,
+        # The income statement's `net_profit` rule, so both reports agree.
+        "current_earnings": _headline(earnings, conversion),
         "current_earnings_signs": "negative_for_gain",
-        "net_profit": _negated(earnings),
+        "net_profit": _headline(-earnings, conversion),
         "valuation_adjustment": data.valuation_adjustment if reconciled else None,
         "equity_total": data.equity_total if reconciled else None,
         "equity_reconciled": reconciled,
@@ -380,24 +416,17 @@ def _interval(value: str) -> Any:
 
 
 def _metadata(filtered: Any, conversion: str, ledger_errors: list[str], interval: str | None = None) -> dict[str, Any]:
-    from fava.beans.abc import Close, Commodity, Open
-
     # Every dated fact the report covers sets the period, not transactions
     # alone: a period-end balance assertion is the last thing a close writes,
     # and a report that stopped before it would omit its own evidence. Opens,
     # closes and commodities are declarations — a commodity conventionally
-    # carries a placeholder date decades before any activity.
+    # carries a placeholder date decades before any activity. Account filters
+    # narrow balances, not the calendar: an over-narrow `--account` that
+    # matches nothing must not read as "no dated activity". The interval
+    # series are cut from the same bounds, so they cover exactly this period.
     start: date | None
     end: date | None
-    if filtered.date_range:
-        start, end = filtered.date_range.begin, filtered.date_range.end
-    else:
-        # Account filters narrow balances, not the calendar. An over-narrow
-        # `--account` that matches nothing must not read as "no dated activity".
-        period_entries = filtered.entries if not filtered.account else filtered.ledger.all_entries
-        dates = [entry.date for entry in period_entries if not isinstance(entry, Open | Close | Commodity)]
-        start = min(dates) if dates else None
-        end = max(dates) + timedelta(days=1) if dates else None
+    start, end = filtered.period
     data: dict[str, Any] = {
         "conversion": conversion,
         "period": {"start": start, "end_exclusive": end},
@@ -449,7 +478,7 @@ def _valuation(
         (currency, when)
         for when, balance in balances
         for currency, amount in balance.items()
-        if amount and currency != conversion and conversion not in {"units", "at_cost", "at_value"}
+        if amount and currency != conversion and conversion not in CONVERSIONS
     }
     missing = sorted({currency for currency, _ in missing_dates})
     pairs = [{"from": currency, "to": conversion} for currency in missing]
@@ -501,7 +530,7 @@ def _unvalued(balance: Mapping[str, Decimal], conversion: str) -> bool:
     balance still holding a currency other than the one asked for is a partial
     valuation. Per-unit conversions ask for no valuation and are never partial.
     """
-    if conversion in {"units", "at_cost", "at_value"}:
+    if conversion in CONVERSIONS:
         return False
     return any(amount and currency != conversion for currency, amount in balance.items())
 
@@ -519,15 +548,10 @@ def _summary_series_json(series: Iterable[Any], conversion: str) -> list[dict[st
     return [
         {
             "date": point.date,
-            "balance": _summary(point.balance, conversion, incomplete=_unvalued(point.balance, conversion)),
+            "balance": _headline(point.balance, conversion),
         }
         for point in series
     ]
-
-
-def _negated(balance: Mapping[str, Decimal]) -> dict[str, Decimal | None]:
-    """The same balance in the opposite sign convention, for translating a credit."""
-    return {currency: -number for currency, number in balance.items()}
 
 
 def _tree_balances(node: Any) -> Iterable[Mapping[str, Decimal]]:
@@ -547,26 +571,56 @@ def _sum(*balances: Mapping[str, Decimal]) -> Any:
 
 
 def _summary(balance: Mapping[str, Decimal], conversion: str, *, incomplete: bool = False) -> dict[str, Decimal | None]:
-    if conversion in {"units", "at_cost", "at_value"}:
+    if conversion in CONVERSIONS:
         return dict(balance.items())
     return {conversion: None if incomplete else balance.get(conversion, Decimal(0))}
+
+
+def _headline(balance: Mapping[str, Decimal], conversion: str) -> dict[str, Decimal | None]:
+    """A combined total, `null` only when this balance itself kept an unvalued commodity.
+
+    Judged on the total being shown, at its own date — not on whether any
+    report row lacked a price. Holding a commodity before its first quote is
+    common: the January row of a ledger first priced in February reads null,
+    but that gap says nothing about the as-of headline, where the quote
+    exists. `valuation: "partial"` and `missing_price_dates` still describe
+    the rows.
+    """
+    return _summary(balance, conversion, incomplete=_unvalued(balance, conversion))
 
 
 def _display_precision(filtered: Any) -> dict[str, int]:
     """Fractional digits per currency, for the frontend's human amount rounding.
 
-    Honors `option "display_precision"` the way the old in-process path did via
-    Beancount's DisplayContext.MAXIMUM — without shipping that object across
-    the process boundary.
-    """
-    from beancount.core.display_context import Precision
+    The finest precision the ledger's own money is written in: posting units
+    and balance assertions. Beancount's display context (MAXIMUM) also learns
+    from price directives and `@`/`{}` numbers, so one long quote such as
+    `price AAPL 191.559998 USD` made every USD total in a cents ledger print
+    six decimals. A quote is a rate, not an amount anyone holds.
 
-    dcontext = filtered.ledger.options["dcontext"]
+    `option "display_precision"` still wins for the currencies it names.
+    """
+    from beancount.core.data import Balance, Transaction
+
     precision: dict[str, int] = {}
-    for currency, ccontext in getattr(dcontext, "ccontexts", {}).items():
-        fractional = ccontext.get_fractional(Precision.MAXIMUM)
-        if fractional is not None:
-            precision[str(currency)] = int(fractional)
+
+    def learn(number: Any, currency: Any) -> None:
+        if not isinstance(number, Decimal) or not number.is_finite() or not isinstance(currency, str):
+            return
+        exponent = number.as_tuple().exponent
+        digits = max(0, -exponent) if isinstance(exponent, int) else 0
+        precision[currency] = max(digits, precision.get(currency, 0))
+
+    for entry in filtered.ledger.all_entries:
+        if isinstance(entry, Transaction):
+            for posting in entry.postings:
+                if posting.units is not None:
+                    learn(posting.units.number, posting.units.currency)
+        elif isinstance(entry, Balance):
+            learn(entry.amount.number, entry.amount.currency)
+    for currency, example in (filtered.ledger.options.get("display_precision") or {}).items():
+        exponent = example.as_tuple().exponent
+        precision[str(currency)] = max(0, -exponent) if isinstance(exponent, int) else 0
     return precision
 
 
@@ -611,8 +665,10 @@ def _prune_tree(node: Any, matches: Callable[[str], bool], closed: set[str] | No
     report` document different ones — substrings there, parent-or-regex here —
     and a shared matcher can only honor one of them.
 
-    In a filtered view, closed accounts drop out unless a still-open
-    descendant was kept; ancestors stay for structure. Every retained node's
+    In a filtered view, closed accounts that hold nothing drop out unless a
+    still-open descendant was kept; ancestors stay for structure. A closed
+    account still holding a balance stays, so totals agree with the trial
+    balance. Every retained node's
     subtree total is recomputed from what was kept, so a parent never reports
     the balance of a sibling the filter excluded.
 
@@ -628,15 +684,23 @@ def _prune_tree(node: Any, matches: Callable[[str], bool], closed: set[str] | No
         pruned = _prune_tree(child, matches, closed)
         if pruned is not None:
             kept.append(pruned)
-    is_closed = bool(closed) and node.account in (closed or ())
+    # Beancount lets a non-empty account be closed; hiding one would silently
+    # understate every parent total, so only a closed account that holds
+    # nothing drops out.
+    is_closed = (
+        bool(closed) and node.account in (closed or ()) and not any(number for _, number in node.balance.items())
+    )
     in_scope = not is_closed and matches(node.account)
     if not (in_scope or kept):
         return None
+    from fava.core.tree import zero_filled
+
     own = node.balance if in_scope else type(node.balance)()
+    parts = [own, *(child.balance_children for child in kept)]
     return dataclasses.replace(
         node,
         balance=own,
         has_txns=node.has_txns if in_scope else False,
         children=kept,
-        balance_children=_sum(own, *(child.balance_children for child in kept)),
+        balance_children=zero_filled(_sum(*parts), parts),
     )

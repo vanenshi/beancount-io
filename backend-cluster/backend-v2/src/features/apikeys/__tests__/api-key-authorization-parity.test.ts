@@ -225,6 +225,25 @@ describe("API-key authorization parity", () => {
     expect(model.revoke).not.toHaveBeenCalled();
   });
 
+  it("tells an MCP caller revoking an unknown key to list keys, not ledgers", async () => {
+    // w5/043: the NOT_FOUND fallback hint names ledger and file calls. No
+    // key-owner relationship exists for an id nobody holds.
+    (relationships.check as jest.Mock).mockResolvedValueOnce(false);
+    const response = await callMcp("manageApiKeys", {
+      operation: "revoke",
+      id: "akey_does_not_exist",
+    });
+    expect(response.isError).toBe(true);
+    const { error } = response.structuredContent as {
+      error: { code: string; hint: string };
+    };
+    expect(error.code).toBe("NOT_FOUND");
+    expect(error.hint).toContain("manageApiKeys");
+    expect(error.hint).toContain("list");
+    expect(error.hint).not.toContain("listLedgers");
+    expect(model.revoke).not.toHaveBeenCalled();
+  });
+
   it("conceals a blank REST revoke id as not found", async () => {
     server.setIdentity(adminOAuth);
     await expect(
@@ -374,19 +393,35 @@ describe("API-key authorization parity", () => {
     },
   );
 
-  it.each([{ expires_at: "not-a-date" }, { expires_at: "2000-01-01T00:00:00Z" }])(
-    "rejects invalid MCP arguments before persistence: %j",
-    async (extra) => {
-      const response = await callMcp("manageApiKeys", {
-        operation: "create",
-        name: "Automation",
-        scopes: ["ledger.read"],
-        ...extra,
-      });
-      expect(response.isError).toBe(true);
-      expect(model.create).not.toHaveBeenCalled();
-    },
-  );
+  it.each([
+    { expires_at: "not-a-date" },
+    { expires_at: "2000-01-01T00:00:00Z" },
+  ])("rejects invalid MCP arguments before persistence: %j", async (extra) => {
+    const response = await callMcp("manageApiKeys", {
+      operation: "create",
+      name: "Automation",
+      scopes: ["ledger.read"],
+      ...extra,
+    });
+    expect(response.isError).toBe(true);
+    expect(model.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses an unknown MCP argument as bad input naming the argument", async () => {
+    const response = await callMcp("manageApiKeys", {
+      operation: "list",
+      bogus_field: 1,
+    });
+    expect(response.isError).toBe(true);
+    const { error } = response.structuredContent as {
+      error: { code: string; message: string; hint: string };
+    };
+    expect(error.code).toBe("BAD_USER_INPUT");
+    expect(error.message).toContain("bogus_field");
+    expect(error.message).not.toContain("unrecognized_keys");
+    expect(error.hint).not.toMatch(/retry/i);
+    expect(model.listByUserId).not.toHaveBeenCalled();
+  });
 
   it("prefers the documented spelling when both key spellings are sent", async () => {
     // The snake_case spellings stay accepted for one release (w2/m27); when

@@ -61,6 +61,12 @@ async function fixture(caller = identity) {
       return { data: { name: branch } };
     }),
     repoCompareDiff: jest.fn(async () => ({ data: { total_commits: 1 } })),
+    repoDeleteBranch: jest.fn(
+      async (_o: string, _n: string, branch: string) => {
+        branches.delete(branch);
+        return { data: null };
+      },
+    ),
     repoCreateBranch: jest.fn(
       async (
         _o: string,
@@ -318,9 +324,9 @@ describe("PR creation, inspection, and review through real adapters/workflow/ser
           message: "Pull request created successfully",
           baseBranch: "feature/base",
         });
-        expect(
-          (created.data as { headBranch?: unknown }).headBranch,
-        ).toMatch(/^pr-patch-/);
+        expect((created.data as { headBranch?: unknown }).headBranch).toMatch(
+          /^pr-patch-/,
+        );
         const pr = f.prs.get(1)!;
         expect([...f.branches.get(pr.head.ref)!]).toEqual([
           ["main.bean", "new"],
@@ -404,8 +410,8 @@ describe("PR creation, inspection, and review through real adapters/workflow/ser
                 surface,
                 op,
                 op === "create"
-              ? { title: "Patch", ...validCreate, changes }
-              : {},
+                  ? { title: "Patch", ...validCreate, changes }
+                  : {},
               )
             ).data,
           ).toEqual({
@@ -450,8 +456,8 @@ describe("PR creation, inspection, and review through real adapters/workflow/ser
                 surface,
                 op,
                 op === "create"
-              ? { title: "Patch", ...validCreate, changes }
-              : {},
+                  ? { title: "Patch", ...validCreate, changes }
+                  : {},
               )
             ).failed,
           ).toBe(true);
@@ -477,8 +483,8 @@ describe("PR creation, inspection, and review through real adapters/workflow/ser
                 surface,
                 op,
                 op === "create"
-              ? { title: "Patch", ...validCreate, changes }
-              : {},
+                  ? { title: "Patch", ...validCreate, changes }
+                  : {},
               )
             ).failed,
           ).toBe(true);
@@ -498,8 +504,8 @@ describe("PR creation, inspection, and review through real adapters/workflow/ser
               surface,
               op,
               op === "create"
-              ? { title: "Patch", ...validCreate, changes }
-              : {},
+                ? { title: "Patch", ...validCreate, changes }
+                : {},
             )
           ).failed,
         ).toBe(true);
@@ -509,6 +515,114 @@ describe("PR creation, inspection, and review through real adapters/workflow/ser
       await f.close();
     }
   });
+  it.each(surfaces)(
+    "leaves no branch behind when a create is refused via %s",
+    async (surface) => {
+      const f = await fixture();
+      try {
+        // Nothing to apply: refused before any branch is minted.
+        const empty = await f.call(surface, "create", {
+          title: "Patch",
+          ...validCreate,
+          changes: [],
+        });
+        expect(empty.failed).toBe(true);
+        expect(f.repos.repoCreateBranch).not.toHaveBeenCalled();
+        // Changes that turn out identical to the base: the branch exists by
+        // the time the empty diff is seen, and is removed again.
+        f.repos.repoCompareDiff.mockResolvedValue({
+          data: { total_commits: 0 },
+        });
+        const same = await f.call(surface, "create", {
+          title: "Patch",
+          ...validCreate,
+          changes,
+        });
+        expect(same.failed).toBe(true);
+        expect(f.repos.repoCreateBranch).toHaveBeenCalledTimes(1);
+        expect([...f.branches.keys()]).toEqual(["main", "feature/base"]);
+        expect(f.prs.size).toBe(0);
+      } finally {
+        await f.close();
+      }
+    },
+  );
+  it("answers creating against an unknown base branch as NOT_FOUND on every surface", async () => {
+    const f = await fixture();
+    f.repos.repoGetBranch.mockRejectedValue({ status: 404 });
+    const input = {
+      title: "Patch",
+      ...validCreate,
+      baseBranch: "qa-no-such-branch",
+      changes,
+    };
+    try {
+      const rest = await f.call("rest", "create", input);
+      expect(rest.failed).toBe(true);
+      expect(rest.data).toMatchObject({ error: { code: "NOT_FOUND" } });
+      const mcp = await f.client.callTool({
+        name: "managePullRequests",
+        arguments: { operation: "create", ledger: "alice/main", ...input },
+      });
+      expect(mcp.isError).toBe(true);
+      expect(mcp.structuredContent).toMatchObject({
+        error: {
+          code: "NOT_FOUND",
+          hint: expect.stringContaining("baseBranch"),
+        },
+      });
+      expect((await f.call("gql", "create", input)).failed).toBe(true);
+      expect(f.repos.repoCreateBranch).not.toHaveBeenCalled();
+      expect(f.branches.size).toBe(2);
+    } finally {
+      await f.close();
+    }
+  });
+  it("answers reading an unknown pull request as NOT_FOUND on every surface", async () => {
+    const f = await fixture();
+    // What the generated client throws for a number Gitea does not know.
+    f.repos.repoGetPullRequest.mockRejectedValue({ status: 404 });
+    try {
+      await expect(f.details("rest")).rejects.toThrow("REST 404");
+      await expect(f.details("mcp")).rejects.toMatchObject({
+        code: -32002,
+        data: { code: "NOT_FOUND" },
+      });
+      await expect(f.details("gql")).rejects.toMatchObject({
+        originalError: { category: "NOT_FOUND" },
+      });
+    } finally {
+      await f.close();
+    }
+  });
+  it.each(["approve", "reject"] as const)(
+    "answers %s of an unknown pull request as NOT_FOUND on every surface",
+    async (operation) => {
+      const f = await fixture();
+      // What the generated client throws for a number Gitea does not know.
+      f.repos.repoMergePullRequest.mockRejectedValue({ status: 404 });
+      f.repos.repoEditPullRequest.mockRejectedValue({ status: 404 });
+      try {
+        const rest = await f.call("rest", operation);
+        expect(rest.failed).toBe(true);
+        expect(rest.data).toMatchObject({ error: { code: "NOT_FOUND" } });
+        const mcp = await f.client.callTool({
+          name: "managePullRequests",
+          arguments: { operation, ledger: "alice/main", prNumber: 1 },
+        });
+        expect(mcp.isError).toBe(true);
+        expect(mcp.structuredContent).toMatchObject({
+          error: { code: "NOT_FOUND" },
+        });
+        expect(JSON.stringify(mcp.structuredContent)).not.toContain(
+          "Unknown error",
+        );
+        expect((await f.call("gql", operation)).failed).toBe(true);
+      } finally {
+        await f.close();
+      }
+    },
+  );
   it("marks failed MCP reviews as errors while retaining their domain result", async () => {
     const f = await fixture();
     try {

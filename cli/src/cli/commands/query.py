@@ -31,6 +31,9 @@ FORMATS = ("text", "csv", "beancount")
 # the undotted forms). Any leading-`.` token also goes through the shell.
 _SHELL_ALIASES = frozenset({"clear", "errors", "exit", "help", "history", "parse", "quit", "run", "set"})
 
+#: `--output` spellings that name this process's own stdout.
+_STDOUT_PATHS = frozenset({"-", "/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"})
+
 
 #: Schemes `bean-query` resolves to `beanquery.sources.<scheme>`; anything else
 #: dies there with a ModuleNotFoundError traceback, so the frontend refuses it
@@ -170,7 +173,7 @@ def query(
         str | None,
         typer.Option(
             "--source",
-            help="Native Beanquery source URI (beancount:<path>, csv:..., or a bare path); delegates to bean-query",
+            help="Native Beanquery source URI (beancount:<path>, csv:..., or a bare path); native bean-query rendering",
         ),
     ] = None,
     allow_errors: Annotated[
@@ -187,6 +190,14 @@ def query(
         bool, typer.Option("--numberify", "-m", help="Split amounts into one column per currency")
     ] = False,
     no_errors: Annotated[bool, typer.Option("--no-errors", "-q", help="Hide ledger load errors")] = False,
+    spreadsheet_safe: Annotated[
+        bool,
+        typer.Option(
+            "--spreadsheet-safe",
+            help="With --format csv, prefix text cells starting with = + - @ tab or CR with ' so spreadsheets "
+            "do not run them as formulas",
+        ),
+    ] = False,
 ) -> None:
     """Run BQL queries against a local ledger.
 
@@ -194,10 +205,14 @@ def query(
     or open the interactive shell when stdin is a terminal.
     """
     ctx = context.current()
-    if output_file == "-":
+    if output_file in _STDOUT_PATHS:
+        # The engine's stdout is the envelope pipe, not the caller's, so a
+        # device path for stdout means what `-` means: print the result here.
         output_file = None
     explicit_format = output_format
-    if output_format is None and output_file is not None:
+    # Under `--json` the destination receives the JSON envelope whatever its
+    # suffix, so a `.csv`/`.tsv` name says nothing about the format.
+    if output_format is None and output_file is not None and not ctx.json_output:
         suffix = Path(output_file).suffix.casefold()
         if suffix == ".csv":
             output_format = "csv"
@@ -215,7 +230,15 @@ def query(
         )
     if output_format is None:
         output_format = "text"
+    if spreadsheet_safe and (output_format != "csv" or ctx.json_output or source is not None):
+        raise UsageError(
+            "--spreadsheet-safe applies to CSV from a local --file: pass --format csv (or -o FILE.csv), "
+            "without --json or --source."
+        )
     if output_file is not None:
+        # Resolve once before checking aliases, then carry that target through
+        # the engine and JSON writer even if the original link changes.
+        output_file = str(Path(output_file).resolve())
         output.check_output_destination(Path(output_file))
 
     rendering = ["--format", output_format]
@@ -231,10 +254,24 @@ def query(
         _check_source_scheme(source)
         if output_file is not None:
             _refuse_source_alias(source, Path(output_file))
-        native_args = [*rendering, source]
-        if query_string is not None:
-            native_args.append(query_string)
-        raise typer.Exit(launch.run_native("bean-query", native_args))
+        if not query_string:
+            # The same missing-query policy as `--file`: a terminal opens the
+            # shell only when prompting is allowed, and a pipe must carry BQL.
+            if not sys.stdin.isatty():
+                query_string = sys.stdin.read()
+            elif ctx.no_input:
+                raise UsageError("A query is required with --no-input. Pass it as an argument or on stdin.")
+            else:
+                raise typer.Exit(launch.run_engine_argv(["source-shell", *rendering, "--", source], interactive=True))
+        if not query_string.strip():
+            raise UsageError("A query is required as an argument or on stdin.")
+        _refuse_one_shot_output(query_string)
+        # Refused before the engine starts, exactly as on the `--file` branch.
+        _refuse_multi_statement(query_string)
+        # The engine runs upstream's shell on the native source the way
+        # `bean-query` does, but a missing stored query exits 2 instead of
+        # printing an error and reporting success.
+        raise typer.Exit(launch.run_engine_argv(["source-query", *rendering, "--", source, query_string]))
 
     file = ctx.entry_file()
     if output_file is not None:
@@ -256,7 +293,9 @@ def query(
             shell_argv = ["shell", "--file", str(file), *rendering]
             if allow_errors or not ctx.strict_reads():
                 shell_argv.append("--allow-errors")
-            raise typer.Exit(launch.run_engine_argv(shell_argv))
+            if spreadsheet_safe:
+                shell_argv.append("--spreadsheet-safe")
+            raise typer.Exit(launch.run_engine_argv(shell_argv, interactive=True))
     if not query_string.strip():
         raise UsageError("A query is required as an argument or on stdin.")
     _refuse_one_shot_output(query_string)
@@ -272,14 +311,18 @@ def query(
     engine_format = output_format
     if ctx.json_output:
         engine_format = "text" if _is_shell_utility(query_string) else "json"
-    args = ["query", "--file", str(file), query_string]
-    args += ["--format", engine_format]
+    args = ["query", "--file", str(file), "--format", engine_format]
     if allow_errors or not ctx.strict_reads():
         args.append("--allow-errors")
     if output_file is not None:
         args += ["--output", output_file]
     if numberify:
         args.append("--numberify")
+    if spreadsheet_safe:
+        args.append("--spreadsheet-safe")
+    # After `--`, so a query that begins with a dash stays a query: the engine
+    # would otherwise parse `--output=main.bean` as its own option.
+    args += ["--", query_string]
 
     data = launch.helper_json(args)
     if not no_errors:
