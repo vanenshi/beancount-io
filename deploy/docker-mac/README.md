@@ -1,7 +1,7 @@
 # deploy/docker-mac — full local stack on macOS
 
 Run the whole beancount.io service — dashboard, backend API, ledger service,
-Gitea, PostgreSQL ×2, Redis — on a Mac with Docker Desktop or
+Gitea, PostgreSQL, Redis — on a Mac with Docker Desktop or
 [OrbStack](https://orbstack.dev/), built entirely from this repository.
 
 ## Quick start
@@ -34,13 +34,15 @@ checks for conflicts: `lsof -iTCP:42600-42602 -sTCP:LISTEN`.
 | 42601     | backend-v2 | http://localhost:42601/api-gateway/ (GraphQL), `/healthz` |
 | 42602     | gitea      | http://localhost:42602 (web UI, HTTP clone) |
 
-Everything else — both PostgreSQL instances, Redis, and the ledger service —
-is **not** published to the host. They are reachable only inside the compose
-network:
+Everything else — PostgreSQL, Redis, and the ledger service — is **not**
+published to the host. They are reachable only inside the compose network.
+One PostgreSQL server holds both the `gitea` and the `backend` database; the
+one-shot `postgres-init` service creates `backend` on every `up` if it is
+missing (`docker compose ps --all` shows it as exited 0):
 
 ```zsh
 docker compose exec postgres psql -U postgres gitea
-docker compose exec postgres-backend psql -U postgres backend
+docker compose exec postgres psql -U postgres backend
 docker compose exec redis redis-cli
 docker compose exec backend-v2 wget -qO- http://ledger:8000/healthz
 ```
@@ -50,7 +52,7 @@ To temporarily publish one for a GUI client, drop a gitignored
 
 ```yaml
 services:
-  postgres-backend:
+  postgres:
     ports:
       - "42605:5432"
 ```
@@ -67,10 +69,37 @@ docker compose down             # stop (data survives in ./data/)
 
 ## Data
 
-All state lives in `./data/` (gitignored): `gitea/`, `postgres/`,
-`postgres-backend/`, `redis/`. Delete a subdirectory (while stopped) to reset
-that service; on next start Gitea/PostgreSQL re-initialize and the post script
-re-provisions.
+All state lives in `./data/` (gitignored): `gitea/`, `postgres/`, `redis/`.
+Delete a subdirectory (while stopped) to reset that service; on next start
+Gitea/PostgreSQL re-initialize and the post script re-provisions. Deleting
+`postgres/` resets both the Gitea and the backend database.
+
+### Upgrading from the two-PostgreSQL layout
+
+Older checkouts ran the backend database in a separate `postgres-backend`
+service with its data in `./data/postgres-backend/`. The new compose file no
+longer reads that directory, so move its data once, with the stack stopped:
+
+```zsh
+docker compose down
+# 1. Dump the old backend database from its data directory (tmp/ is gitignored).
+mkdir -p tmp
+docker run -d --name bio-old-backend-pg -v "$PWD/data/postgres-backend:/var/lib/postgresql/data" postgres:16
+until docker exec bio-old-backend-pg pg_isready -U postgres -d backend; do sleep 1; done
+docker exec bio-old-backend-pg pg_dump -U postgres -Fc backend > tmp/backend.dump
+docker rm -f bio-old-backend-pg
+# 2. Start the shared server; postgres-init creates an empty `backend` database.
+docker compose up -d postgres-init
+# 3. Restore, then start everything.
+docker compose exec -T postgres pg_restore -U postgres -d backend --no-owner < tmp/backend.dump
+docker compose up -d
+./apply-migrations.sh   # expect "pending: 0"
+```
+
+Also point `POSTGRES_BACKEND_URI` in `.env` at `@postgres:5432` (or remove it)
+and drop `POSTGRES_BACKEND_USER`/`POSTGRES_BACKEND_PASSWORD`. Once the
+dashboard shows your ledgers, delete `tmp/backend.dump` and
+`./data/postgres-backend/`.
 
 ## Git over SSH (optional)
 

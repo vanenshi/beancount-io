@@ -4,7 +4,7 @@ Deployment configuration for the Beancount.io stack. Read the target's README be
 
 ## Targets
 
-- `docker-mac/` — full local stack through Docker Compose: dashboard, backend-v2, ledger, Gitea, two PostgreSQL instances, and Redis. Run Compose commands from `deploy/docker-mac/`.
+- `docker-mac/` — full local stack through Docker Compose: dashboard, backend-v2, ledger, Gitea, one PostgreSQL server holding both the `gitea` and `backend` databases (the one-shot `postgres-init` service creates `backend`), and Redis. Run Compose commands from `deploy/docker-mac/`.
 - `dev-sandbox/` — the docker-mac stack (on ports 42610-42612 plus a `devdns` dnsmasq sidecar) **plus the Ask-AI sandbox path**: the agent-box worker under host-side `wrangler dev` and optional local-model (Ollama) credentials. Use `./up.sh` / `./down.sh` from `deploy/dev-sandbox/`; the scripts also write `backend-cluster/agent-box/.dev.vars` (shared `ADMIN_TOKEN`).
 - `docker/` — production-oriented, single-host Docker Compose deployment with Caddy-managed TLS, named volumes, health-gated initialization, and no directly published application or datastore ports. Run Compose commands from `deploy/docker/`.
 - `docker-single-psql/` — the `docker/` target with Gitea and backend-v2 sharing **one** PostgreSQL server (two databases, two owning login roles, provisioned by the idempotent one-shot `postgres-init` service). Self-contained: keep it in sync with `docker/` when changing shared services, and keep the shared-server trade-offs documented in its README. Run Compose commands from `deploy/docker-single-psql/`.
