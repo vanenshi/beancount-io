@@ -71,7 +71,7 @@ echo "🗃️  Applying backend-v2 database migrations..."
 
 echo ""
 echo "🔍 Service health summary..."
-SERVICES=("postgres" "postgres-backend" "redis" "gitea" "ledger" "backend-v2" "dashboard")
+SERVICES=("postgres" "redis" "gitea" "ledger" "backend-v2" "dashboard")
 HEALTHY=0
 TOTAL=${#SERVICES[@]}
 for service in "${SERVICES[@]}"; do
