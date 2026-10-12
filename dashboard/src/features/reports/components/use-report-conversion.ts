@@ -60,9 +60,10 @@ export function storedReportConversion(ledgerId: string): ConversionOption {
 }
 
 /**
- * The ledger's report conversion, shared by every report page. Choosing one on
- * Balance Sheet is what Income Statement, Cash Flow, Trial Balance, and account
- * reports open with for the same ledger, and it survives a reload. The value
+ * The ledger's report conversion, shared by every report page and the
+ * Overview's flow modules. Choosing one on Balance Sheet or Overview is what
+ * Income Statement, Cash Flow, Trial Balance, and account reports open with for
+ * the same ledger, and it survives a reload. The value
  * lives in a cookie, so server and client render the same choice.
  *
  * The cookie is read for the current ledger on every render rather than once,

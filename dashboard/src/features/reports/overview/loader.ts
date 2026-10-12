@@ -7,6 +7,7 @@ import {
   GetLedgerOverviewDocument,
   GetLedgerOverviewValuationDocument,
 } from "@/graphql/definitions";
+import { storedReportConversion } from "@/features/reports/components/use-report-conversion";
 import { overviewQueryDefaults } from "./constants";
 import { loadPublicReadme } from "./load-public-readme";
 import type { InitialLedgerReadme } from "@/common/lib/ledger-readme";
@@ -49,7 +50,7 @@ export const overviewLoader: RouteLoader<
           filter,
           time,
           interval: overviewQueryDefaults.interval,
-          conversion: overviewQueryDefaults.conversion,
+          conversion: storedReportConversion(ledgerId),
         },
       })
       .catch(() => undefined),
