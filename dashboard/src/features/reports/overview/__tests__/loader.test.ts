@@ -10,6 +10,13 @@ import {
 } from "@/graphql/definitions";
 import { overviewLoader } from "../loader";
 
+const { cookies } = vi.hoisted(() => ({ cookies: new Map<string, string>() }));
+vi.mock("@/common/hooks/use-cookie-storage-state/cookie", () => ({
+  getCookie: (key: string) => cookies.get(key),
+  setCookie: vi.fn(),
+  removeCookie: vi.fn(),
+}));
+
 type QueryOptions = { query: unknown; variables?: Record<string, unknown> };
 
 function loaderInput(
@@ -48,6 +55,24 @@ describe("overviewLoader", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.useRealTimers();
+    cookies.clear();
+  });
+
+  it("prefetches the flows in the ledger's stored report conversion", async () => {
+    vi.stubEnv("SSR", false);
+    cookies.set("beancount.reportConversion.open_ledger%2Fexample", "IRR");
+    const query = vi.fn((options: QueryOptions) =>
+      PRIMARY.includes(options.query as never)
+        ? Promise.resolve({ data: {} })
+        : pending(),
+    );
+
+    await overviewLoader(loaderInput(query));
+
+    const flows = query.mock.calls.find(
+      ([options]) => options.query === GetLedgerOverviewDocument,
+    );
+    expect(flows?.[0].variables).toMatchObject({ conversion: "IRR" });
   });
 
   it("resolves once the primary reads are cached even while README and metadata are still loading", async () => {
