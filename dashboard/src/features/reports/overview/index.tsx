@@ -38,7 +38,10 @@ import { useTranslations } from "@/common/hooks/use-translations";
 import { getErrorMessageKey } from "@/common/lib/errors/error-message";
 import { overviewQueryDefaults } from "./constants";
 import { ConversionSelect } from "@/common/components/conversion-select";
-import { useReportConversion } from "@/features/reports/components/use-report-conversion";
+import {
+  balanceConversion,
+  useReportConversion,
+} from "@/features/reports/components/use-report-conversion";
 import { ReadmeCard } from "@/common/components/readme-card";
 import { useLedgerReadme } from "@/common/hooks/use-ledger-readme";
 import type { InitialLedgerReadme } from "@/common/lib/ledger-readme";
@@ -207,7 +210,8 @@ export default function LedgerOverviewPage() {
     },
     fetchPolicy: "cache-first",
   });
-  // Balances (net worth, account balances, distribution) at market value.
+  // Balances (net worth, account balances, distribution) at market value, or
+  // in the currency the reader converted to.
   const {
     data: valuationData,
     loading: valuationLoading,
@@ -219,6 +223,7 @@ export default function LedgerOverviewPage() {
       filter: ledgerFilters.searchParams.filter,
       time: ledgerFilters.searchParams.time,
       interval: overviewQueryDefaults.interval,
+      marketConversion: balanceConversion(conversion),
     },
     fetchPolicy: "cache-first",
   });
@@ -265,12 +270,13 @@ export default function LedgerOverviewPage() {
       filter: ledgerFilters.searchParams.filter,
       time: month.timeFilter,
       interval: overviewQueryDefaults.interval,
+      marketConversion: balanceConversion(conversion),
     },
     skip: !pastMonth || !month.timeFilter,
     fetchPolicy: "cache-first",
   });
   const market = valuationData?.market;
-  const costNetWorth = data?.getLedgerOverview?.netWorthData;
+  const costNetWorth = valuationData?.cost?.netWorthData;
   const netWorthValuation = useMemo(
     () =>
       describeLatestNetWorth({

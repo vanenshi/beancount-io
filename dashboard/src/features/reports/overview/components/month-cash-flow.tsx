@@ -39,7 +39,15 @@ export function MonthCashFlow({
   accountMetaPending?: boolean;
 }) {
   const { t } = useTranslations();
-  const scope = { ledgerId, account, filter, ...overviewQueryDefaults };
+  // At cost, as the Income Statement's default: the diagram does not follow
+  // the page's conversion selector, which drives only the flow cards.
+  const scope = {
+    ledgerId,
+    account,
+    filter,
+    interval: overviewQueryDefaults.interval,
+    conversion: "at_cost",
+  };
   const month = useQuery(GetLedgerOverviewDocument, {
     variables: { ...scope, time },
     fetchPolicy: "cache-first",

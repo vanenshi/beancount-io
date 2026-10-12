@@ -9,7 +9,10 @@ import {
   GetLedgerOverviewDocument,
   GetLedgerOverviewValuationDocument,
 } from "@/graphql/definitions";
-import { storedReportConversion } from "@/features/reports/components/use-report-conversion";
+import {
+  balanceConversion,
+  storedReportConversion,
+} from "@/features/reports/components/use-report-conversion";
 import { overviewQueryDefaults } from "./constants";
 import { loadPublicReadme } from "./load-public-readme";
 import { recentTransactionsVariables } from "./lib/recent-transactions";
@@ -50,6 +53,7 @@ export const overviewLoader: RouteLoader<
   // picks the month the page opens on, so that month never changes under the
   // reader. The page renders its own error states from these same queries, so
   // a failure here must not become a route error.
+  const conversion = storedReportConversion(ledgerId);
   const overview = context.client
     .query({
       query: GetLedgerOverviewDocument,
@@ -59,7 +63,7 @@ export const overviewLoader: RouteLoader<
         filter,
         time,
         interval: overviewQueryDefaults.interval,
-        conversion: storedReportConversion(ledgerId),
+        conversion,
       },
     })
     .catch(() => undefined);
@@ -72,6 +76,7 @@ export const overviewLoader: RouteLoader<
         filter,
         time,
         interval: overviewQueryDefaults.interval,
+        marketConversion: balanceConversion(conversion),
       },
     })
     .catch(() => undefined);
@@ -134,6 +139,7 @@ export const overviewLoader: RouteLoader<
             filter,
             time: monthTime,
             interval: overviewQueryDefaults.interval,
+            marketConversion: balanceConversion(conversion),
           },
         })
         .catch(() => undefined);
