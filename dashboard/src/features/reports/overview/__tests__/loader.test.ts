@@ -48,7 +48,7 @@ describe("overviewLoader", () => {
     cookies.clear();
   });
 
-  it("prefetches the flows in the ledger's stored report conversion", async () => {
+  it("prefetches flows and balances in a stored currency conversion", async () => {
     vi.stubEnv("SSR", false);
     cookies.set("beancount.reportConversion.open_ledger%2Fexample", "IRR");
     const query = vi.fn((options: QueryOptions) =>
@@ -63,6 +63,10 @@ describe("overviewLoader", () => {
       ([options]) => options.query === GetLedgerOverviewDocument,
     );
     expect(flows?.[0].variables).toMatchObject({ conversion: "IRR" });
+    const balances = query.mock.calls.find(
+      ([options]) => options.query === GetLedgerOverviewValuationDocument,
+    );
+    expect(balances?.[0].variables).toMatchObject({ marketConversion: "IRR" });
   });
 
   it("resolves once both primary reads are cached even while README and metadata are still loading", async () => {
@@ -100,7 +104,7 @@ describe("overviewLoader", () => {
           },
         },
         {
-          // No conversion variable: the document values balances at market.
+          // At cost is a flow choice: balances stay at market.
           query: GetLedgerOverviewValuationDocument,
           variables: {
             ledgerId: "open_ledger/example",
@@ -108,6 +112,7 @@ describe("overviewLoader", () => {
             filter: "",
             time: "2025",
             interval: "monthly",
+            marketConversion: "at_value",
           },
         },
       ]),

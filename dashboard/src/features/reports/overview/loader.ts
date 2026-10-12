@@ -7,7 +7,10 @@ import {
   GetLedgerOverviewDocument,
   GetLedgerOverviewValuationDocument,
 } from "@/graphql/definitions";
-import { storedReportConversion } from "@/features/reports/components/use-report-conversion";
+import {
+  balanceConversion,
+  storedReportConversion,
+} from "@/features/reports/components/use-report-conversion";
 import { overviewQueryDefaults } from "./constants";
 import { loadPublicReadme } from "./load-public-readme";
 import type { InitialLedgerReadme } from "@/common/lib/ledger-readme";
@@ -40,6 +43,7 @@ export const overviewLoader: RouteLoader<
   // figures, so nothing is drawn at cost and then replaced. The page renders
   // its own error states from these same queries, so a failure here must not
   // become a route error.
+  const conversion = storedReportConversion(ledgerId);
   await Promise.all([
     context.client
       .query({
@@ -50,7 +54,7 @@ export const overviewLoader: RouteLoader<
           filter,
           time,
           interval: overviewQueryDefaults.interval,
-          conversion: storedReportConversion(ledgerId),
+          conversion,
         },
       })
       .catch(() => undefined),
@@ -63,6 +67,7 @@ export const overviewLoader: RouteLoader<
           filter,
           time,
           interval: overviewQueryDefaults.interval,
+          marketConversion: balanceConversion(conversion),
         },
       })
       .catch(() => undefined),
