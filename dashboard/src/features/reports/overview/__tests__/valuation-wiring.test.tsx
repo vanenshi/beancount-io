@@ -123,7 +123,7 @@ const tree = (account: string, balance: Record<string, string>) => ({
   costChildren: null,
 });
 
-// At cost, as the flows and the cost basis read it.
+// At cost, as the flows read it.
 const overview = {
   netWorthData: [{ date: "2017-09-30", balance: { USD: "106723.05" } }],
   assetsData: [],
@@ -142,12 +142,17 @@ const overview = {
   expensesHierarchyData: tree("Expenses", { USD: "60" }),
 };
 
-// At market value, with the units held and the ledger's prices.
+// At market value, with the cost basis, the units held and the ledger's
+// prices. The cost basis is the valuation read's own, so it stays at cost
+// whatever conversion the flows are drawn in.
 const valuation = {
   market: {
     netWorthData: [{ date: "2017-09-30", balance: { USD: "117546.49" } }],
     assetsHierarchyData: tree("Assets", { USD: "125669.84" }),
     liabilitiesHierarchyData: tree("Liabilities", { USD: "-8123.35" }),
+  },
+  cost: {
+    netWorthData: [{ date: "2017-09-30", balance: { USD: "106723.05" } }],
   },
   held: {
     netWorthData: [

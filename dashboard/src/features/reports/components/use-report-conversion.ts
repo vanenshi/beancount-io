@@ -38,6 +38,17 @@ export function resolveReportConversion(
   return DEFAULT_REPORT_CONVERSION;
 }
 
+/**
+ * The conversion balances are drawn in: the currency the reader chose, or
+ * market value for any other choice — a balance at cost or in units would
+ * hide what the holdings are worth.
+ */
+export function balanceConversion(
+  conversion: ConversionOption,
+): ConversionOption {
+  return PRESENTATION_CONVERSIONS.has(conversion) ? "at_value" : conversion;
+}
+
 function readStoredConversion(ledgerId: string): string | undefined {
   try {
     return getCookie(reportConversionCookieKey(ledgerId));

@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  balanceConversion,
   reportConversionCookieKey,
   storedReportConversion,
   useReportConversion,
@@ -83,6 +84,15 @@ describe("useReportConversion", () => {
     expect(
       renderHook(() => useReportConversion(LEDGER_A, "USD")).result.current[0],
     ).toBe("at_cost");
+  });
+});
+
+describe("balanceConversion", () => {
+  it("draws balances in the chosen currency, and at market for any other choice", () => {
+    expect(balanceConversion("USD")).toBe("USD");
+    expect(balanceConversion("at_cost")).toBe("at_value");
+    expect(balanceConversion("units")).toBe("at_value");
+    expect(balanceConversion("at_value")).toBe("at_value");
   });
 });
 

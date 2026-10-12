@@ -1,17 +1,21 @@
-# Balances at market value for the overview's balance modules (Net Worth,
-# Account balances, the distribution charts), plus what the Net Worth card
-# needs to say what that figure is: the units it holds, the ledger's price
-# dates, and which commodities a managed feed prices (w4/m27). Flows stay on GetLedgerOverview at cost; see w4/m26.
+# Balances at market value — or converted to the currency the reader chose —
+# for the overview's balance modules (Net Worth, Account balances, the
+# distribution charts), plus what the Net Worth card needs to say what that
+# figure is: its cost basis, the units it holds, the ledger's price dates, and
+# which commodities a managed feed prices (w4/m27). Flows stay on
+# GetLedgerOverview; see w4/m26.
 query GetLedgerOverviewValuation(
   $ledgerId: String!
   $account: String
   $filter: String
   $time: String
   $interval: String
+  # "at_value", or the currency the reader chose to see everything in.
+  $marketConversion: String! = "at_value"
 ) {
   market: getLedgerBalanceSheet(
     ledgerId: $ledgerId
-    conversion: "at_value"
+    conversion: $marketConversion
     account: $account
     filter: $filter
     time: $time
@@ -38,6 +42,21 @@ query GetLedgerOverviewValuation(
       hasTxns
       cost
       costChildren
+    }
+  }
+  # The Net Worth card's cost basis. Its own read, so it stays at cost whatever
+  # conversion the flow modules are drawn in.
+  cost: getLedgerBalanceSheet(
+    ledgerId: $ledgerId
+    conversion: "at_cost"
+    account: $account
+    filter: $filter
+    time: $time
+    interval: $interval
+  ) {
+    netWorthData {
+      date
+      balance
     }
   }
   held: getLedgerBalanceSheet(
