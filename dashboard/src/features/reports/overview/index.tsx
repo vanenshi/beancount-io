@@ -25,6 +25,8 @@ import { useTranslations } from "@/common/hooks/use-translations";
 import { getErrorMessageKey } from "@/common/lib/errors/error-message";
 import CashFlowSankey from "./components/cash-flow-sankey";
 import { overviewQueryDefaults } from "./constants";
+import { ConversionSelect } from "@/common/components/conversion-select";
+import { useReportConversion } from "@/features/reports/components/use-report-conversion";
 import { ReadmeCard } from "@/common/components/readme-card";
 import { useLedgerReadme } from "@/common/hooks/use-ledger-readme";
 import type { InitialLedgerReadme } from "@/common/lib/ledger-readme";
@@ -127,7 +129,12 @@ export default function LedgerOverviewPage() {
   const invertIncomeLiabilitiesEquity =
     getInvertIncomeLiabilitiesEquity(ledgerData);
 
-  // Flows (money movement, income vs expenses, cash flow) at cost.
+  // Flows (money movement, income vs expenses) in the ledger's report
+  // conversion, shared with the report pages.
+  const [conversion, setConversion] = useReportConversion(
+    ledgerId,
+    primaryCurrency,
+  );
   const {
     data,
     loading: overviewLoading,
@@ -138,7 +145,8 @@ export default function LedgerOverviewPage() {
       account: ledgerFilters.searchParams.account,
       filter: ledgerFilters.searchParams.filter,
       time: ledgerFilters.searchParams.time,
-      ...overviewQueryDefaults,
+      interval: overviewQueryDefaults.interval,
+      conversion,
     },
     fetchPolicy: "cache-first",
   });
@@ -475,6 +483,11 @@ export default function LedgerOverviewPage() {
               )}
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
+              <ConversionSelect
+                value={conversion}
+                onValueChange={setConversion}
+                currency={primaryCurrency}
+              />
               <LedgerWritePermission>
                 <Button
                   asChild

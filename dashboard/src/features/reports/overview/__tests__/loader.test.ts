@@ -9,6 +9,13 @@ import {
 } from "@/graphql/definitions";
 import { overviewLoader } from "../loader";
 
+const { cookies } = vi.hoisted(() => ({ cookies: new Map<string, string>() }));
+vi.mock("@/common/hooks/use-cookie-storage-state/cookie", () => ({
+  getCookie: (key: string) => cookies.get(key),
+  setCookie: vi.fn(),
+  removeCookie: vi.fn(),
+}));
+
 type QueryOptions = { query: unknown; variables?: Record<string, unknown> };
 
 function loaderInput(query: (options: QueryOptions) => Promise<unknown>) {
@@ -31,12 +38,31 @@ function pending() {
   return new Promise<never>(() => {});
 }
 
-// The two reads the page renders from: flows at cost, balances at market.
+// The two reads the page renders from: flows in the ledger's report
+// conversion (at cost until one is chosen), balances at market.
 const PRIMARY = [GetLedgerOverviewDocument, GetLedgerOverviewValuationDocument];
 
 describe("overviewLoader", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
+    cookies.clear();
+  });
+
+  it("prefetches the flows in the ledger's stored report conversion", async () => {
+    vi.stubEnv("SSR", false);
+    cookies.set("beancount.reportConversion.open_ledger%2Fexample", "IRR");
+    const query = vi.fn((options: QueryOptions) =>
+      PRIMARY.includes(options.query as never)
+        ? Promise.resolve({ data: {} })
+        : pending(),
+    );
+
+    await overviewLoader(loaderInput(query));
+
+    const flows = query.mock.calls.find(
+      ([options]) => options.query === GetLedgerOverviewDocument,
+    );
+    expect(flows?.[0].variables).toMatchObject({ conversion: "IRR" });
   });
 
   it("resolves once both primary reads are cached even while README and metadata are still loading", async () => {
