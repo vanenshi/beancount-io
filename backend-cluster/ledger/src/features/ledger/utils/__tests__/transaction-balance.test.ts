@@ -117,6 +117,50 @@ describe("checkTransactionBalance", () => {
     // 0.1 + 0.2 - 0.3 is exactly zero in decimal math — no float dust.
     expect(check).toEqual({ ok: true, value: { residuals: [] } });
   });
+
+  // Regression: a priced posting balances by its weight (units × price) in
+  // the price currency, as Beancount does — not by its raw units.
+  it("weighs a priced posting in the price currency", () => {
+    expect(
+      checkTransactionBalance([
+        { account: "Assets:Transit", units: { number: "26000000", currency: "IRT" } },
+        {
+          account: "Assets:Crypto:USDT",
+          units: { number: "-100", currency: "USDT" },
+          price: { number: "260000", currency: "IRT" },
+        },
+      ]),
+    ).toEqual({ ok: true, value: { residuals: [] } });
+  });
+
+  it("refuses a priced posting whose weight is off, naming the price currency", () => {
+    const check = checkTransactionBalance([
+      { account: "Assets:Transit", units: { number: "25000000", currency: "IRT" } },
+      {
+        account: "Assets:Crypto:USDT",
+        units: { number: "-100", currency: "USDT" },
+        price: { number: "260000", currency: "IRT" },
+      },
+    ]);
+    if (!check.ok && check.value.kind === "unbalanced") {
+      expect(check.value.residuals).toEqual(["1000000 IRT"]);
+    } else {
+      throw new Error("expected an unbalanced failure");
+    }
+  });
+
+  it("interpolates an elided posting against a priced weight", () => {
+    expect(
+      checkTransactionBalance([
+        {
+          account: "Assets:Crypto:USDT",
+          units: { number: "-100", currency: "USDT" },
+          price: { number: "260000", currency: "IRT" },
+        },
+        { account: "Assets:Transit" },
+      ]).ok,
+    ).toBe(true);
+  });
 });
 
 describe("scanInferredToleranceDefault", () => {

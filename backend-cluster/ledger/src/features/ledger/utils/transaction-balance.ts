@@ -17,6 +17,8 @@ export const DEFAULT_INFERRED_TOLERANCE = "0.005";
 export type BalancePosting = {
   account: string;
   units?: { number: string; currency: string } | null;
+  /** Per-unit `@` price: the posting then weighs units × price in its currency. */
+  price?: { number: string; currency: string } | null;
 };
 
 export type BalanceFailure =
@@ -130,8 +132,36 @@ export function checkTransactionBalance(
         },
       };
     }
-    sums.set(currency, (sums.get(currency) ?? new BigNumber(0)).plus(amount));
     const places = impliedDecimals(number);
+    if (posting.price) {
+      // A priced posting balances by its weight, units × price, in the price
+      // currency. Like Beancount, it infers no tolerance for that currency.
+      const price = new BigNumber(posting.price.number);
+      if (!price.isFinite()) {
+        return {
+          ok: false,
+          value: {
+            kind: "unbalanced",
+            message: `posting price "${posting.price.number} ${posting.price.currency}" is not a number`,
+            residuals: [`${posting.price.number} ${posting.price.currency}`],
+          },
+        };
+      }
+      const weightCurrency = posting.price.currency;
+      sums.set(
+        weightCurrency,
+        (sums.get(weightCurrency) ?? new BigNumber(0)).plus(amount.times(price)),
+      );
+      decimals.set(
+        weightCurrency,
+        Math.max(
+          decimals.get(weightCurrency) ?? 0,
+          places + impliedDecimals(posting.price.number),
+        ),
+      );
+      continue;
+    }
+    sums.set(currency, (sums.get(currency) ?? new BigNumber(0)).plus(amount));
     decimals.set(currency, Math.max(decimals.get(currency) ?? 0, places));
     const candidate = halfUnit(places);
     const best = inferred.get(currency);
