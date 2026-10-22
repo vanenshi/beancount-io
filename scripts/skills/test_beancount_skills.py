@@ -160,6 +160,7 @@ class TestInstall(Workspace):
                 "beancount-accruals",
                 "beancount-add",
                 "beancount-ask",
+                "beancount-bonbast",
                 "beancount-close",
                 "beancount-import",
                 "beancount-importer-author",

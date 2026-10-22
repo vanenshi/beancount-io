@@ -1,6 +1,6 @@
 # Install the Beancount skills
 
-Install the thirteen `beancount-*` ledger skills for Claude Code, Codex, or both, from any directory. You keep one Git checkout of the skills and link it into each agent's skill directory. Updating the checkout updates every agent, and the helper script never touches skills it did not install. [OpenClaw and Hermes Agent](#openclaw-and-hermes-agent) use standalone ClawHub bundles, with the availability and host limits below.
+Install the fourteen `beancount-*` ledger skills for Claude Code, Codex, or both, from any directory. You keep one Git checkout of the skills and link it into each agent's skill directory. Updating the checkout updates every agent, and the helper script never touches skills it did not install. [OpenClaw and Hermes Agent](#openclaw-and-hermes-agent) use standalone ClawHub bundles, with the availability and host limits below.
 
 Rehearsed on macOS with Claude Code and Codex (see [tested with](first-query.md#tested-with)). Linux uses the same commands but has not been rehearsed. Windows is not covered.
 
@@ -50,7 +50,7 @@ Check the files first. `verify` only reads, and it exits nonzero with one line p
 python3 "$SKILLS_SRC/scripts/skills/beancount-skills.py" verify ~/.claude/skills ~/.agents/skills
 ```
 
-Then ask each agent from your ledger directory. Both should name the same thirteen skills listed in the [skills catalog](../../skills/README.md).
+Then ask each agent from your ledger directory. Both should name the same fourteen skills listed in the [skills catalog](../../skills/README.md).
 
 ```sh
 claude -p "List the names of the skills available to you that start with beancount-, one per line, nothing else."
@@ -71,7 +71,7 @@ Next: get a first answer from a sample ledger with the [first-query walkthrough]
 
 ## Install from a standard channel instead
 
-The checkout-and-link install above is one way in. The standard skill channels also carry the suite, because it lives at the conventional `skills/<name>/SKILL.md` layout. A channel install **copies** the thirteen skills into the agent's directory instead of linking a checkout, so there is no `verify` script afterwards: confirm with the client skill listing in step 3 and the [first-query walkthrough](first-query.md). Install the whole suite every time — the skills hand off to siblings and share one command contract. Each channel below was checked against the tool's current help (2026-10-19); the exact forms matter, for the reasons given.
+The checkout-and-link install above is one way in. The standard skill channels also carry the suite, because it lives at the conventional `skills/<name>/SKILL.md` layout. A channel install **copies** the fourteen skills into the agent's directory instead of linking a checkout, so there is no `verify` script afterwards: confirm with the client skill listing in step 3 and the [first-query walkthrough](first-query.md). Install the whole suite every time — the skills hand off to siblings and share one command contract. Each channel below was checked against the tool's current help (2026-10-19); the exact forms matter, for the reasons given.
 
 ### `npx skills` (skills.sh)
 
@@ -113,7 +113,7 @@ codex plugin add beancount-io@beancount-io
 codex plugin remove beancount-io@beancount-io     # remove
 ```
 
-Both manifests carry one shared suite version; a client delivers a new copy only when that version changes, and every shipped skill change bumps it. Confirm with each client's skill listing (step 3): the thirteen skills appear under the `beancount-io:` namespace.
+Both manifests carry one shared suite version; a client delivers a new copy only when that version changes, and every shipped skill change bumps it. Confirm with each client's skill listing (step 3): the fourteen skills appear under the `beancount-io:` namespace.
 
 ### Hermes and raw GitHub folders
 

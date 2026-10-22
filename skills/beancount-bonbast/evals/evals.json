@@ -1,0 +1,67 @@
+{
+  "skill_name": "beancount-bonbast",
+  "notes": "Live evals hit bonbast.com, so expected figures are whatever the helper returns at run time; grade that the figure matches a shown helper run, not a fixed number. Archive ground truth from the 2024-03-15 capture (evals/files/archive-2024-03-15.html): USD sell 59450 / buy 59350 Toman = 594500 / 593500 IRR; AMD 1475 Toman per 10 AMD = 1475 IRR per AMD. Bonbast answers a date it lacks (e.g. 2012-01-01) with the latest day's table; the helper must refuse it. Offline parser tests live in scripts/skills/test_bonbast.py. eval5 maps evals/files/eval5_ledger.beancount to ./main.bean and evals/files/prices.bean beside it.",
+  "evals": [
+    {
+      "id": 1,
+      "name": "live-usd-rate",
+      "prompt": "What's the dollar rate in Iran right now?",
+      "expected_output": "Today's bonbast.com USD sell (and buy) rate, in IRR and/or Toman, with the as_of time, from a shown helper run.",
+      "files": [],
+      "expectations": [
+        "The agent runs scripts/bonbast.py live (with -c USD or all commodities)",
+        "The answer states the side (sell/buy), the unit (IRR or Toman, 1 Toman = 10 IRR), and Bonbast's as_of time",
+        "No figure is quoted from memory"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "archive-single-day",
+      "prompt": "What was USD to rial on bonbast on 15 March 2024?",
+      "expected_output": "USD sold at 594,500 IRR (59,450 Toman) and bought at 593,500 IRR on 2024-03-15.",
+      "files": [],
+      "expectations": [
+        "The agent runs scripts/bonbast.py archive --date 2024-03-15",
+        "The answer gives sell 594500 IRR / 59450 Toman and buy 593500 IRR",
+        "The unit and side are stated"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "persian-coin-price",
+      "prompt": "قیمت سکه امامی امروز چنده؟",
+      "expected_output": "Today's Emami coin sell/buy price from a bonbast live run, answered in Persian, with unit and as_of time.",
+      "files": [],
+      "expectations": [
+        "The skill triggers on the Persian request for the Emami coin price",
+        "The figure comes from COIN-EMAMI in a shown helper run",
+        "The answer states Toman or IRR explicitly"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "refuse-missing-archive-day",
+      "prompt": "Give me the bonbast USD rate for 2012-01-01.",
+      "expected_output": "The helper reports bonbast has no archive for 2012-01-01; the agent says so and does not present another day's rate.",
+      "files": [],
+      "expectations": [
+        "The agent reports the helper's 'no archive for 2012-01-01' failure",
+        "No substitute day's figure is presented as the 2012-01-01 rate"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "record-month-of-prices",
+      "prompt": "Add daily USD prices from bonbast for March 2024 to my ledger ./main.bean.",
+      "expected_output": "Discovers the IRR commodity and prices.bean include, proposes 31 sell-side USD price directives from an archive range run, and only after confirmation writes them with bea add price --into prices.bean, then runs bea check.",
+      "files": ["evals/files/eval5_ledger.beancount", "evals/files/prices.bean"],
+      "expectations": [
+        "The agent reads the ledger's rial commodity (IRR) and existing prices include before fetching",
+        "It runs one archive range --date 2024-03-01 --to 2024-03-31 rather than 31 separate invocations",
+        "It shows the proposed directives and waits for confirmation before writing",
+        "Writes go through bea add price --into the existing prices file, never a hand append while bea is installed",
+        "bea check runs after the writes"
+      ]
+    }
+  ]
+}

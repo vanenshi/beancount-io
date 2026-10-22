@@ -1,6 +1,6 @@
 # Beancount Skills
 
-Skills for Beancount users working with a ledger through a coding agent. The thirteen workflows below support Claude Code and Codex; their source files live in [`skills/`](.).
+Skills for Beancount users working with a ledger through a coding agent. The fourteen workflows below support Claude Code and Codex; their source files live in [`skills/`](.).
 
 The skills work on ledger files on your machine. A hosted ledger stops the local workflow. You can separately request a Beancount.io MCP workflow for a named ledger, or a local clone; the skills do not invoke remote tools or clone a ledger merely because a server is connected.
 
@@ -23,6 +23,7 @@ The suite shares [command recipes](beancount-init/references/bea-cli.md) that se
 | [beancount-accruals](beancount-accruals/SKILL.md) | Prepare supported accrual drafts for a period from a stated schedule. |
 | [beancount-close](beancount-close/SKILL.md) | Reconcile and close an accounting period. |
 | [beancount-options](beancount-options/SKILL.md) | Record options trades and lifecycle events. |
+| [beancount-bonbast](beancount-bonbast/SKILL.md) | Fetch live or historical Iranian rial (IRR/Toman) rates from bonbast.com and record them as prices. |
 
 ## Install
 

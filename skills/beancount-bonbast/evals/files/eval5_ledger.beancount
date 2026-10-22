@@ -1,0 +1,16 @@
+option "title" "Rial household"
+option "operating_currency" "IRR"
+
+include "prices.bean"
+
+2024-01-01 commodity IRR
+2024-01-01 commodity USD
+
+2024-01-01 open Assets:Bank:Melli IRR
+2024-01-01 open Assets:Cash:USD USD
+2024-01-01 open Equity:Opening-Balances
+
+2024-01-01 * "Opening balances"
+  Assets:Bank:Melli  500000000 IRR
+  Assets:Cash:USD    200 USD @ 520000 IRR
+  Equity:Opening-Balances

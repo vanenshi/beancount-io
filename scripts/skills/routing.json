@@ -493,9 +493,10 @@
       "expected": "beancount-add",
       "confusable": [
         "beancount-ask",
+        "beancount-bonbast",
         "beancount-options"
       ],
-      "why": "A price directive."
+      "why": "A price directive with a user-supplied quote; nothing to fetch from bonbast.com."
     },
     {
       "id": "add-paycheck",
@@ -947,9 +948,10 @@
       "expected": "none",
       "confusable": [
         "beancount-ask",
+        "beancount-bonbast",
         "beancount-trade"
       ],
-      "why": "A live market quote, not a ledger question or a trade to record."
+      "why": "A live crypto quote, not a ledger question, a trade to record, or a rial rate."
     },
     {
       "id": "rollforward-prepaid-why",
@@ -1065,6 +1067,49 @@
         "beancount-import"
       ],
       "why": "Generic PDF manipulation/OCR belongs to a PDF helper, with no ledger workflow."
+    },
+    {
+      "id": "bonbast-live-usd-irr",
+      "prompt": "What's the free-market dollar rate in Iran right now, in Toman?",
+      "expected": "beancount-bonbast",
+      "confusable": [
+        "beancount-ask"
+      ],
+      "why": "A live IRR/Toman open-market rate from bonbast.com, not a ledger question."
+    },
+    {
+      "id": "bonbast-archive-day",
+      "prompt": "What was USD to rial on bonbast on 2024-03-15?",
+      "expected": "beancount-bonbast",
+      "confusable": [
+        "beancount-ask"
+      ],
+      "why": "A historical bonbast archive rate for one day."
+    },
+    {
+      "id": "bonbast-persian-coin",
+      "prompt": "قیمت سکه امامی امروز چنده؟",
+      "expected": "beancount-bonbast",
+      "confusable": [],
+      "why": "Persian: today's Emami gold-coin price, quoted by bonbast.com."
+    },
+    {
+      "id": "bonbast-record-month",
+      "prompt": "Add daily USD prices in IRR for March 2024 to my ledger, using the bonbast rates.",
+      "expected": "beancount-bonbast",
+      "confusable": [
+        "beancount-add"
+      ],
+      "why": "The quotes must be fetched from the bonbast archive before price directives are written."
+    },
+    {
+      "id": "none-official-cbi-rate",
+      "prompt": "What is the Central Bank of Iran's official NIMA exchange rate for the euro today?",
+      "expected": "none",
+      "confusable": [
+        "beancount-bonbast"
+      ],
+      "why": "Official CBI/NIMA rates are not the open-market rates bonbast.com publishes."
     }
   ]
 }
