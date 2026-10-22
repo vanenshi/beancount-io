@@ -1,6 +1,6 @@
 # Beancount Skills
 
-A ledger workflow suite from [Beancount.io](https://beancount.io/) for Beancount users working with a ledger through a coding agent. The sixteen workflows below support Claude Code and Codex; their source files live in [`skills/`](.).
+A ledger workflow suite from [Beancount.io](https://beancount.io/) for Beancount users working with a ledger through a coding agent. The seventeen workflows below support Claude Code and Codex; their source files live in [`skills/`](.).
 
 The skills work on ledger files on your machine. A hosted ledger stops the local workflow. You can separately request a Beancount.io MCP workflow for a named ledger, or a local clone; the skills do not invoke remote tools or clone a ledger merely because a server is connected.
 
@@ -26,10 +26,11 @@ The suite shares [command recipes](beancount-init/references/bea-cli.md) that se
 | [beancount-business-metrics](beancount-business-metrics/SKILL.md) | Answer net burn, cash and runway questions from the ledger's cash movements, and decline ARR/CAC/LTV-style figures it cannot support. |
 | [beancount-close](beancount-close/SKILL.md) | Reconcile and close an accounting period. |
 | [beancount-options](beancount-options/SKILL.md) | Record options trades and lifecycle events. |
+| [beancount-bonbast](beancount-bonbast/SKILL.md) | Fetch live or historical Iranian rial (IRR/Toman) rates from bonbast.com and record them as prices. |
 
 ## Install
 
-For one versioned suite, use the [Beancount.io plugin for Claude Code/Codex](../docs/skills/installation.md#plugin-both-clients) or the [OpenClaw suite package](../docs/skills/installation.md#one-suite-release). The sixteen source folders are the workflows inside the plugin; the published OpenClaw package (suite 0.4.0) predates `beancount-invoices` and carries the other thirteen. Git-copy channels install them together from the explicit customer directory; third-party per-skill pages do not define separate Beancount.io releases.
+For one versioned suite, use the [Beancount.io plugin for Claude Code/Codex](../docs/skills/installation.md#plugin-both-clients) or the [OpenClaw suite package](../docs/skills/installation.md#one-suite-release). The seventeen source folders are the workflows inside the plugin; the published OpenClaw package (suite 0.4.0) predates `beancount-invoices` and carries the other thirteen. Git-copy channels install them together from the explicit customer directory; third-party per-skill pages do not define separate Beancount.io releases.
 
 For a Git checkout, install the whole suite: migration and month-end close depend on sibling workflows, and each skill's `references/` and fixtures belong with its `SKILL.md`. One Git checkout serves Claude Code (`~/.claude/skills`) and Codex (`~/.agents/skills`):
 

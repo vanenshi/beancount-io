@@ -1,6 +1,6 @@
 # Install the Beancount skills
 
-Install the sixteen `beancount-*` ledger skills for Claude Code, Codex, or both, from any directory. You keep one Git checkout of the skills and link it into each agent's skill directory. Updating the checkout updates every agent, and the helper script never touches skills it did not install. [OpenClaw and Hermes Agent](#openclaw-and-hermes-agent) have the suite route and host limits described below, including migration from the retired standalone listings.
+Install the seventeen `beancount-*` ledger skills for Claude Code, Codex, or both, from any directory. You keep one Git checkout of the skills and link it into each agent's skill directory. Updating the checkout updates every agent, and the helper script never touches skills it did not install. [OpenClaw and Hermes Agent](#openclaw-and-hermes-agent) have the suite route and host limits described below, including migration from the retired standalone listings.
 
 Rehearsed on macOS with Claude Code and Codex (see [tested with](first-query.md#tested-with)). Linux arm64 Codex has [isolated-container installation and ledger rehearsals](routing-rehearsal.md#linux-codex-execution-restored--2026-11-08). On native Windows, the [PowerShell steps](#windows-powershell) were rehearsed with Windows PowerShell 5.1. Claude Code and Codex there discovered a workspace install and answered the first query, with the [Windows-specific corrections](#agents-on-windows) listed in that section. WSL is not covered.
 
@@ -52,7 +52,7 @@ Check the files first. `verify` only reads, and it exits nonzero with one line p
 python3 "$SKILLS_SRC/scripts/skills/beancount-skills.py" verify ~/.claude/skills ~/.agents/skills
 ```
 
-Then ask each agent from your ledger directory. Both should name the same sixteen skills listed in the [skills catalog](../../skills/README.md).
+Then ask each agent from your ledger directory. Both should name the same seventeen skills listed in the [skills catalog](../../skills/README.md).
 
 ```sh
 claude -p "List the names of the skills available to you that start with beancount-, one per line, nothing else."
@@ -75,7 +75,7 @@ For investment and property accounts, follow the [first-year investor guide](fir
 
 ## Install from a standard channel instead
 
-For one versioned install and update, use the [Beancount.io plugin](#plugin-both-clients) on Claude Code/Codex or the [suite package](#one-suite-release) on OpenClaw. The Git channels below also install the whole suite, but copy individual workflow directories rather than installing a versioned plugin. Confirm all sixteen skills with the client listing in step 3 and the [first-query walkthrough](first-query.md). Skills hand off to siblings and share one command contract, so install them together. These channels read this repository; their per-skill catalog pages are not separate releases maintained by Beancount.io.
+For one versioned install and update, use the [Beancount.io plugin](#plugin-both-clients) on Claude Code/Codex or the [suite package](#one-suite-release) on OpenClaw. The Git channels below also install the whole suite, but copy individual workflow directories rather than installing a versioned plugin. Confirm all seventeen skills with the client listing in step 3 and the [first-query walkthrough](first-query.md). Skills hand off to siblings and share one command contract, so install them together. These channels read this repository; their per-skill catalog pages are not separate releases maintained by Beancount.io.
 
 ### `npx skills` (skills.sh)
 
@@ -138,7 +138,7 @@ when the query engine cannot create temporary files under `--sandbox read-only`.
 Keep Codex user configuration loaded so its plugin registration remains visible;
 `--ignore-user-config` hides an installed plugin as well as older sandbox settings.
 
-Both manifests carry one shared suite version; a client delivers a new copy only when that version changes, and every shipped skill change bumps it. Confirm with each client's skill listing (step 3): the sixteen skills appear under the `beancount-io:` namespace.
+Both manifests carry one shared suite version; a client delivers a new copy only when that version changes, and every shipped skill change bumps it. Confirm with each client's skill listing (step 3): the seventeen skills appear under the `beancount-io:` namespace.
 
 ### Hermes and raw GitHub folders
 
