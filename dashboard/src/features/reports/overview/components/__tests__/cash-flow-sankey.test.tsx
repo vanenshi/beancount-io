@@ -106,6 +106,18 @@ describe("CashFlowSankey", () => {
     );
   });
 
+  it("says the flows do not reconcile instead of claiming there were none", () => {
+    render(<CashFlowSankey primaryCurrency="IRR" unreconciled />);
+
+    expect(
+      screen.getByTestId("cash-flow-sankey-unreconciled"),
+    ).toHaveTextContent("page.overview.cashFlowUnreconciled");
+    expect(
+      screen.queryByTestId("cash-flow-sankey-empty"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId("echarts-mock")).not.toBeInTheDocument();
+  });
+
   it("reserves the chart space while the data is pending instead of showing provisional output", () => {
     render(<CashFlowSankey primaryCurrency="USD" pending />);
 

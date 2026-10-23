@@ -40,6 +40,8 @@ interface CashFlowSankeyProps {
    * provisional layout as if it were final.
    */
   pending?: boolean;
+  /** The period's movements do not reconcile in `primaryCurrency`. */
+  unreconciled?: boolean;
 }
 
 export default function CashFlowSankey({
@@ -48,6 +50,7 @@ export default function CashFlowSankey({
   depth = 2,
   accountMeta,
   pending = false,
+  unreconciled = false,
 }: CashFlowSankeyProps) {
   const isDark = useIsDarkTheme();
   const formatNum = useFormatNumber();
@@ -106,6 +109,22 @@ export default function CashFlowSankey({
             {t("page.overview.cashFlowRolesPending")}
           </p>
         </div>
+      </div>
+    );
+  }
+
+  if (unreconciled) {
+    return (
+      <div
+        className="flex w-full items-center justify-center text-center"
+        style={{ height: SANKEY_HEIGHT }}
+        data-testid="cash-flow-sankey-unreconciled"
+      >
+        <p className="text-sm text-muted-foreground">
+          {t("page.overview.cashFlowUnreconciled", {
+            currency: primaryCurrency,
+          })}
+        </p>
       </div>
     );
   }

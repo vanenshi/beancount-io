@@ -96,6 +96,12 @@ const caOverview: Record<string, TranslationEntry> = {
     description:
       "Caption under the cash flow chart listing units that could not be converted to the presentation currency",
   },
+  "page.overview.cashFlowUnreconciled": {
+    message:
+      "Els fluxos d'aquest període no quadren en {currency}, per això el gràfic està amagat.",
+    description:
+      "Shown instead of the cash flow chart when the period's converted movements do not sum to zero in the presentation currency",
+  },
   "page.overview.cashFlowNoFlows": {
     message: "No hi ha fluxos en {currency} en aquest període.",
     description:

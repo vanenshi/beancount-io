@@ -172,13 +172,16 @@ export default function LedgerOverviewPage() {
   });
 
   const { accountMeta, pending: accountMetaPending } = useAccountMeta(ledgerId);
-  const { statement: sankeyStatement, pending: sankeyPending } =
-    useSankeyStatement(
-      ledgerId,
-      primaryCurrency,
-      ledgerFilters.searchParams,
-      accountMeta,
-    );
+  const {
+    statement: sankeyStatement,
+    unreconciled: sankeyUnreconciled,
+    pending: sankeyPending,
+  } = useSankeyStatement(
+    ledgerId,
+    primaryCurrency,
+    ledgerFilters.searchParams,
+    accountMeta,
+  );
 
   const market = valuationData?.market;
   const costNetWorth = valuationData?.cost?.netWorthData;
@@ -432,6 +435,7 @@ export default function LedgerOverviewPage() {
               primaryCurrency={primaryCurrency}
               accountMeta={accountMeta}
               pending={accountMetaPending || sankeyPending}
+              unreconciled={sankeyUnreconciled}
             />
           </CardContent>
         </Card>

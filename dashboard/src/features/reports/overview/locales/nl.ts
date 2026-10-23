@@ -95,6 +95,12 @@ const nlOverview: Record<string, TranslationEntry> = {
     description:
       "Caption under the cash flow chart listing units that could not be converted to the presentation currency",
   },
+  "page.overview.cashFlowUnreconciled": {
+    message:
+      "De stromen in deze periode sluiten niet aan in {currency}, daarom is de grafiek verborgen.",
+    description:
+      "Shown instead of the cash flow chart when the period's converted movements do not sum to zero in the presentation currency",
+  },
   "page.overview.cashFlowNoFlows": {
     message: "Geen {currency}-stromen in deze periode.",
     description:

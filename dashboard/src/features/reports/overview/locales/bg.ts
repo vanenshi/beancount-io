@@ -94,6 +94,12 @@ const bgOverview: Record<string, TranslationEntry> = {
     description:
       "Caption under the cash flow chart listing units that could not be converted to the presentation currency",
   },
+  "page.overview.cashFlowUnreconciled": {
+    message:
+      "Потоците за този период не се равняват в {currency}, затова диаграмата е скрита.",
+    description:
+      "Shown instead of the cash flow chart when the period's converted movements do not sum to zero in the presentation currency",
+  },
   "page.overview.cashFlowNoFlows": {
     message: "Няма потоци в {currency} за този период.",
     description:

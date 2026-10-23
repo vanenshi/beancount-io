@@ -97,6 +97,12 @@ const frOverview: Record<string, TranslationEntry> = {
     description:
       "Caption under the cash flow chart listing units that could not be converted to the presentation currency",
   },
+  "page.overview.cashFlowUnreconciled": {
+    message:
+      "Les flux de cette période ne s'équilibrent pas en {currency} : le graphique est donc masqué.",
+    description:
+      "Shown instead of the cash flow chart when the period's converted movements do not sum to zero in the presentation currency",
+  },
   "page.overview.cashFlowNoFlows": {
     message: "Aucun flux en {currency} sur cette période.",
     description:

@@ -4,6 +4,7 @@ import { GetLedgerCashFlowSankeyDocument } from "@/graphql/definitions";
 import { mergeIntervalAccountChanges } from "@/features/reports/cash-flow/lib/merge-intervals";
 import {
   buildCashFlowStatement,
+  CashFlowReconciliationError,
   type AccountMetaMap,
   type CashFlowStatement,
 } from "@/features/reports/cash-flow/lib/model";
@@ -16,6 +17,12 @@ export interface SankeyStatementState {
    * the whole overview page.
    */
   statement: CashFlowStatement | undefined;
+  /**
+   * The converted movements did not sum to zero, so no statement can be drawn
+   * in the presentation currency (e.g. prices moved within an interval). The
+   * card says so rather than claiming there were no flows.
+   */
+  unreconciled: boolean;
   /** True while the flows are still loading with nothing cached. */
   pending: boolean;
 }
@@ -55,8 +62,8 @@ export function useSankeyStatement(
     fetchPolicy: "cache-first",
   });
 
-  const statement = useMemo(() => {
-    if (!data) return undefined;
+  const { statement, unreconciled } = useMemo(() => {
+    if (!data) return { statement: undefined, unreconciled: false };
     // A partial response (one root errored, an older backend) must degrade
     // this card, not throw through the overview page that renders it.
     const intervals = mergeIntervalAccountChanges(
@@ -66,13 +73,22 @@ export function useSankeyStatement(
       data.liabilityIntervals ?? [],
       data.equityIntervals ?? [],
     );
-    return buildCashFlowStatement({
-      intervals,
-      closingCashAccounts: [],
-      primaryCurrency,
-      accountMeta,
-    });
+    try {
+      return {
+        statement: buildCashFlowStatement({
+          intervals,
+          closingCashAccounts: [],
+          primaryCurrency,
+          accountMeta,
+        }),
+        unreconciled: false,
+      };
+    } catch (error) {
+      // Same degradation as the cash-flow page; anything else is a real bug.
+      if (!(error instanceof CashFlowReconciliationError)) throw error;
+      return { statement: undefined, unreconciled: true };
+    }
   }, [data, primaryCurrency, accountMeta]);
 
-  return { statement, pending: loading && !data };
+  return { statement, unreconciled, pending: loading && !data };
 }

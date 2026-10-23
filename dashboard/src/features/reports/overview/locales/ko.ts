@@ -94,6 +94,11 @@ const koOverview: Record<string, TranslationEntry> = {
     description:
       "Caption under the cash flow chart listing units that could not be converted to the presentation currency",
   },
+  "page.overview.cashFlowUnreconciled": {
+    message: "이 기간의 흐름이 {currency}(으)로 맞지 않아 차트를 숨겼습니다.",
+    description:
+      "Shown instead of the cash flow chart when the period's converted movements do not sum to zero in the presentation currency",
+  },
   "page.overview.cashFlowNoFlows": {
     message: "이 기간에는 {currency} 흐름이 없습니다.",
     description:
