@@ -8,6 +8,7 @@ import http from "http";
 
 import cookie from "koa-cookie";
 import cors from "@koa/cors";
+import { resolveCorsOrigin } from "./cors-origin";
 import { restMetricsMiddleware } from "@/metrics/koa-middleware";
 import { logger } from "@/shared/logger";
 import { asyncContextMiddleware } from "./middleware/async-context-middleware";
@@ -71,39 +72,7 @@ export async function startServer(): Promise<void> {
   // Pattern-based origin matching (no env vars needed)
   app.use(
     cors({
-      origin: (ctx) => {
-        const origin = ctx.get("Origin");
-
-        // If no origin header (same-origin request), allow it
-        if (!origin) {
-          return "*";
-        }
-
-        try {
-          const url = new URL(origin);
-          const hostname = url.hostname;
-
-          // Allow any subdomain of beancount.io (production/staging)
-          if (
-            hostname === "beancount.io" ||
-            hostname.endsWith(".beancount.io")
-          ) {
-            return origin;
-          }
-
-          // Allow localhost for development (any port)
-          if (hostname === "localhost" || hostname === "127.0.0.1") {
-            return origin;
-          }
-
-          // Reject other origins by returning empty string
-          // This prevents the Access-Control-Allow-Origin header from being set
-          return "";
-        } catch {
-          // Invalid origin URL, reject by returning empty string
-          return "";
-        }
-      },
+      origin: (ctx) => resolveCorsOrigin(ctx.get("Origin"), config.env),
       credentials: true,
     }),
   );

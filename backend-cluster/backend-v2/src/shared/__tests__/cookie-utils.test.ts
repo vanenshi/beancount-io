@@ -1,5 +1,6 @@
 import {
   COOKIE_NAME,
+  authCookieDomain,
   setAuthCookie,
   clearAuthCookie,
   getAuthCookieFromCtx,
@@ -67,11 +68,51 @@ describe("cookie-utils", () => {
     });
   });
 
+  describe("authCookieDomain", () => {
+    it("shares the cookie across beancount.io in production", () => {
+      expect(authCookieDomain("api.v3.beancount.io", true)).toBe(
+        ".beancount.io",
+      );
+    });
+
+    it("shares an OrbStack API host's cookie with its sibling dashboard", () => {
+      // backend-v2.beancount-io.orb.local sets it; dashboard.beancount-io.orb.local reads it.
+      expect(authCookieDomain("backend-v2.beancount-io.orb.local", false)).toBe(
+        "beancount-io.orb.local",
+      );
+    });
+
+    it("keeps localhost and bare dev suffixes host-only", () => {
+      for (const host of [
+        "localhost",
+        "127.0.0.1",
+        "api.localhost",
+        "api.test",
+        "x.orb.local",
+      ]) {
+        expect(authCookieDomain(host, false)).toBeUndefined();
+      }
+    });
+  });
+
   describe("clearAuthCookie", () => {
-    it("should call ctx.cookies.set with empty string and maxAge 0", () => {
-      clearAuthCookie(mockCtx);
+    it("clears with the Domain the cookie was set with", () => {
+      clearAuthCookie(mockCtx, true);
       expect(mockCtx.cookies.set).toHaveBeenCalledWith(COOKIE_NAME, "", {
         maxAge: 0,
+        domain: ".beancount.io",
+      });
+    });
+
+    it("clears host-only on localhost", () => {
+      const httpCtx = {
+        cookies: { set: jest.fn(), get: jest.fn() },
+        URL: new URL("http://localhost:4104"),
+      } as any;
+      clearAuthCookie(httpCtx, false);
+      expect(httpCtx.cookies.set).toHaveBeenCalledWith(COOKIE_NAME, "", {
+        maxAge: 0,
+        domain: undefined,
       });
     });
   });

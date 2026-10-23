@@ -8,6 +8,7 @@ import {
 } from "@/server/rest/v1-route";
 import { json } from "@/server/rest/v1-schemas";
 import { getTokenFromCtx } from "@/features/auth/utils/auth";
+import { config } from "@/config/config";
 import { clearAuthCookie } from "@/shared/cookie-utils";
 import {
   CLI_AUTH_WIRE_STATUSES,
@@ -142,7 +143,7 @@ export const CLI_AUTH_V1_ROUTES = [
     handler: async ({ layers }, { ctx }) => {
       const token = getTokenFromCtx(ctx);
       if (token) await layers.services.auth.logout(token);
-      clearAuthCookie(ctx);
+      clearAuthCookie(ctx, config.env === "production");
       return { success: true };
     },
   }),
