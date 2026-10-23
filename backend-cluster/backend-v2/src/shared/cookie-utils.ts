@@ -1,4 +1,5 @@
 import { Context } from "koa";
+import { isDevelopmentHostname } from "./development-hosts";
 
 export const COOKIE_NAME = "authSess:beancount.io";
 
@@ -36,8 +37,32 @@ function getCookieOptions(
     secure: context.URL.protocol === "https:", // HTTPS only in production
     sameSite: "lax", // CSRF protection
     path: "/",
-    domain: isProduction ? authCookieDomain() : undefined,
+    domain: authCookieDomain(context.URL.hostname, isProduction),
   };
+}
+
+/**
+ * The Domain the auth cookie is shared under, so the dashboard's server render
+ * receives the cookie the API set on a sibling host.
+ *
+ * - Production: AUTH_COOKIE_DOMAIN, or `.beancount.io` when unset, shared
+ *   across api.v3.beancount.io, dashboard.v3.beancount.io, etc.
+ * - Development on a dev-only domain: the API host's parent, e.g.
+ *   backend-v2.beancount-io.orb.local → beancount-io.orb.local, so
+ *   dashboard.beancount-io.orb.local receives it. The parent must itself be
+ *   under the dev suffix; a bare `orb.local` or `test` would be rejected.
+ * - Otherwise (localhost): host-only. Cookies ignore ports, so the dashboard on
+ *   localhost:42600 already receives what localhost:42601 set.
+ */
+export function authCookieDomain(
+  hostname: string,
+  isProduction: boolean,
+): string | undefined {
+  if (isProduction) {
+    return productionCookieDomain();
+  }
+  const parent = hostname.slice(hostname.indexOf(".") + 1);
+  return isDevelopmentHostname(parent) ? parent : undefined;
 }
 
 /**
@@ -46,7 +71,7 @@ function getCookieOptions(
  * A browser keys a cookie by name, domain and path, so the expiry must carry
  * the same domain and path `setAuthCookie` used or the browser keeps the
  * original. The host-only expiry also removes a copy set without a domain
- * (every non-production cookie, and any older host-only one). Koa keeps both
+ * (localhost cookies, and any older host-only one). Koa keeps both
  * `Set-Cookie` headers because `overwrite` defaults to false.
  *
  * Duck-typed on the jar's `set`, the only method used: Koa and @koa/router
@@ -55,6 +80,7 @@ function getCookieOptions(
  */
 export function clearAuthCookie(
   ctx: {
+    URL: URL;
     cookies: {
       set(
         name: string,
@@ -66,12 +92,9 @@ export function clearAuthCookie(
   isProduction: boolean,
 ): void {
   ctx.cookies.set(COOKIE_NAME, "", { maxAge: 0, path: "/" });
-  if (isProduction) {
-    ctx.cookies.set(COOKIE_NAME, "", {
-      maxAge: 0,
-      path: "/",
-      domain: authCookieDomain(),
-    });
+  const domain = authCookieDomain(ctx.URL.hostname, isProduction);
+  if (domain) {
+    ctx.cookies.set(COOKIE_NAME, "", { maxAge: 0, path: "/", domain });
   }
 }
 
@@ -97,7 +120,7 @@ export function getAuthCookieFromCtx(ctx: Context): string | undefined {
  * and API hosts (e.g. `.example.com`): a browser rejects a cookie claiming
  * `.beancount.io` from any other site.
  */
-function authCookieDomain(): string {
+function productionCookieDomain(): string {
   return process.env.AUTH_COOKIE_DOMAIN?.trim() || ".beancount.io";
 }
 
