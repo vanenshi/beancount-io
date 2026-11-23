@@ -175,6 +175,7 @@ export default function LedgerOverviewPage() {
   const ledgerId = createLedgerId(ledgerOwner, ledgerName);
   const {
     primaryCurrency,
+    operatingCurrencies,
     ledgerName: ledgerDisplayName,
     ledgerData,
   } = useLedger();
@@ -193,7 +194,7 @@ export default function LedgerOverviewPage() {
   // conversion, shared with the report pages.
   const [conversion, setConversion] = useReportConversion(
     ledgerId,
-    primaryCurrency,
+    operatingCurrencies,
   );
   const {
     data,
@@ -650,7 +651,7 @@ export default function LedgerOverviewPage() {
             <ConversionSelect
               value={conversion}
               onValueChange={setConversion}
-              currency={primaryCurrency}
+              currencies={operatingCurrencies}
             />
             <LedgerWritePermission>
               <Button asChild variant="outline" className="pointer-coarse:h-11">
